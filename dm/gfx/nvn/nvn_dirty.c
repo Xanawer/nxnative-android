@@ -58,7 +58,9 @@ static void rl_n(rline *l, uint64_t v, int hex) {   // as %d / %#zx / %p print v
 static void rl_out(rline *l) { l->b[l->n++] = '\n'; if (write(2, l->b, l->n) < 0) {} }
 // A range left holding a page read-only it could not make writable counts as always written: another range over the same page may make it writable behind its back, and its writes would go
 // unseen (atomics only: the fault path calls it)
-static void mark_bad(range_t *r) { if (atomic_load_explicit(&r->live, memory_order_acquire) && !atomic_exchange(&r->bad, 1)) atomic_fetch_add(&g_nbad, 1); }   // a removed range: nothing to count (see nvn_dirty_add_range)
+// Counted before it is set (and the count taken back if it was set already), so g_nbad is never below the number of ranges marked, even for a moment: nvn_dirty_now moves while any is.
+// A fault on a pool being destroyed can mark its slot after the removal cleared it: the slot stays counted until reused (nvn_dirty_add_range), which costs only the shortcuts meanwhile
+static void mark_bad(range_t *r) { atomic_fetch_add(&g_nbad, 1); if (atomic_exchange(&r->bad, 1)) atomic_fetch_sub(&g_nbad, 1); }
 // 0 = the protection changed. It can fail: Linux refuses a split past vm.max_map_count (65,530 mappings; split KGSL mappings never merge back, docs/android/probes-gpu.md P0.7), and over several
 // mappings it may change the first ones and then fail on a later one (ENOMEM). Every caller makes the states true again (a one-page call is all or nothing: one mapping) and marks the range
 // always written (mark_bad, protect_failed), and a fault it cannot resolve goes to the crash report instead of retrying forever. Reported red once
@@ -188,7 +190,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     }
     { int lv = atomic_fetch_add(&g_live, 1) + 1, pk = atomic_load(&g_live_peak); while (lv > pk && !atomic_compare_exchange_weak(&g_live_peak, &pk, lv)) {} }
     range_t *r = rg(slot);
-    if (atomic_exchange(&r->bad, 0)) atomic_fetch_sub(&g_nbad, 1);   // a fault that timed out on the previous pool here may have marked it after its removal: not this pool's
+    if (atomic_exchange(&r->bad, 0)) atomic_fetch_sub(&g_nbad, 1);   // a fault that timed out on the previous pool here may have marked it after its removal: not this pool's (one still running may mark this pool: conservative)
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
