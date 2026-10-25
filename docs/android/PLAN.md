@@ -95,7 +95,7 @@ The probes live in `dm/android/probe/`. Each one runs as an NDK executable over 
   - **B:** shadow copies on the stock driver.
 - the default driver for this phone.
 
-**Made (2026-10-25, [probes.md](probes.md)):** bionic's pthread key slots, two loads (P0.2's candidate (b)); the macOS mapping path plus cache maintenance (P0.1); strategy A on Qualcomm 842.6, the default driver when the user supplies it, B on the stock driver, Turnip second (P0.7, with the conditions listed there: prefaulted placed chunks, a coarse dirty tracker with a VMA budget, no freeing on 842.6, parameters in buffers).
+**Made (2026-10-25, [probes.md](probes.md)):** bionic's pthread key slots, two loads (P0.2's candidate (b)); the macOS mapping path plus cache maintenance (P0.1); strategy A on Qualcomm 842.6, the default driver when the user supplies it, B on the stock driver, Turnip second (P0.7, with the conditions listed there: prefaulted placed chunks, a coarse dirty tracker with a VMA budget, no freeing on 842.6, parameters in buffers). Phase 2 changes the memory order: B first everywhere (2.2).
 
 ## Phase 1: CPU and host port
 
@@ -199,6 +199,8 @@ On the guest–host ABI: Apple's arm64 ABI passes variadic arguments on the stac
 
 **Done when:** Stardew Valley is playable on the phone (title screen, a new farm, then gameplay) at 60 fps, with no validation-layer errors. ANIMAL WELL and Celeste when supplied, then a Unity game (Patrick's Parabox), then Mario Wonder follow.
 
+**What Stardew Valley uses** (the null backend's counters, title screen to the farm; 124 NVN functions, the same set as on the Mac): indexed draws only, all u16 triangle lists, nearly all with a base vertex, up to 126 a frame. One RGBA8 colour target, with D24S8 depth in about half the passes. Clears only at the start of a pass, never with a partial mask. Viewport swizzles only as a Y flip. No compute, queries, transform feedback, conditional rendering, copies, fills, MSAA, instancing or indirect draws. The first backend covers exactly this, and the rest follows game by game.
+
 Build it in vertical slices:
 1. **Mac + KosmicKrisp, validation layers on:** a clear colour, then present, then the first real frame of Stardew Valley in the Mac host.
 2. **Phone:** the same slices on top of Phase 1.
@@ -222,7 +224,7 @@ Build it in vertical slices:
   - Allocations are split into chunks no larger than `maxMemoryAllocationSize` (4 GB − 1 on Turnip), placed side by side.
   - A pool that crosses a chunk join needs a sparse buffer, or heap growth aligned to chunks.
 - **Strategy A′:** at `mtl_pool_add`, copy the page-rounded range out, place it, and copy it back.
-- **Bring-up order:** A′ first, for Stardew Valley only, then A. A′ needs no change to the boot order. Its cost on 842.6 is that a freed pool's placed memory is never returned (P0.7), and on the null backend Stardew Valley creates 18 pools and frees one (at frame 2). That pool's size is not measured yet: measure it before relying on A′. A stays the target, since other games free pools as they go.
+- **Bring-up order (measured 2026-10-25):** B first, on all three targets; A on 842.6 later, as an optimization. On the null backend, from the title screen to walking on the farm, Stardew Valley's GPU work writes nothing the CPU reads back: no queries, transform feedback or copies into buffers, and its ReadTexels calls (12, at loads) are all on textures the CPU wrote. It makes 32 pools (194 MB) and frees 5, each an 8.44 MiB render-target pool, one at frame 2 and four at the new-game load. Placed memory is never freed on 842.6, so that rules out A′ there. The buffer data the GPU reads on the farm is 259 pages (1.06 MB), of which about 40 are written each frame. Write-protecting it page by page cost 2.7 ms of CPU a frame in a simulation, so B copies that set at each submission without tracking it, and keeps write faults for textures and the rarely written pages. Render-target pools, which the CPU cannot access, get plain device memory with no shadow. B touches only ordinary memory, so the KGSL split-mapping bugs and the mapping budget (P0.7) do not apply to it. A would save the per-submission copy, estimated at under 0.1 ms a frame for this game
 - **Strategy B:** shadow `VkBuffer`s, kept current from the dirty-page tracking in `nvn_dirty.c`.
 - **Address lookup:** `mtl_addr` maps a game address to (`VkBuffer`, offset, device address), the same interval table as now (`nvn_mtl.m:382-493`).
 - **Virtual pools** (`hle_nvn.c:1826-1915`, used by Monster Hunter Rise) wait for Phase 4.
