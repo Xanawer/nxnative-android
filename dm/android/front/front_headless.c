@@ -5,6 +5,7 @@
 
 void front_run(void (*guest)(void)) { guest(); }   // as front_mac.m without DM_WINDOW: main.c's thread runs the guest, and exits when it returns
 void *front_metal_layer(void) { return NULL; }
+void *front_native_window(void) { return NULL; }   // no window: the Vulkan backend's presents are dropped (its GPU work still runs, the adb route)
 int front_screen_max_fps(void) { return 0; }        // no screen known
 void front_screen_match(int fps) { (void)fps; }
 // No window: nothing is shown and -1 is returned (front.h); the software keyboard takes it as a cancel

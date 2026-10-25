@@ -18,9 +18,14 @@ CFLAGS=-O1 -g -Wall -Wno-unused-function
 # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
 SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m entry.S
 # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
-# Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
-GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+# Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line.
+# Named GFX_SRC, not GFX: make GFX=vkn (below) sets GFX on the command line, which would override this list
+GFX_SRC=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
 GFX_H=$(sort $(wildcard ../gfx/nvn/*.h ../gfx/nvn/include/*.h ../gfx/tex/*.h))
+# make GFX=vkn: dmhost_vkn, the Vulkan backend (dm/gfx/vkn, docs/android/PLAN.md Phase 2) in place of the Metal one: no nvn_mtl.m and its Objective-C companions (nvn_refl.m, tex/*.m, the guest
+# Vulkan and GL layers vk/*.m and gl/*.m, which present through it); the front end's Objective-C stays. Vulkan is dlopen'd at run time (Homebrew's loader, KosmicKrisp), nothing links it
+GFX_VKN=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/vkn/*.c))
+GFX_VKN_H=$(GFX_H) $(sort $(wildcard ../gfx/vkn/*.h))
 # Third party: libvpx ships only the VP9 decoder's sources (movie decoding, hle_movie.c), with its configuration headers in config/ (arm64, shared by Mac and iOS). Built separately into a static library, file by file, so host changes do not recompile it
 VPX=../third_party/libvpx
 VPX_SRC=$(sort $(shell find $(VPX) -name '*.c'))
@@ -32,6 +37,13 @@ gen/vpx/%.o: $(VPX)/%.c $(wildcard $(VPX)/config/*.h)
 $(VPX_LIB): $(VPX_OBJ)
 	rm -f $@; ar rcs $@ $^
 .DEFAULT_GOAL := dmhost   # The header generation rules are written first below, so the default goal must be stated explicitly (otherwise make only generates the headers and does not build the host)
+ifeq ($(origin GFX),command line)   # make GFX=vkn only: a GFX in the environment leaves the default build alone
+ifeq ($(GFX),vkn)
+.DEFAULT_GOAL := dmhost_vkn
+else ifneq ($(strip $(GFX)),)
+$(error GFX=$(GFX): the only other backend is vkn (the Metal one is the default, with GFX unset))
+endif
+endif
 .PHONY: game_profile
 game_profile: $(GAME_H)
 # Regenerated on every make (FORCE): the same GAME can come from another profile folder (DM_GAMES_FIRST), whose game.tsv may be older than the header; game.py writes it only when it changes
@@ -45,13 +57,15 @@ $(GAME_STAMP): FORCE
 	@mkdir -p gen; echo $(GAME) | cmp -s - $@ || echo $(GAME) > $@
 ifneq ($(strip $(GAME)),)
 ifneq ($(shell cat $(GAME_STAMP) 2>/dev/null),$(GAME))
-dmhost: FORCE
+dmhost dmhost_vkn: FORCE
 endif
 endif
 .PHONY: FORCE
 FORCE:
-dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
-	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+dmhost: $(SRC) $(GFX_SRC) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
+	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX_SRC) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+dmhost_vkn: $(SRC) $(GFX_VKN) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_VKN_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
+	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX_VKN) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
 clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx build; dmhost_* and *.dSYM beside them, as in .gitignore)
 	rm -rf gen dmhost dmhost_* *.dSYM
 .PHONY: clean

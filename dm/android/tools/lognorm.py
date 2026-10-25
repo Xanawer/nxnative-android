@@ -4,7 +4,7 @@
 # Usage: lognorm.py <log> [--until-present] > normalized.txt      Self-test: two Mac runs of the same game normalize to the same text.
 import re, sys
 
-BACKEND = re.compile(r"\[(nvn-mtl|nvn-vk|nvn-null|mtl|metal|vk)\]|pipeline (prewarm|archive)|translation (up to|detail)|thread policy:|packaged textures:|\[nvn\] frame \d+:| up to frame \d+:|audren: render time|\[longframe\]|\[slowframe\]|\[hitch\]")
+BACKEND = re.compile(r"\[(nvn-mtl|nvn-vk|nvn-null|mtl|metal|vk|vkn)\]|pipeline (prewarm|archive)|translation (up to|detail)|thread policy:|packaged textures:|\[nvn\] frame \d+:| up to frame \d+:|audren: render time|\[longframe\]|\[slowframe\]|\[hitch\]")
 SUBS = [
     (re.compile(r"(/[^\s:,()'\"]+)+"), "<path>"),
     (re.compile(r"0x[0-9a-fA-F]+"), "<hex>"),

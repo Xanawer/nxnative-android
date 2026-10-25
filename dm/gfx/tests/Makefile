@@ -107,6 +107,17 @@ t_upgrade_alias: t_upgrade_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upgrade_alias.m $(MTL_T_SRC) $(FW)
 t_stencil_view: t_stencil_view.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_stencil_view.m $(MTL_T_SRC) $(FW)
+# The Vulkan backend (dm/gfx/vkn, #included) on a real device: KosmicKrisp with the validation layer, as Homebrew installs them (mesa, vulkan-loader, vulkan-validationlayers).
+# check_t_vkn is strict (T_VKN_STRICT=1: no device or validation off fails); make run's run_t_vkn is not: a machine with no Vulkan at all is said SKIPPED and passes
+VKN_ENV=DM_VK_VALIDATION=1 VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+t_vkn: t_vkn.c $(wildcard ../vkn/*.c ../vkn/*.h) ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c $(GFX_H)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -o $@ t_vkn.c ../vkn/vk_dev.c ../vkn/vk_present.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c
+.PHONY: check_t_vkn run_t_vkn
+check_t_vkn: t_vkn
+	T_VKN_STRICT=1 $(VKN_ENV) ./t_vkn
+run_t_vkn: t_vkn
+	$(VKN_ENV) ./t_vkn
+run: run_t_vkn
 # The Vulkan layer (#included) over the whole NVN layer, whose device and present path it uses
 t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)

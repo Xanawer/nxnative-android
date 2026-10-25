@@ -1,6 +1,7 @@
-# The host for Android arm64 with the null GPU backend (docs/android/PLAN.md 1.1): dmhost, headless (the adb loop), and libdmhost.so, the NativeActivity of dm/android/app.
+# The host for Android arm64 (docs/android/PLAN.md 1.1): dmhost, headless (the adb loop), and libdmhost.so, the NativeActivity of dm/android/app. GPU_BACKEND picks the GPU backend: null
+# (dm/gfx/null, the default, Phase 1) or vkn (dm/gfx/vkn, the Vulkan backend of Phase 2, which loads Vulkan at run time: no libvulkan link).
 # Driven by build.sh beside this file; build outputs stay under build/ (.gitignore). Source lists follow dm/host/Makefile (SRC, GFX) minus its Objective-C files (nvn_mtl.m, nvn_refl.m,
-# hle_vk.m, hle_gl.m, tex/nvn_deswizzle_gpu.m, memstat.m, haptics_apple.m, front_mac.m), plus the platform layer (dm/host/plat), the null backend (dm/gfx/null) and a front end
+# hle_vk.m, hle_gl.m, tex/nvn_deswizzle_gpu.m, memstat.m, haptics_apple.m, front_mac.m), plus the platform layer (dm/host/plat), the GPU backend (GPU_BACKEND) and a front end
 # (dm/android/front). New hle_*.c / dm/gfx sources are picked up by the same wildcards as the Makefile's
 cmake_minimum_required(VERSION 3.22)
 project(nxhost C ASM)
@@ -10,6 +11,16 @@ if(NOT GAME)
     message(FATAL_ERROR "GAME is not set: -DGAME=<base game title ID> (dm/games/<id>/game.tsv)")
 endif()
 get_filename_component(DM "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)   # dm/
+set(GPU_BACKEND null CACHE STRING "GPU backend: null (dm/gfx/null) or vkn (dm/gfx/vkn, Vulkan)")
+set_property(CACHE GPU_BACKEND PROPERTY STRINGS null vkn)
+if(GPU_BACKEND STREQUAL "null")
+    set(GPU_SRC "${DM}/gfx/null/nvn_null.c")
+elseif(GPU_BACKEND STREQUAL "vkn")
+    file(GLOB GPU_SRC "${DM}/gfx/vkn/*.c")   # as the Makefile's GFX_VKN: what make GFX=vkn builds on the Mac
+    list(SORT GPU_SRC)
+else()
+    message(FATAL_ERROR "GPU_BACKEND=${GPU_BACKEND}: null or vkn")
+endif()
 if(NOT EXISTS "${DM}/games/${GAME}/game.tsv")
     message(FATAL_ERROR "no game profile ${GAME} in dm/games (a provisional profile outside the repository is a Makefile-only path for now)")
 endif()
@@ -47,7 +58,7 @@ set(HOST_SRC
     "${DM}/host/loader.c" "${DM}/host/hle.c" "${DM}/host/crash.c" "${DM}/host/probe.c" "${DM}/host/thread.c" ${HLE_SRC} "${DM}/host/entry.S"
     "${DM}/host/plat/plat_linux.c"
     ${GFX_SRC} "${DM}/gfx/nvn/nvn_entry.S" "${GEN}/nvn_thunks_elf.S"
-    "${DM}/gfx/null/nvn_null.c")
+    ${GPU_SRC})
 add_executable(dmhost ${HOST_SRC} "${DM}/host/main.c" "${DM}/android/front/front_headless.c")
 add_dependencies(dmhost game_profile)
 target_compile_options(dmhost PRIVATE ${DM_CFLAGS})
@@ -55,6 +66,9 @@ target_include_directories(dmhost PRIVATE ${DM_INC})
 # --export-dynamic: dladdr names host functions in crash dumps and stack scans (Mach-O executables export theirs). 16 KB segment alignment: runs on 4 KB and 16 KB page kernels alike
 target_link_options(dmhost PRIVATE -Wl,--export-dynamic -Wl,-z,max-page-size=16384)
 target_link_libraries(dmhost PRIVATE vpx aaudio log m dl)
+if(GPU_BACKEND STREQUAL "vkn")
+    target_link_libraries(dmhost PRIVATE android)   # ANativeWindow_acquire / _release in vk_present.c (the adb route has no window, the calls are linked all the same)
+endif()
 
 # libdmhost.so: the same sources compiled as PIC, main.c's main as dm_main (front/host_main.c, as the iOS app builds it) and front_android.c (ANativeActivity_onCreate) in place of the headless front.
 # Nothing may use initial-exec TLS (bionic refuses to dlopen such a library, docs/android/probes-cpu.md P0.2): the __thread variables stay general-dynamic (TLSDESC) under -fPIC.

@@ -1,7 +1,11 @@
 #!/bin/bash
 # Build the Phase 1 app (docs/android/PLAN.md, dm/android/app): libdmhost.so (dm/android/cmake/build.sh) in a NativeActivity APK with no Java code, made as the Phase 0 probe APKs are
 # (aapt2 link, zip, zipalign, apksigner with the debug keystore; no Gradle). The APK carries no game files: run_app.sh pushes the modules, the RomFS and env.txt to the phone.
-# Usage: build_app.sh <GAME> [--clean]    Output: dm/android/app/build/nxhost.apk (org.nxnative.host; build/ is not committed).
+# Usage: build_app.sh <GAME> [--gpu null|vkn] [build.sh options: --tests, --clean]    Output: dm/android/app/build/nxhost.apk (org.nxnative.host; build/ is not committed), nxhost-vkn.apk with --gpu vkn.
+# --gpu vkn: the Vulkan backend (build.sh --gpu vkn, dm/android/cmake/build-vkn), with libadrenotools and its hook libraries beside libdmhost.so (DM_VK_DRIVER=842 / turnip: vk_dev.c opens
+# them from its own directory), built as for the P0.7 probe (ADRENOTOOLS_BUILD, default ~/dm-work/android/src/libadrenotools-build), and VALIDATION_LAYER=<arm64 libVkLayer_khronos_validation.so>
+# (optional, Khronos' android-binaries release) in the same directory, where the system loader finds it for DM_VK_VALIDATION=1 with every driver, as dm/android/probe/shader/build.sh packages it.
+# None of these binaries is in the repository; the null APK carries none of them.
 # ANDROID_HOME overrides the SDK, APP_KEYSTORE the signing keystore (the standard debug keystore by default; never in the repository)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -11,17 +15,28 @@ BT=${APP_BUILD_TOOLS:-$ANDROID_HOME/build-tools/36.1.0}
 ANDROID_JAR=$ANDROID_HOME/platforms/android-36/android.jar
 KEYSTORE=${APP_KEYSTORE:-$HOME/.android/debug.keystore}
 die() { echo "error: $*" >&2; exit 1; }
-GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build_app.sh <GAME> [--clean]"; shift
+GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build_app.sh <GAME> [--gpu null|vkn] [build.sh options]"; shift
+GPU=null BARGS=()
+while [ $# -gt 0 ]; do case $1 in --gpu) GPU=${2:-}; shift 2 || die "--gpu takes null or vkn" ;; *) BARGS+=("$1"); shift ;; esac; done   # the rest go to build.sh (it refuses what it does not know)
+case $GPU in null) LIB=$HERE/../cmake/build/libdmhost.so APKN=nxhost.apk ;; vkn) LIB=$HERE/../cmake/build-vkn/libdmhost.so APKN=nxhost-vkn.apk ;; *) die "--gpu takes null or vkn, not '$GPU'" ;; esac
 for t in aapt2 zipalign apksigner; do [ -x "$BT/$t" ] || die "no $t in $BT"; done
 [ -f "$ANDROID_JAR" ] || die "no $ANDROID_JAR"; [ -f "$KEYSTORE" ] || die "no keystore at $KEYSTORE"
-"$HERE/../cmake/build.sh" "$GAME" "$@"
+EXTRA=()
+if [ $GPU = vkn ]; then
+    AT=${ADRENOTOOLS_BUILD:-$HOME/dm-work/android/src/libadrenotools-build}
+    for l in "$AT/libadrenotools.so" "$AT/src/hook/libhook_impl.so" "$AT/src/hook/libmain_hook.so" "$AT/src/hook/libfile_redirect_hook.so" "$AT/src/hook/libgsl_alloc_hook.so"; do
+        [ -f "$l" ] || die "missing $l (build libadrenotools first: docs/android/probes-gpu.md, \"Loading the drivers\")"; EXTRA+=("$l"); done
+    if [ -n "${VALIDATION_LAYER:-}" ]; then [ -f "$VALIDATION_LAYER" ] || die "missing $VALIDATION_LAYER"; EXTRA+=("$VALIDATION_LAYER"); fi
+fi
+"$HERE/../cmake/build.sh" "$GAME" --gpu $GPU ${BARGS[@]+"${BARGS[@]}"}
 OUT=$HERE/build; mkdir -p "$OUT"; W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/apk/lib/arm64-v8a"
+for e in ${EXTRA[@]+"${EXTRA[@]}"}; do cp "$e" "$W/apk/lib/arm64-v8a/"; done
 # Debug info stays in dm/android/cmake/build/libdmhost.so (symbolize crash offsets there); the APK's copy keeps its dynamic symbols, which dladdr names in crash dumps
-"$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" --strip-debug -o "$W/apk/lib/arm64-v8a/libdmhost.so" "$HERE/../cmake/build/libdmhost.so"
+"$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" --strip-debug -o "$W/apk/lib/arm64-v8a/libdmhost.so" "$LIB"
 "$BT/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR"
 (cd "$W/apk" && zip -q -r "$W/base.apk" lib)
 "$BT/zipalign" -f -P 16 4 "$W/base.apk" "$W/aligned.apk"   # 16 KB page alignment for uncompressed libraries, as the probes
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$OUT/nxhost.apk" "$W/aligned.apk"
-rm -f "$OUT/nxhost.apk.idsig"
-echo "built $OUT/nxhost.apk (org.nxnative.host, game $GAME, $(du -h "$OUT/nxhost.apk" | cut -f1))"
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$OUT/$APKN" "$W/aligned.apk"
+rm -f "$OUT/$APKN.idsig"
+echo "built $OUT/$APKN (org.nxnative.host, game $GAME, GPU backend $GPU, $(du -h "$OUT/$APKN" | cut -f1)); lib/arm64-v8a: $(cd "$W/apk/lib/arm64-v8a" && ls | tr '\n' ' ')"

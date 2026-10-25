@@ -2,7 +2,7 @@
 // the environment, the directories and the log are set before the host starts, dm_main runs on a big-stack thread, the activity's lifecycle drives focus, audio, the guest clock and graphics,
 // and the activity's input queue feeds player 1's controller path (dm_pad_set) and the keyboard path (dm_input_set). Every callback here runs on the activity's main (UI) thread; the host calls
 // it makes are lock-free (hle_hid.c) or take short host locks (hle_oe.c, hle_audio.c, hle_os.c), and no Java is called (JNI stays on host-owned threads, PLAN.md 1.6).
-// The window is recorded for the Vulkan backend (front_native_window, Phase 2) and painted black, as nothing draws to it yet
+// The window is recorded for the Vulkan backend (front_native_window, Phase 2), whose swapchain draws it; the null backend's build paints it black, as nothing else draws to it
 #include "dm.h"
 #include "hle.h"
 #include "front.h"
@@ -301,8 +301,13 @@ static int on_input(int fd, int events, void *data) {
 static void on_input_created(ANativeActivity *a, AInputQueue *q) { (void)a; g_queue = q; AInputQueue_attachLooper(q, ALooper_forThread(), 1, on_input, NULL); }
 static void on_input_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AInputQueue_detachLooper(q); g_queue = NULL; input_release(); }
 
-// ---------- Window: recorded for Phase 2, painted black meanwhile (nothing else draws to it; the Vulkan swapchain takes the window over and this CPU fill goes) ----------
+// ---------- Window: recorded for the GPU backend (front_native_window); the null backend's build paints it black, as nothing else draws to it ----------
+// The Vulkan backend (dm/gfx/vkn/vk_present.c) defines both hooks: its swapchain owns the window (a CPU lock would connect the window as a CPU producer, and the swapchain could not connect), and on
+// window loss it releases the surface before this callback returns, as Android requires (the window may go once onNativeWindowDestroyed returns). Weak: the null build links neither
+__attribute__((weak)) int dm_gfx_owns_window(void) { return 0; }
+__attribute__((weak)) void dm_gfx_window_lost(void) {}
 static void win_black(ANativeWindow *w) {
+    if (dm_gfx_owns_window()) return;
     ANativeWindow_Buffer b;
     if (ANativeWindow_setBuffersGeometry(w, 0, 0, WINDOW_FORMAT_RGBX_8888) || ANativeWindow_lock(w, &b, NULL)) return;
     for (int y = 0; y < b.height; y++) memset((uint8_t *)b.bits + (size_t)y * b.stride * 4, 0, (size_t)b.width * 4);
@@ -310,11 +315,11 @@ static void win_black(ANativeWindow *w) {
 }
 static void on_win_created(ANativeActivity *a, ANativeWindow *w) {
     (void)a; atomic_store(&g_win, w);
-    LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));
+    LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));   // one wording for both backends (parity_expected.txt); the Vulkan backend logs its surface
     win_black(w);
 }
-static void on_win_redraw(ANativeActivity *a, ANativeWindow *w) { (void)a; win_black(w); }
-static void on_win_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; atomic_store(&g_win, NULL); }
+static void on_win_redraw(ANativeActivity *a, ANativeWindow *w) { (void)a; win_black(w); }   // the swapchain's next present redraws it (FIFO, every frame) with the Vulkan backend
+static void on_win_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; atomic_store(&g_win, NULL); dm_gfx_window_lost(); }   // NULL first: no new surface is made on it
 static void on_focus(ANativeActivity *a, int has) { (void)a; if (!has) input_release(); }
 
 // ---------- Lifecycle (iOS front_ios_focus_event): paused = focus lost and audio suspended; stopped = in the background, the guest clock frozen and graphics suspended ----------

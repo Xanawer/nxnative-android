@@ -9,4 +9,5 @@ dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
 # Android host build (dm/android/cmake/build.sh) and the app (dm/android/app/build_app.sh)
 dm/android/cmake/build/
+dm/android/cmake/build-vkn/
 dm/android/app/build/

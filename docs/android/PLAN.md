@@ -216,6 +216,22 @@ Build it in vertical slices:
   - The pacer logic in `nvn_pace.h` is portable. It is driven by `AChoreographer` vsync callbacks plus present-wait / present-id, or Swappy.
   - On the Mac, `VK_EXT_metal_surface`.
 
+**As built, slice 1 (2026-10-26):** `dm/gfx/vkn/`, built with `make GFX=vkn` on the Mac and `build_app.sh <GAME> --gpu vkn` for the phone; `run_app.sh --driver system|842|turnip` picks the driver. Render targets, clears, barriers, submission and present are real. Draws, binds and texture uploads are only counted, which is the next slice.
+- **Submission:** four slots, one timeline value per submit (the NVN fence), and a completion thread that writes a submission's effects before its fence counts as done.
+- **Present:** its own thread and timeline, FIFO. The swapchain is made in the display's natural orientation and the picture is rotated in the shader. Crop and clamp are specialization constants, because push constants hit a Turnip bug.
+- **Driver check:** `vk_dev.c` reports which driver actually answered, from the mapped library's path and the driver ID.
+- **A lost GPU** is reported once; submissions then complete without it. Once any submission has been retired without the GPU's answer, nothing is freed again (a leak, not a use-after-free).
+- **Bounds on Android:** window loss and the suspend drain wait at most 4 s.
+- **Test:** `dm/gfx/tests/t_vkn.c` (`make check_t_vkn`, strict) checks clears and pass ends by readback on KosmicKrisp, with validation on.
+
+Results: Stardew Valley's title-screen clears on KosmicKrisp, the system driver, 842.6 and Turnip (with `TU_DEBUG=sysmem,noubwc`), with 0 `[RED]` and 0 validation messages; background and resume rebuild the swapchain.
+
+Open after slice 1:
+- **Turnip:** in its default GMEM mode the device is lost once presents run. With `sysmem,noubwc`, the present test pattern (quadrants cleared into an image, then sampled) comes out as 8 px vertical stripes; review found nothing invalid in that image's setup. Turnip is not a target until this is understood.
+- **Suspend can still hang:** `hle_nvn.c` waits without a bound, before `dm_gfx_suspend(1)`, for a submit blocked on a free slot. A GPU that hangs without reporting loss can block `onStop`. No backend-only fix keeps pending work safe.
+- **Crop changes:** a new crop compiles a present pipeline (4-entry cache). Games with dynamic resolution need a uniform-buffer path.
+- **Format-changing views:** render-target views of another format are only reported in red, for example Mario Wonder's RGBA8 window texture written through an sRGB view.
+
 ### 2.2 Memory (by the P0.7 decision)
 - **Boot order (strategies A and A′):** today the Metal device is created at graphics init (`nvn_mtl.m:282-365`). Under A, the Vulkan device has to exist before `mem_init`, the first `SetHeapSize` and the loader's RW mapping. So the host's early load at app launch creates it first: choose the driver (loading it through libadrenotools if needed), create the device and pick the memory type. Phase 1 still uses plain `mmap`, so the null backend is not affected.
 - **Strategy A:**
