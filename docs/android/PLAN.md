@@ -40,9 +40,9 @@ So no Adreno driver can wrap memory the game already has, the way `newBufferWith
 **First games to target:** ones that use NVN with very few shaders, and only `main` + `sdk` modules:
 - ANIMAL WELL: 48 shaders, about 54 MB.
 - Celeste: 28 shaders.
-- Stardew Valley: 67 shaders.
+- Stardew Valley: 65 shaders (23 pixel, 42 vertex), MonoGame compiled by BRUTE, like Celeste.
 
-Mario Wonder (16,270 shaders) comes after those.
+Mario Wonder (16,270 shaders) comes after those. **Stardew Valley is the game on hand** (update 1.6.15.13, `v1310720`), so it is the first game for P0.8 and the done-tests of Phases 1 and 2; ANIMAL WELL and Celeste join when supplied.
 
 ## Principles
 
@@ -59,7 +59,7 @@ Mario Wonder (16,270 shaders) comes after those.
 
 | Location | Contents |
 |---|---|
-| `dm/android/app/` | Gradle project: Kotlin launcher (from `launcher.json`), GameActivity, JNI glue |
+| `dm/android/app/` | The APK. Phase 1: a NativeActivity with no Java code, built with `aapt2` / `zipalign` / `apksigner` like the probes (input through its `AInputQueue`, the window through `ANativeWindow`). Later: a Gradle project with the Kotlin launcher (from `launcher.json`), GameActivity and the IME, swapped in behind the same `front_android.c` |
 | `dm/android/front/` | `front_android.c` (the `front.h` interface), input, IME, haptics, thermal (all JNI on host threads) |
 | `dm/android/probe/` | Phase 0 probes: an NDK executable and a minimal NativeActivity APK |
 | `dm/android/cmake/` | NDK build of the host: `dmhost` executable (adb loop) and `libdmhost.so` (app) |
@@ -83,7 +83,7 @@ The probes live in `dm/android/probe/`. Each one runs as an NDK executable over 
 | P0.5 | **x18 and TLS.** bionic uses x18 for the shadow call stack and `tpidr_el0` for its TLS | After rewriting, guest code never changes the real x18 or `tpidr_el0`; host code called from the guest keeps working | — |
 | P0.6 | **System registers.** Can EL0 read `cntvct_el0`, and is `cntfrq_el0` 19.2 MHz (the Switch rate)? What does `ctr_el0` hold, compared with the rewriter's constant (`movz #4, lsl #16`, `patch_nso.py:845-847`)? | Values logged | Keep the gates. A matching counter allows a fast path later |
 | P0.7 | **GPU memory**, on all three drivers: stock, 842.6 through libadrenotools, and Turnip R8's separate `turnip_a8xx.zip` (the main R8 package may not drive an Adreno 830). Compare the three inside the APK, since libadrenotools loading is only certain to work there; `adb shell` is enough for the stock driver. Log the full extension and feature list: BC formats, geometry shader, `indexTypeUint8`, `depthBounds`, push descriptors, sparse binding and residency, subgroup stages. Check:<br>- the memory types: is there one that is HOST_VISIBLE + COHERENT + CACHED?<br>- a placed map over an existing `PROT_NONE` reservation, as `mem_init` makes (`dm/host/hle_svc.c:30-47`)<br>- one 3.5 GB allocation, and adjacent allocations at contiguous addresses<br>- unmapping with `VK_MEMORY_UNMAP_RESERVE_BIT_EXT`<br>- CPU bandwidth on placed memory compared with anonymous memory<br>- the GPU sees CPU writes without a flush, and the CPU sees GPU writes after a fence<br>- `mprotect` and the write fault work on driver-mapped pages (`dm/gfx/nvn/nvn_dirty.c`) | Placed memory is cached, coherent and as fast as anonymous memory for the CPU; GPU and CPU see each other's writes; `mprotect` works | Strategy B (shadow copies, below), or rely on 842.6 / Turnip only |
-| P0.8 | **Shaders.** SPIR-V from `dmsh_xlate` for ANIMAL WELL or Celeste | `spirv-val` is clean, pipelines build on the device, compile times recorded, and a test pattern shows the Y direction and NaN `min`/`max` behaviour | Fix the translator options before Phase 2 |
+| P0.8 | **Shaders.** SPIR-V from `dmsh_xlate` for Stardew Valley | `spirv-val` is clean, pipelines build on the device, compile times recorded, and a test pattern shows the Y direction and NaN `min`/`max` behaviour | Fix the translator options before Phase 2 |
 | P0.9 | **KosmicKrisp.** Build it on the Mac and run the P0.7 subset | Placed mapping works in the Mac host process | Develop the backend on the phone only |
 
 **Decisions Phase 0 makes:**
@@ -95,9 +95,11 @@ The probes live in `dm/android/probe/`. Each one runs as an NDK executable over 
   - **B:** shadow copies on the stock driver.
 - the default driver for this phone.
 
+**Made (2026-10-25, [probes.md](probes.md)):** bionic's pthread key slots, two loads (P0.2's candidate (b)); the macOS mapping path plus cache maintenance (P0.1); strategy A on Qualcomm 842.6, the default driver when the user supplies it, B on the stock driver, Turnip second (P0.7, with the conditions listed there: prefaulted placed chunks, a coarse dirty tracker with a VMA budget, no freeing on 842.6, parameters in buffers).
+
 ## Phase 1: CPU and host port
 
-**Done when:** on the phone, with the null GPU backend, ANIMAL WELL and Celeste boot to their frame loop, with the log matching a Mac run up to the first present. This must work two ways: from `adb shell` (the `dmhost` executable), and from `libdmhost.so` inside the APK using the P0.2 thread-slot mechanism and its startup self-check. The APK run is the case where the slot mechanism is uncertain, so Phase 2 does not start until it passes. The portable unit tests (`t_cover`, `t_hmap`, `t_pace`, `t_fstep`, `tex/tests/t_tex`, then `t_dirty_*`) pass on the device. Input and audio work in the APK shell.
+**Done when:** on the phone, with the null GPU backend, Stardew Valley boots to its frame loop, with the log matching a Mac run up to the first present (ANIMAL WELL and Celeste too when supplied). The Mac reference is a run with a fresh save, `DM_DETCLOCK`, `DM_FIXED_TIME` and a fixed `DM_KEYS` script; `dm/android/tools/lognorm.py --until-present` normalizes both logs (addresses, paths, numbers, backend-tagged and statistics lines), and two Mac runs normalize to the same text. Pixels are not compared: two Mac runs of the same script differ in 2–37% of the pixels of the same frame, `DM_DETCLOCK_PACE` included. The frame loop is checked on the wall clock (the same script in seconds): with `DM_DETCLOCK` the guest clock only advances per present, and a backend whose first frame is fast (the null backend now; Vulkan later, with a warm pipeline cache) leaves the game asleep in its fixed-timestep wait after the first present. On the Mac the first Metal frame is slow enough to hide this. This must work two ways: from `adb shell` (the `dmhost` executable), and from `libdmhost.so` inside the APK using the P0.2 thread-slot mechanism and its startup self-check. The APK run is the case where the slot mechanism is uncertain, so Phase 2 does not start until it passes. The portable unit tests (`t_cover`, `t_hmap`, `t_pace`, `t_fstep`, `tex/tests/t_tex`, then `t_dirty_*`) pass on the device. Input and audio work in the APK shell.
 
 ### 1.1 Build
 - CMake with the NDK toolchain builds `dmhost` (an executable for the adb loop) and `libdmhost.so` (for the app).
@@ -189,10 +191,10 @@ On the guest–host ABI: Apple's arm64 ABI passes variadic arguments on the stac
 
 ## Phase 2: GPU rewrite (NVN on Vulkan)
 
-**Done when:** ANIMAL WELL and Celeste are playable on the phone (title screen, then gameplay) at 60 fps, with no validation-layer errors. Stardew Valley, then a Unity game (Patrick's Parabox), then Mario Wonder follow.
+**Done when:** Stardew Valley is playable on the phone (title screen, a new farm, then gameplay) at 60 fps, with no validation-layer errors. ANIMAL WELL and Celeste when supplied, then a Unity game (Patrick's Parabox), then Mario Wonder follow.
 
 Build it in vertical slices:
-1. **Mac + KosmicKrisp, validation layers on:** a clear colour, then present, then the first real frame of ANIMAL WELL in the Mac host.
+1. **Mac + KosmicKrisp, validation layers on:** a clear colour, then present, then the first real frame of Stardew Valley in the Mac host.
 2. **Phone:** the same slices on top of Phase 1.
 3. **Widen game by game.**
 
@@ -355,8 +357,6 @@ Several go away on Vulkan: triangle fans are native, indirect-count draws are na
 
 ## Open questions
 
-1. Which of ANIMAL WELL, Celeste and Stardew Valley do you own? That becomes the first game for P0.8 and Phase 2.
-2. May the .NET SDK be installed on the Mac (`brew install --cask dotnet-sdk`)? `nx_extract` and `dmsh_xlate` need it.
-3. Which driver should be the default on this phone if P0.7 passes on both 842.6 and Turnip?
+1. None at the moment: the Phase 0 questions are answered in [probes.md](probes.md).
 
 Sources for the driver facts: [Mesa `features.txt`](https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/docs/features.txt), Turnip sources at `e9a83d530cce` (`src/freedreno/vulkan/`), [AdrenoToolsDrivers releases](https://github.com/K11MCH1/AdrenoToolsDrivers/releases), and the stock driver pulled from the phone.

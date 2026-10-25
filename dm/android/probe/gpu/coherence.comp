@@ -1,0 +1,45 @@
+#version 450
+// P0.7 coherence kernel. Reads n words from src, writes dst[k] = src[k] ^ xform(seed, k), and accumulates into res:
+//   res.sum += src[k] (wrapping), and with check != 0 counts words where src[k] != pattern(seed, k) (res.mism, lowest index in res.first).
+// The CPU fills src with pattern(seed, k) (same hash as gpu_probe.c), so res.mism == 0 means the GPU saw every CPU write.
+// Built twice: with descriptors (VkBuffer bound to the memory) and with -DUSE_BDA (buffer device addresses).
+// The parameters come from a small storage buffer that the GPU itself writes (vkCmdUpdateBuffer), not from push constants: the Turnip a8xx
+// build tested reads garbage from compute push constants (diag.comp checks push constants separately).
+#ifdef USE_BDA
+#extension GL_EXT_buffer_reference : require
+#endif
+layout(local_size_x = 256) in;
+
+#ifdef USE_BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Res { uint mism; uint first; uint sum; uint pad; };
+layout(std430, set = 0, binding = 0) readonly buffer Params { Words src; Words dst; Res res; uint seed; uint n; uint check; uint pad; } pc;
+#define SRC pc.src.v
+#define DST pc.dst.v
+#define RES pc.res
+#else
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint v[]; } src;
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint v[]; } dst;
+layout(std430, set = 0, binding = 2) buffer ResB { uint mism; uint first; uint sum; uint pad; } res;
+layout(std430, set = 0, binding = 3) readonly buffer Params { uint seed; uint n; uint check; uint pad; } pc;
+#define SRC src.v
+#define DST dst.v
+#define RES res
+#endif
+
+uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+uint pattern(uint seed, uint k) { return hash(k ^ hash(seed)); }
+uint xform(uint seed, uint k) { return hash(k + seed * 0x9e3779b9u) | 1u; }
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint lsum = 0u, lmis = 0u, lfirst = 0xffffffffu;
+    for (uint k = gl_GlobalInvocationID.x; k < pc.n; k += stride) {
+        uint w = SRC[k];
+        lsum += w;
+        if (pc.check != 0u && w != pattern(pc.seed, k)) { lmis++; lfirst = min(lfirst, k); }
+        DST[k] = w ^ xform(pc.seed, k);
+    }
+    atomicAdd(RES.sum, lsum);
+    if (lmis != 0u) { atomicAdd(RES.mism, lmis); atomicMin(RES.first, lfirst); }
+}

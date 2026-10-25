@@ -1,0 +1,10 @@
+# Phase 0 probe build outputs and raw results must never land in the repo.
+# Builds go to ~/dm-work/android/probe-build/, raw results to ~/dm-work/android/probe-results/,
+# but ignore any stray artifacts if a build is ever pointed at the tree.
+*.o
+*.apk
+*.apk.idsig
+*.so
+*.patched.bin
+probe-build/
+probe-results/

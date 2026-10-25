@@ -1,0 +1,56 @@
+#version 450
+// P0.7 compute sanity kernel: one invocation per index i < n, no loop, each writes 8 words that isolate one operation each, so a driver
+// whose coherence results look wrong can be told apart from a driver that computes wrong values:
+//   out[8i+0] = i                     (invocation ID)       out[8i+4] = hash(i)             (the hash used by coherence.comp)
+//   out[8i+1] = seed                  (push constant)       out[8i+5] = src[i]              (a load)
+//   out[8i+2] = n                     (push constant)       out[8i+6] = src[i] ^ hash(i ^ seed)
+//   out[8i+3] = i * 0x7feb352d        (32-bit multiply)     out[8i+7] = gl_NumWorkGroups.x
+//   res[0] += 1, res[2] += src[i]     (atomics; the block starts as {0, 0xffffffff, 0, 0})
+// Four builds: descriptors or -DUSE_BDA (buffer device addresses), each with the parameters in push constants or, with -DPARAMS_BUF,
+// in a storage buffer the GPU writes (binding 3 for descriptors, binding 0 for BDA), the same layout coherence.comp uses.
+#ifdef USE_BDA
+#extension GL_EXT_buffer_reference : require
+#endif
+layout(local_size_x = 256) in;
+
+#ifdef USE_BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+#ifdef PARAMS_BUF
+layout(std430, set = 0, binding = 0) readonly buffer Params { Words src; Words dst; Words res; uint seed; uint n; uint check; uint pad; } pc;
+#else
+layout(push_constant) uniform PC { Words src; Words dst; Words res; uint seed; uint n; uint check; uint pad; } pc;
+#endif
+#define SRC pc.src.v
+#define DST pc.dst.v
+#define RES pc.res.v
+#else
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint v[]; } src;
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint v[]; } dst;
+layout(std430, set = 0, binding = 2) buffer ResB { uint v[]; } res;
+#ifdef PARAMS_BUF
+layout(std430, set = 0, binding = 3) readonly buffer Params { uint seed; uint n; uint check; uint pad; } pc;
+#else
+layout(push_constant) uniform PC { uint seed; uint n; uint check; uint pad; } pc;
+#endif
+#define SRC src.v
+#define DST dst.v
+#define RES res.v
+#endif
+
+uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint w = SRC[i];
+    DST[8u * i + 0u] = i;
+    DST[8u * i + 1u] = pc.seed;
+    DST[8u * i + 2u] = pc.n;
+    DST[8u * i + 3u] = i * 0x7feb352du;
+    DST[8u * i + 4u] = hash(i);
+    DST[8u * i + 5u] = w;
+    DST[8u * i + 6u] = w ^ hash(i ^ pc.seed);
+    DST[8u * i + 7u] = gl_NumWorkGroups.x;
+    atomicAdd(RES[0], 1u);
+    atomicAdd(RES[2], w);
+}
