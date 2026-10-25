@@ -7,7 +7,9 @@
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <libkern/OSCacheControl.h>
+#endif
 #if !TARGET_OS_IPHONE
 #define HC_MAX 8192
 static struct { const char *kind, *name; void *fn; _Atomic uint64_t n; } g_hc[HC_MAX];

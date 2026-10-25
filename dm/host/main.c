@@ -3,7 +3,12 @@
 #include "front.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
+#ifdef __ANDROID__
+#include <malloc.h>
+#endif
 #include <sys/time.h>
 #include <unistd.h>
 void probe_install(void); void hid_keys_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); uint32_t svc_thread_main_init(void);
@@ -47,11 +52,15 @@ static void flags_init(void) {
 
 // Zero point of the boot timeline = process creation time (p_starttime from sysctl KERN_PROC_PID, wall clock) converted to the now_ns monotonic time base; same definition on Mac / iOS
 static uint64_t proc_start_mono_ns(void) {
+#ifndef __APPLE__
+    uint64_t mono = now_ns(), age = dm_plat_proc_age_ns(); return age && age < mono ? mono - age : mono;   // Linux: the start time in /proc/self/stat, as an age (plat_linux.c)
+#else
     struct kinfo_proc kp; size_t n = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     uint64_t mono = now_ns(); struct timeval tv; gettimeofday(&tv, NULL);
     if (sysctl(mib, 4, &kp, &n, NULL, 0) || !n) return mono;
     int64_t age = (int64_t)(tv.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000000000ll + (tv.tv_usec - kp.kp_proc.p_starttime.tv_usec) * 1000ll;
     return age > 0 ? mono - (uint64_t)age : mono;
+#endif
 }
 
 // Host loading (independent of UIKit / Metal): read the NSO, relocate, forced take-over, probes / tick gate / keys, start prefetch. By default it runs synchronously in main;
@@ -122,6 +131,11 @@ void dm_host_preload_start(int argc, char **argv) {
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
 int main(int argc, char **argv) {
+#ifdef __ANDROID__
+    // Untagged heap pointers before anything is allocated: scudo tags the top byte (0xb4) in an executable started from a shell, and host pointers handed to the guest must have a zero top byte
+    // (the guest's own pointer arithmetic and compares). Cannot be turned back on (docs/android/probes-cpu.md P0.4); an APK sets allowNativeHeapPointerTagging="false" as well
+    if (!mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE)) LOG("[RED] heap pointer tagging could not be turned off: host pointers keep their top-byte tag");
+#endif
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
         pthread_join(g_pre.th, NULL);

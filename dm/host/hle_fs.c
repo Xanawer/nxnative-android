@@ -5,7 +5,9 @@
 // Paths look like "rom:/data/x". FileHandle / DirectoryHandle are 8 bytes passed by value, here they store the host fd / DIR*.
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
 #include "hle.h"
+#ifdef __APPLE__
 #include <mach/mach.h>
+#endif
 #include "front.h"
 #include <dirent.h>
 #include <errno.h>
@@ -14,8 +16,19 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#ifdef __APPLE__
 #include <sys/clonefile.h>
+#endif
 #include <sys/xattr.h>
+#ifndef __APPLE__   // Linux: the l* calls (XATTR_NOFOLLOW is their meaning; no position / options arguments), names in the user namespace, ENODATA for a missing attribute
+// A filesystem without user xattrs (ENOTSUP) holds no guest names: reading or removing one is "no attribute", not a failure, or every save create / mkdir / rename there would fail
+static inline ssize_t dm_lgetxattr(const char *p, const char *n, void *v, size_t s) { ssize_t r = lgetxattr(p, n, v, s); if (r < 0 && errno == ENOTSUP) errno = ENODATA; return r; }
+static inline int dm_lremovexattr(const char *p, const char *n) { int r = lremovexattr(p, n); if (r && errno == ENOTSUP) errno = ENODATA; return r; }
+#define getxattr(p, n, v, s, pos, o) dm_lgetxattr(p, "user." n, v, s)
+#define setxattr(p, n, v, s, pos, o) lsetxattr(p, "user." n, v, s, 0)
+#define removexattr(p, n, o) dm_lremovexattr(p, "user." n)
+#define ENOATTR ENODATA
+#endif
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
 #undef HLE_FORCE
@@ -603,9 +616,14 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
                 static _Atomic int once; if (!once++) LOG("[fs] ReadFile into %p+%#zx: the destination was write-protected again during the read, prepared again at +%#zx (first case)", buf, sz, got);
                 dm_guest_write_prepare((uint8_t *)buf + got, sz - got); continue; }
             if (errno == EFAULT) {   // the destination is not writable host memory: say where, with the protection of its VM region
+#ifdef __APPLE__
                 int e = errno; vm_address_t ra = (vm_address_t)((uint8_t *)buf + got); vm_size_t rs = 0; vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
                 kern_return_t kr = vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj);
                 LOG("[RED] fs ReadFile into %p+%#zx failed at +%#zx (EFAULT): VM region %#lx+%#lx protection %d%s", buf, sz, got, (unsigned long)ra, (unsigned long)rs, kr == KERN_SUCCESS ? vi.protection : -1, kr == KERN_SUCCESS ? "" : " (none)");
+#else
+                int e = errno, prot = dm_plat_page_prot((uintptr_t)buf + got);   // Linux: the mapping's protection from /proc/self/maps (PROT_* bits, as VM_PROT_*)
+                LOG("[RED] fs ReadFile into %p+%#zx failed at +%#zx (EFAULT): page protection %d%s", buf, sz, got, prot, prot >= 0 ? "" : " (none)");
+#endif
                 errno = e; }
             return err_res("pread", "fd"); }
         if (r == 0) break;

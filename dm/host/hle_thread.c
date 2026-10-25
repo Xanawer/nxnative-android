@@ -15,8 +15,10 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <pthread/qos.h>
+#endif
 #include <dlfcn.h>
 #include <stdatomic.h>
 
@@ -281,18 +283,34 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t || !atomic_load(&t->pause_req) || atomic_load(&t->svc_regs)) return;
+#ifdef __APPLE__
     ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
     if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return;   // in host code: do not stop; the requester resends
+#else
+    ucontext_t *uc = uc_;
+    if (!module_of((void *)DM_UC_PC(uc))) return;   // in host code: do not stop; the requester resends
+#endif
     pthread_mutex_lock(&G);
     if (t->pause_req) {
+#ifdef __APPLE__
         for (int i = 0; i < 29; i++) t->ctx_x[i] = ss->__x[i];
+#else
+        for (int i = 0; i < 29; i++) t->ctx_x[i] = DM_UC_X(uc, i);
+#endif
         // x18 is the Apple platform register: the rewriter keeps the guest's x18 in its thread slot (patch_nso.py K18), and compiled game code may hold an object pointer there,
         // which a collector scanning this context (IL2CPP's, through GetThreadContext3) would otherwise not see. The rewriter's x18 sequences also park two registers up to 24 bytes
         // below sp for a few instructions, so the reported sp is 32 bytes lower: the collector scans the stack upward from it, and a few extra words cost a conservative scan nothing
         t->ctx_x[18] = (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
+#ifdef __APPLE__
         t->ctx_fp = __darwin_arm_thread_state64_get_fp(*ss); t->ctx_lr = __darwin_arm_thread_state64_get_lr(*ss);
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
         memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
+#else
+        t->ctx_fp = DM_UC_FP(uc); t->ctx_lr = DM_UC_LR(uc);
+        t->ctx_sp = DM_UC_SP(uc) - 32; t->ctx_pc = DM_UC_PC(uc); t->ctx_pstate = (uint32_t)DM_UC_CPSR(uc);
+        { const struct fpsimd_context *f = dm_uc_fpsimd(uc);   // the FP / SIMD record of the signal frame; zeros without one
+          memcpy(t->ctx_v, DM_UC_V(uc), sizeof t->ctx_v); t->ctx_fpcr = f ? f->fpcr : 0; t->ctx_fpsr = f ? f->fpsr : 0; }
+#endif
         t->ctx_ok = 1; t->paused = 1; pthread_cond_broadcast(&t->pcv);
         while (t->pause_req) pthread_cond_wait(&t->pcv, &G);
         t->paused = 0; t->ctx_ok = 0;
@@ -357,6 +375,7 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
     if (!t->mport) return;
     thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
     if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS) h->rs = bi.run_state;
+#ifdef __APPLE__   // Linux cannot stop another thread and read its registers from outside: the line keeps the wait state and the last SVC
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; c = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
@@ -370,6 +389,7 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
         }
     }
     thread_resume(t->mport);
+#endif
 }
 static void hitch_log(const hitch_t *h) {
     static const char *kinds[] = {"run", "mutex", "condvar", "address", "sync"};
@@ -529,6 +549,9 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
 static void thr_bt(thr_t *t) {
+#ifndef __APPLE__
+    (void)t;   // Linux cannot stop another thread and read its registers from outside (Mach thread_suspend / thread_get_state): the dump keeps each thread's wait and last SVC lines
+#else
     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
@@ -561,6 +584,7 @@ static void thr_bt(thr_t *t) {
         fprintf(stderr, "%s\n", line);
     }
     thread_resume(t->mport);
+#endif
 }
 void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
@@ -592,6 +616,7 @@ void svc_thread_dump(void) {
         thr_bt(t);
     }
     // Threads created by the host itself (graphics present, audio, movie decoding, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
+#ifdef __APPLE__   // Linux: no Mach thread list to suspend and read
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
         for (mach_msg_type_number_t i = 0; i < nth; i++) {
@@ -618,6 +643,7 @@ void svc_thread_dump(void) {
         }
         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
     }
+#endif
 }
 
 // An approximation of same-core preemption: when an SVC woke a higher-priority thread pinned to this core, wait before the SVC returns until those threads (and every other higher-priority thread of this core) block, for at most 5 ms.

@@ -3,9 +3,30 @@
 //       iOS defaults to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutBuffer / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs (AudioOut: the SDK's own fields, au_info).
 #include "hle.h"
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
 #include <dispatch/dispatch.h>
+#elif defined(__ANDROID__)
+// Android: an AAudio stream stands in for the AudioUnit (au_create below; 48 kHz, 16-bit, low latency, data callback). The few AudioUnit names the rest of this file uses map onto the stream,
+// so the queues, the downmix, the volume, the watchdog and the silent sink stay one code. Stop waits for the stream to stop: an AudioUnit stops synchronously, and a silent sink taking over must not pull beside a late callback
+#include <aaudio/AAudio.h>
+typedef AAudioStream *AudioUnit; typedef int32_t OSStatus; typedef uint32_t UInt32; typedef uint32_t AudioUnitRenderActionFlags; typedef struct AudioTimeStamp AudioTimeStamp;
+typedef struct { UInt32 mNumberChannels, mDataByteSize; void *mData; } AudioBuffer;
+typedef struct { UInt32 mNumberBuffers; AudioBuffer mBuffers[1]; } AudioBufferList;
+enum { noErr = 0 };
+static OSStatus aa_stop(AAudioStream *s) {
+    aaudio_result_t r = AAudioStream_requestStop(s); if (r != AAUDIO_OK) return r;
+    aaudio_stream_state_t st = AAudioStream_getState(s);
+    for (int i = 0; i < 20 && st != AAUDIO_STREAM_STATE_STOPPED && st != AAUDIO_STREAM_STATE_DISCONNECTED && st != AAUDIO_STREAM_STATE_CLOSED; i++)
+        AAudioStream_waitForStateChange(s, st, &st, 10000000);   // up to 200 ms
+    return noErr;
+}
+#define AudioOutputUnitStart(u) AAudioStream_requestStart(u)
+#define AudioOutputUnitStop(u) aa_stop(u)
+#define AudioUnitUninitialize(u) ((void)(u))
+#define AudioComponentInstanceDispose(u) AAudioStream_close(u)
+#endif
 #include <stdatomic.h>
 #include <unistd.h>
 
@@ -160,6 +181,30 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
     return noErr;
 }
+#ifdef __ANDROID__
+static aaudio_data_callback_result_t aa_data(AAudioStream *s, void *ctx, void *data, int32_t frames) {   // the device's callback, handed to the AudioUnit render path as one interleaved buffer
+    (void)s; aout *a = ctx; UInt32 ch = (UInt32)device_channels(a);
+    AudioBufferList bl = {1, {{ch, (UInt32)frames * 2u * ch, data}}};
+    au_render(a, NULL, NULL, 0, (UInt32)frames, &bl);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+static OSStatus au_create(aout *a) {
+    AAudioStreamBuilder *b = NULL; a->au = NULL;
+    aaudio_result_t r = AAudio_createStreamBuilder(&b); if (r != AAUDIO_OK) return r;
+    int ch = device_channels(a);
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT); AAudioStreamBuilder_setSampleRate(b, RATE); AAudioStreamBuilder_setChannelCount(b, ch);
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16); AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setDataCallback(b, aa_data, a);
+    r = AAudioStreamBuilder_openStream(b, &a->au); AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK) { a->au = NULL; return r; }
+    // The queue's own format or nothing: no conversion here (AAudio resamples a 48 kHz request itself when the device runs at another rate)
+    if (AAudioStream_getSampleRate(a->au) != RATE || AAudioStream_getChannelCount(a->au) != ch || AAudioStream_getFormat(a->au) != AAUDIO_FORMAT_PCM_I16) {
+        LOG("[RED] audio #%d: AAudio offered %d Hz, %d channels, format %d", a->id, AAudioStream_getSampleRate(a->au), AAudioStream_getChannelCount(a->au), (int)AAudioStream_getFormat(a->au));
+        AAudioStream_close(a->au); a->au = NULL; return AAUDIO_ERROR_INVALID_FORMAT; }
+    LOG("audio #%d: AAudio stream, %d frames per burst, buffer %d frames, performance mode %d", a->id, AAudioStream_getFramesPerBurst(a->au), AAudioStream_getBufferSizeInFrames(a->au), (int)AAudioStream_getPerformanceMode(a->au));
+    return noErr;
+}
+#else
 static OSStatus au_create(aout *a) {
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output,
 #if TARGET_OS_IPHONE
@@ -187,6 +232,7 @@ static OSStatus au_create(aout *a) {
     if (st) { AudioComponentInstanceDispose(a->au); a->au = NULL; }
     return st;
 }
+#endif
 // OpenAudioOut runs on the game's thread, and creating the AudioUnit takes about 24 KB of stack (measured on the Mac: component lookup, instance, Initialize), more than some game threads have
 // left (Super Mario 3D World's save thread has 8 KB in all; Pokémon: Let's Go overflowed here at startup, PR #36). So it runs on a host thread, once per AudioOut. Not HLE_FORCE_BIG:
 // the open hooks log the game's call site through __builtin_return_address(0), which under the big-stack entry would be the trampoline
@@ -194,7 +240,11 @@ static void *au_create_th(void *a) { return (void *)(intptr_t)au_create(a); }
 static void au_open(aout *a) {
     pthread_t t; void *r = NULL;
     if (pthread_create(&t, NULL, au_create_th, a) || pthread_join(t, &r)) die("AudioUnit setup: cannot start its thread");
-    OSStatus st = (OSStatus)(intptr_t)r; if (st) die("AudioUnit setup failed (status %d)", (int)st);
+    OSStatus st = (OSStatus)(intptr_t)r;
+#ifdef __ANDROID__   // no AAudio output (no device, refused format): this output gets the silent sink at Start, the game's audio keeps its real-time pace
+    if (st) { LOG("[RED] audio #%d: no AAudio output (%s): the silent sink stands in", a->id, AAudio_convertResultToText(st)); return; }
+#endif
+    if (st) die("AudioUnit setup failed (status %d)", (int)st);
 }
 // Silent sink: consumes in real time at 48 kHz every 5 ms. When more than 100 ms behind (iOS suspended the whole process in the background, SIGSTOP on the Mac), restart the count from now and do not make up the missed time --
 // making it up would pull hundreds of times in one go (seconds' worth), releasing all of the game's buffers and logging hundreds of underruns; a suspended console does not play that stretch either
@@ -215,9 +265,15 @@ static void backend_stop(aout *a) {
     if (a->backend == BK_AU) { AudioOutputUnitStop(a->au); a->backend = BK_NONE; }
     else if (a->backend == BK_NULL) null_stop(a);
 }
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }   // Android (TARGET_OS_IPHONE 0): the Mac default for now, the silent sink; DM_AUDIO=1 opens AAudio
 // Start the AudioUnit of an output whose backend is BK_NONE (callers hold g_aos_lock). When the device refuses (the session is held by a call, or is being reset), the silent sink stands in and the watchdog retries
 static void au_go(aout *a, uint64_t now) {
+#ifdef __ANDROID__   // a disconnected stream (headphones unplugged, the output device changed) never calls back again and refuses every start: the watchdog's retry opens a new one on the current device,
+    // and a reopen that failed (the route still settling, a refused format) is tried again at each retry, with the same back-off
+    int lost = a->au && AAudioStream_getState(a->au) == AAUDIO_STREAM_STATE_DISCONNECTED;
+    if (lost) { LOG("audio #%d: the AAudio stream was disconnected: opening a new one", a->id); AAudioStream_close(a->au); a->au = NULL; }
+    if (!a->au && (lost || a->stalled)) au_open(a);
+#endif
     OSStatus st = a->au ? AudioOutputUnitStart(a->au) : -1;
     a->wd_n = atomic_load_explicit(&a->cb_n, memory_order_relaxed); a->wd_t = now;
     if (!st) { a->backend = BK_AU; a->stalled = 0; return; }
@@ -239,7 +295,11 @@ static void *au_watchdog(void *p) {
         pthread_mutex_lock(&g_aos_lock);
         uint64_t t = now_ns(), gap = t - last; last = t;
         for (int i = 0; i < AOMAX; i++) {
+#ifdef __ANDROID__
+            aout *a = g_aos[i]; if (!a || (!a->au && !a->stalled)) continue;   // stalled without a stream: its AAudio reopen failed, and the retry below opens one again (au_go)
+#else
             aout *a = g_aos[i]; if (!a || !a->au) continue;
+#endif
             uint64_t n = atomic_load_explicit(&a->cb_n, memory_order_relaxed);
             if (a->backend != BK_AU || g_suspended || gap > 4ull * WD_TICK_MS * 1000000 || n != a->wd_n) {
                 if (a->backend == BK_AU && n != a->wd_n) a->retry_ms = 0;   // callbacks seen: a later stall starts the back-off from 1 s again
@@ -312,7 +372,12 @@ static Result au_start_at(void *g, void *lr) {
     au_note(a, was == STATE_STARTED ? "Start (already playing)" : g_suspended ? "Start (app in the background: the silent sink takes over for now)" : "Start", lr);
     if (was != STATE_STARTED) {
         if (a->au && !g_suspended) { a->stalled = 0; au_go(a, now_ns()); }
-        else null_start(a);
+        else {
+            null_start(a);
+#ifdef __ANDROID__   // real output wanted but no AAudio stream (its open failed: no device yet, a headset still connecting): stalled, so the watchdog's retry opens one (au_go) at 1, 2, 4, 8 s
+            if (!a->au && real_audio()) { a->stalled = 1; a->retry_ms = 1000; a->retry_at = now_ns() + 1000000000ull; }
+#endif
+        }
     }
     pthread_mutex_unlock(&g_aos_lock);
     return RES_OK;

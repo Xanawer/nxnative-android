@@ -3,13 +3,20 @@
 // The host takes over Decoder (below; VP9 is decoded with libvpx, H.264 with VideoToolbox in hle_movie_avc.c, Vorbis audio with stb_vorbis): Engage's movies are 103 VP9 WebM files under RomFS/Data/StreamingAssets/Movie (2.7 GB, no audio track), and the game does not go on until the opening movie S01F has played.
 #include "hle.h"
 #include <arm_neon.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
+#endif
 #include <pthread.h>
 #include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>   // AAC
+#else   // Android: no AAC decoder yet (AMediaCodec comes later); the decoder fields keep their types, md_aac reports the track once and gives no samples
+typedef void *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; UInt32 mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
+#define AudioConverterDispose(c) ((void)(c))
+#endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -327,6 +334,7 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
 // ---------- AAC ----------
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
+#ifdef __APPLE__
 static uint8_t *esds_descr(uint8_t *p, int tag, unsigned n) { *p++ = (uint8_t)tag; for (int i = 3; i > 0; i--) *p++ = (uint8_t)(n >> (7 * i) | 0x80); *p++ = (uint8_t)(n & 0x7f); return p; }
 static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, AudioStreamPacketDescription **pd, void *ud) {
     (void)c; mdec_t *d = ud;
@@ -373,6 +381,24 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     d->out[slot].bytes = (size_t)frames * 2 * d->ch;
     return frames > 0;
 }
+#else
+// One AAC frame of silence per packet (1,024 samples per channel, 2,048 with SBR, as GetOutputBufferSize reports): the track keeps its length and the movie's audio clock runs.
+// Channels and rate as the AudioToolbox path takes them: Configure's, else the AudioSpecificConfig's, else 2 channels at 48 kHz
+static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
+    (void)p;
+    if (d->vhdr_n[0] >= 2) { static const int rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+        int fi = (d->vhdr[0][0] & 7) << 1 | d->vhdr[0][1] >> 7, cc = d->vhdr[0][1] >> 3 & 15;
+        if (fi < 13 && d->rate <= 0) d->rate = rates[fi]; if (cc && cc < 8 && d->ch <= 0) d->ch = cc == 7 ? 8 : cc; }
+    if (d->rate <= 0) d->rate = 48000; if (d->ch <= 0) d->ch = 2;
+    static _Atomic int said; if (!said++) LOG("[RED] movie: AAC unsupported on Android (no decoder yet; %d channels %d Hz): the track plays silence", d->ch, d->rate);
+    if (n <= 0) return 0;
+    if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+    int sbr = d->vhdr_n[0] > 0 && ((d->vhdr[0][0] >> 3) == 5 || (d->vhdr[0][0] >> 3) == 29);
+    size_t bytes = (size_t)(sbr ? 2048 : 1024) * 2 * d->ch; if (bytes > MD_PCM_CAP) bytes = MD_PCM_CAP / (2 * d->ch) * 2 * d->ch;
+    memset(d->out[slot].frm, 0, bytes); d->out[slot].bytes = bytes;
+    return 1;
+}
+#endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
 // Absolum's movies bring csd-0 / csd-1 to Configure, and a decoder made there used to stay NV12: the frames' bytes went into the RGBA texture as they were
 static void md_avc_open(mdec_t *d) { if (!d->avc) { d->avc = mavc_new(); if (d->fmt == MD_FMT_ABGR) mavc_set_rgba(d->avc); } }

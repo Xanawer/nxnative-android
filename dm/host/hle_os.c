@@ -2,7 +2,9 @@
 // (The former 136 HLE entries for nn::os/mem/lmem/C++ ABI have been deleted: the SDK brings its own nn::os, and at load time not one of these entries was resolved and used.)
 #include <pthread.h>
 #include "hle.h"
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#endif
 #include <stdatomic.h>
 
 // ---------- Side table ----------

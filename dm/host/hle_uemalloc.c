@@ -18,7 +18,9 @@
 // keep the guest's function, which calls Malloc through the vtable
 // Fixed addresses: each row runs only on the main build it was found in (AGENTS.md)
 #include "hle.h"
+#ifdef __APPLE__
 #include <malloc/malloc.h>
+#endif
 #include <stdatomic.h>
 
 // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions

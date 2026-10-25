@@ -9,6 +9,8 @@ static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local
 static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
 static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
+// Called on every thread before its first guest instruction (hle_thread.c thread_main, main.c guest_main). On bionic each of the four keys must be set here through pthread_setspecific,
+// not first written by a stub: the stubs write key_data[].data directly, and pthread_getspecific clears a slot whose seq is not the key's (bionic pthread_key.cpp), as on a thread that never set it
 void guest_thread_init(void) {
     pthread_setspecific(g_keygate, (void *)dm_gate);
     pthread_setspecific(g_key18, 0);

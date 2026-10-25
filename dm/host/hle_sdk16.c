@@ -3,7 +3,9 @@
 #include "hle.h"
 #include <fcntl.h>
 #include <pthread.h>
+#ifdef __APPLE__
 #include <pthread/qos.h>
+#endif
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>

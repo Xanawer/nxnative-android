@@ -4,6 +4,37 @@
 // VideoToolbox wants a format description built from SPS / PPS and NAL units with 4-byte length prefixes. Decoding is synchronous and yields pictures in decode order; MediaCodec yields them
 // in presentation order, so pictures wait in a queue sorted by presentation time and leave it once more than `depth` are queued (4 when the profile has B-frames, 0 for Baseline), or all at the end of the stream
 #include "hle.h"
+#ifndef __APPLE__
+// Android: no H.264 decoder yet (AMediaCodec behind this same interface comes later). Each access unit gives a black picture at its time, in presentation order (4 held back, as a stream
+// with B-frames): a player that waits for pictures keeps going and the movie runs its length in black, where no picture at all could leave it waiting for good
+#include "hle_movie_avc.h"
+#define QMAX 16
+struct mavc { int rgba, nq; int64_t q[QMAX]; };
+mavc *mavc_new(void) {
+    static _Atomic int said; if (!said++) LOG("[RED] movie: H.264 unsupported on Android (no decoder yet): its movies play in black");
+    mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a;
+}
+void mavc_free(mavc *a) { free(a); }
+void mavc_param_sets(mavc *a, const uint8_t *p, size_t n) { (void)a; (void)p; (void)n; }
+void mavc_avcc(mavc *a, const uint8_t *p, size_t n) { (void)a; (void)p; (void)n; }
+int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
+    (void)p; if (n <= 0) return 0;
+    if (a->nq == QMAX) return -1;
+    int i = a->nq++; for (; i > 0 && a->q[i - 1] > pts_us; i--) a->q[i] = a->q[i - 1];   // sorted by presentation time
+    a->q[i] = pts_us; return 0;
+}
+int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
+    if (!a->nq || (!flush && a->nq <= 4)) return 0;
+    if (pts_us) *pts_us = a->q[0];
+    memmove(a->q, a->q + 1, --a->nq * sizeof a->q[0]);
+    if (a->rgba) for (size_t i = 0; i < (size_t)w * h; i++) ((uint32_t *)dst)[i] = 0xff000000u;   // opaque black
+    else { memset(dst, 16, (size_t)w * h); memset(dst + (size_t)w * h, 128, (size_t)w * h / 2); }   // NV12 black (video range)
+    return 1;
+}
+int mavc_queued(const mavc *a) { return a->nq; }
+void mavc_set_rgba(mavc *a) { a->rgba = 1; }
+void mavc_drop(mavc *a) { a->nq = 0; }
+#else
 #include <VideoToolbox/VideoToolbox.h>
 #include <arm_neon.h>
 #include "hle_movie_avc.h"
@@ -141,3 +172,4 @@ int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
     CVPixelBufferRelease(pb);
     return 1;
 }
+#endif

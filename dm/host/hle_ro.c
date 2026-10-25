@@ -7,7 +7,9 @@
 // (on Horizon they become the module's memory; the game keeps them until UnloadModule).
 // Only success matters for the failures: the game checks IsSuccess only, so a failure code is a non-zero value under the ro module number 22.
 #include "hle.h"
+#ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
+#endif
 
 #define RO_FAIL ((Result)(22 | (1 << 9)))   // a failure under ro module 22
 #define RO_NOT_NRO ((Result)0x816)           // the SDK's result for an image without NRO0 (sdk+0x3471e8)

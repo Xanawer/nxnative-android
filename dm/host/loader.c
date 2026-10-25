@@ -1,13 +1,17 @@
 // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
 // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
 #include "dm.h"
+#ifdef __APPLE__
 #include <TargetConditionals.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#endif
 #include "hle.h"
 
 module_t g_mod[MAX_MOD];
@@ -22,6 +26,12 @@ uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
+// pthread_key_t is unsigned long on Darwin, an int on bionic with the top bit set (0x80000000 | index): logged as its 32 bits there, not sign-extended to 64
+#ifdef __ANDROID__
+#define KEY_NUM(k) ((unsigned long)(uint32_t)(k))
+#else
+#define KEY_NUM(k) ((unsigned long)(k))
+#endif
 static pthread_key_t key_value(unsigned i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
@@ -31,16 +41,49 @@ static pthread_key_t key_value(unsigned i) {
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
-    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", KEY_NUM(g_key18), KEY_NUM(g_keytls), KEY_NUM(g_keytlr), KEY_NUM(g_keygate));
 }
 
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+// The rewriter's target (patch_nso.py --target): how its stubs reach a thread slot. Modules for another target read the wrong memory as their x18 / TLS, so they are refused (read_layout)
+#ifdef __ANDROID__
+#define DM_MOD_TARGET "android"
+#else
+#define DM_MOD_TARGET "darwin"
+#endif
+// The key page entry of a key: the slot's offset from the stubs' thread base. Darwin: the pthread TSD array (tpidrro_el0), 8 bytes per key. bionic: struct bionic_tls (*(tpidr_el0 - 8)),
+// whose key_data[] of {seq, data} comes first, indexed by the key without its valid bit (bionic keys are 0x80000000 | index; as an int, cast through uint32_t so it is not sign-extended)
+#ifdef __ANDROID__
+#define KEY_SLOT_OFF(k) (16 * (uint64_t)((uint32_t)(k) & 0x7fffffffu) + 8)
+#else
+#define KEY_SLOT_OFF(k) ((uint64_t)(k) * 8)
+#endif
+
+// K slot check: a value set through pthread_setspecific is where the stubs read it (Darwin: the TSD array at tpidrro_el0, slot = base + 8*key; bionic: below)
 static void tsd_check(void) {
+#if defined(__ANDROID__)
+    // bionic: each key's value set through pthread_setspecific must be where the stubs read it, *(tpidr_el0 - 8) + its key page entry (no &~7: tpidr_el0 is the thread pointer itself).
+    // All four keys: each has its own entry in the key page. The values set here are put back (this thread may already carry its slots)
+    uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    uint64_t base = *(uint64_t *)(tp - 8);
+    for (unsigned i = 0; i < KEY_N; i++) {
+        pthread_key_t k = key_value(i); void *was = pthread_getspecific(k);
+        pthread_setspecific(k, (void *)(uintptr_t)(0x1234 + i));
+        uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[i] * 8);
+        uint64_t got = *(uint64_t *)(base + off);
+        pthread_setspecific(k, was);
+        if (got != 0x1234 + i) die("thread slot layout mismatch: key %u (%#x) read %#llx at *(tpidr_el0 - 8) + %#llx, expected %#x", i, (unsigned)k, (unsigned long long)got, (unsigned long long)off, 0x1234 + i);
+    }
+    LOG("thread slots: bionic key data at *(tpidr_el0 - 8) + %#llx / %#llx / %#llx / %#llx, checked", (unsigned long long)KEY_SLOT_OFF(g_key18), (unsigned long long)KEY_SLOT_OFF(g_keytls),
+        (unsigned long long)KEY_SLOT_OFF(g_keytlr), (unsigned long long)KEY_SLOT_OFF(g_keygate));
+#elif defined(__APPLE__)
     pthread_setspecific(g_key18, (void *)0x1234);
     uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
     if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
+#else
+    die("thread slots: no layout for this system (Darwin's TSD or bionic's key data)");
+#endif
 }
 
 static void build_symhash(module_t *m);
@@ -149,7 +192,7 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
 // Forced take-over table (hle.h HLE_FORCE, the __DATA,swforce section): a hit overrides the definition inside the module
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
+    unsigned long sz; g_force = (const hle_force_ent *)DM_SECT_DATA("__DATA", swforce, &sz);
     g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     for (unsigned i = 0; i < g_nforce; i++)
@@ -179,8 +222,9 @@ static void read_layout(module_t *m, const char *dir) {
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
-    char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    char line[256], key[32], target[16] = "darwin"; unsigned long v; unsigned seen = 0;   // no TARGET line: a darwin module (the rewriter writes the line only for other targets)
     while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "# TARGET %15s", target) == 1) continue;   // ahead of the numbers: "android" and "darwin" would both read as hex there
         if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
@@ -200,6 +244,7 @@ static void read_layout(module_t *m, const char *dir) {
         }
     }
     fclose(f);
+    if (strcmp(target, DM_MOD_TARGET)) die("%s: rewritten for %s, this host runs %s modules; rewrite them with dm/tools/patch_nso.py --target %s", path, target, DM_MOD_TARGET, DM_MOD_TARGET);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
@@ -234,7 +279,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = KEY_SLOT_OFF(key_value(i));
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -250,7 +295,7 @@ static void register_gates(module_t *m, const char *dir) {
             if (sscanf(line, "%lx %15s %d %lx", &ret, kind, &arg, &orig) == 4) { gate_register((uint64_t)m->base + ret, kind, arg, orig); ng++; }
         fclose(f);
     }
-    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, KEY_NUM(g_key18), KEY_NUM(g_keytls), KEY_NUM(g_keytlr), KEY_NUM(g_keygate));
 }
 
 // DT_RELR (from SDK 20; all three modules of The Legend of Zelda: Breath of the Wild 1.9.0 have it): a compact table of relative relocations with the addend in the slot (*slot += base).
@@ -417,7 +462,9 @@ void nro_unload(module_t *m) {
 // DM_LOADHASH=1 (diagnostics): after loading, output an address-independent sha256 per module, to prove that the load results of "early start / no early start" are byte-identical.
 // Module base addresses and host ASLR differ every run, and only the values of the relocation slots change with them: copy the image and, using the same relocation table, replace every slot with an address-independent token --
 // RELATIVE → (0, addend); symbol target falls in some module → (1 + module number, offset within the module); otherwise (host forced take-over / host symbol) → (name FNV, addend); all other bytes as is.
+#ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
+#endif
 void loader_hash_log(void) {
     if (!getenv("DM_LOADHASH")) return;
     for (int k = 0; k < g_nmod; k++) {
@@ -540,6 +587,9 @@ static void map_image(module_t *m, const char *dir) {
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+#ifndef __APPLE__
+        __builtin___clear_cache((char *)m->base, (char *)m->base + rx); __builtin___clear_cache((char *)a, (char *)a + m->patch_len);   // Linux leaves the instruction cache to the writer: code copied in with data stores must be cleaned to it before it first runs
+#endif
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
@@ -552,6 +602,9 @@ static void map_image(module_t *m, const char *dir) {
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
+#ifndef __APPLE__
+    __builtin___clear_cache((char *)m->base, (char *)m->base + rx); __builtin___clear_cache((char *)m->base + po, (char *)m->base + m->size);   // Linux leaves the instruction cache to the writer: code copied in with data stores must be cleaned to it before it first runs
+#endif
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }
 #endif

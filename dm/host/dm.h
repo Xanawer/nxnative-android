@@ -1,5 +1,6 @@
 // Common header of the native Switch host (multi-module).
 #pragma once
+#include "plat/plat.h"   // platform layer: Darwin service names on Linux, object-format macros (nothing else on Apple)
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
