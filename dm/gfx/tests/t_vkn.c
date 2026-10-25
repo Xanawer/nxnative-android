@@ -6,12 +6,27 @@
 // - strategy B (PLAN.md 2.2 "As built, slice 2a"): bytes written into a CPU-visible pool reach its shadow buffer (read back on the GPU), a rewrite uploads only the pages written, and a pool deleted while
 //   a submission that read it is in flight (held back on the GPU by a semaphore the test signals) has its pages writable at once and its shadow destroyed only after that submission completes.
 //   Two pools sharing a host page (16 KB pages; skipped at 4 KB, where 4 KB-aligned pools share none): an address there resolves to the pool whose bytes hold it, the page is protected by
-//   neither and both shadows get it at every submission. The real write tracking is linked in (nvn_dirty.c, and host/crash.c for its fault handler), as in the host;
+//   neither and both shadows get it at every submission. The real write tracking is linked in (nvn_dirty.c, and host/crash.c for its fault handler), as in the host. A write whose fault's
+//   unprotect is under way at the commit's stamp (held between its BUSY and its generation increment by the interposed mprotect below, the stamp read one ahead) is picked by the commit's
+//   re-scan after its drain, reaches the shadow, and its page is protected again;
+// - sampled textures (PLAN.md 2.3 "As built, slice 2b"): a CPU-written RGBA8 texture with a mip chain, swizzled into a pool as the guest lays it out, bound and drawn with, reads back level by level as
+//   written (uploaded through the CPU deswizzle); it is uploaded again only after a guest write (one into its own bytes; one beside it in a page it shares is only compared), its pages protected;
+//   one nothing wrote is cleared to zero; a format this slice does not upload gets no image; on 16 KB hosts one in an edge page of two pools is never protected and uploaded at every use;
+//   ReadTexels reads it from guest memory; a render target later registered as a texture is one image, its layout moved from rendered to sampled ahead of the submission and within one;
+//   samplers for every filter and wrap mode (and anisotropy, compare, reduction, border, bias) are made, the same parameters sharing one;
+//   a write whose page generation the tracker stores after a check has read the moved generation (staged through t_dirty_now) is still uploaded at the next use; a LINEAR texture the CPU
+//   writes straight into its pool is uploaded and tracked, and stride 0 means nvn_tex_layout's row pitch; storage the CPU flushed, or a CPU_NO_ACCESS pool's initial content, fills a
+//   texture once (a COMPRESSIBLE one there is cleared to zero); an RGBX view and a biased sampler are valid, and under a portability subset without those features they fall back;
 // - no validation message. Each target is read back with a copy to a host-visible buffer.
 // T_VKN_STRICT=1 (make check_t_vkn) never skips: no device, validation off or any failure to start is a failure. Without it (make run) a machine with no Vulkan at all (no loader, or a
 // loader with no driver: vd.absent) is said to be SKIPPED and passes; a Vulkan that is there but fails to start fails all the same, and validation off is said (its check passes unchecked)
+// nvn_dirty_now reaches the backend through t_dirty_now (below), so a check can be staged in the window between nvn_dirty.c's generation increment and the page's generation store
+#define nvn_dirty_now t_dirty_now
 #include "../vkn/nvn_vk.c"
+#undef nvn_dirty_now
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 
 // What the backend needs of the host and of hle_nvn.c
@@ -25,6 +40,29 @@ void *front_metal_layer(void) { return NULL; }
 void *front_native_window(void) { return NULL; }
 _Atomic uint64_t dm_present_ns;
 uint64_t now_ns(void) { return mono_ns(); }
+static uint8_t *g_tflush_lo, *g_tflush_hi;   // the one range the test says the CPU flushed (hle_nvn.c's nvn_flushed keeps every nvnMemoryPoolFlushMappedRange)
+int nvn_flushed(const void *p, uint64_t n) { const uint8_t *a = p; return g_tflush_lo && a < g_tflush_hi && a + n > g_tflush_lo; }
+uint64_t nvn_dirty_now(void);
+static _Atomic uint64_t g_now_ahead;   // what the backend reads is this far ahead of the tracker's generation (0: the same)
+uint64_t t_dirty_now(void) { return nvn_dirty_now() + atomic_load(&g_now_ahead); }
+
+// mprotect, interposed: nvn_dirty.c is linked into this executable, so its calls take this definition (the real one is the next image's, resolved before main: dlsym is no signal handler's
+// call). Armed with a page (g_mp_hold), the next set-writable call covering it waits g_mp_ms first (one shot; nanosleep and atomics only: it runs in the fault handler): a write fault's
+// unprotect (nvn_dirty.c unprotect_page) is held after its state change PROT -> BUSY and before its generation increment, with g_mp_held saying so
+static int (*g_real_mprotect)(void *, size_t, int);
+static _Atomic uintptr_t g_mp_hold; static _Atomic int g_mp_held; static _Atomic uint64_t g_mp_n; static const long g_mp_ms = 300;
+__attribute__((constructor)) static void mp_resolve(void) { g_real_mprotect = (int (*)(void *, size_t, int))dlsym(RTLD_NEXT, "mprotect"); }
+int mprotect(void *a, size_t n, int prot) {
+    atomic_fetch_add(&g_mp_n, 1);
+    uintptr_t h = atomic_load(&g_mp_hold);
+    if (h && (prot & PROT_WRITE) && h >= (uintptr_t)a && h < (uintptr_t)a + n && atomic_compare_exchange_strong(&g_mp_hold, &h, 0)) {
+        atomic_store(&g_mp_held, 1);
+        struct timespec ts = {0, g_mp_ms * 1000000L}; while (nanosleep(&ts, &ts) && errno == EINTR) {}
+    }
+    if (!g_real_mprotect) { errno = ENOSYS; return -1; }
+    return g_real_mprotect(a, n, prot);
+}
+static void *t_writer(void *p) { *(volatile uint8_t *)p = 0x5a; return NULL; }   // one store, from another thread: its fault is the one held
 
 static int checks, failed;
 #define CHECK(c, ...) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -182,6 +220,56 @@ static int shoot(const tex_t *t, const char *path) {
 static uint32_t rgba(float r, float g, float b, float a) { return (uint32_t)(r * 255.f + .5f) | (uint32_t)(g * 255.f + .5f) << 8 | (uint32_t)(b * 255.f + .5f) << 16 | (uint32_t)(a * 255.f + .5f) << 24; }
 static float depth_at(const tex_t *t, int x, int y) { uint32_t v = texel(t, x, y); float f; memcpy(&f, &v, 4); return f; }
 
+// ---------- Sampled textures ----------
+// A texture whose storage is in a test pool at off (laid out by nvn_tex.c, as hle_nvn.c's TextureInitialize does): live, no host image until a draw looks it up
+static tex_t *tex_in(uint8_t *pool, size_t off, unsigned w, unsigned h, unsigned levels, int fmt) {
+    tex_t *t = calloc(1, sizeof *t); t->d.width = w; t->d.height = h; t->d.depth = 1; t->d.levels = levels; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.format = fmt;
+    nvn_tex_layout(&t->d, &t->L); t->mem = pool + off; t->serial = nvn_new_serial(); mtl_tex_init(t);
+    return t;
+}
+// The same with texture flags, a row stride and the pool object (hle_nvn.c's TextureInitialize gives every texture with storage its pool)
+static tex_t *tex_in_p(uint8_t *mem, pool_t *pool, unsigned w, unsigned h, int fmt, int flags, unsigned stride) {
+    tex_t *t = calloc(1, sizeof *t); t->d.width = w; t->d.height = h; t->d.depth = 1; t->d.levels = 1; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.format = fmt; t->d.flags = flags; t->d.stride = stride;
+    nvn_tex_layout(&t->d, &t->L); t->mem = mem; t->pool = pool; t->serial = nvn_new_serial(); mtl_tex_init(t);
+    return t;
+}
+static void rec_bind(int tid, int sid) { p_bind_tex1 b = {4, 0, (uint64_t)tid | (uint64_t)sid << 20, 0, 0}; rec(OP_BIND_TEX1, &b, sizeof b); }   // fragment stage, slot 0
+static void draw_with(const tex_t *rt, int tid, int sid) { rec_rt(rt, NULL); rec_bind(tid, sid); rec_draw(); submit(); }
+static uint64_t ts_n(int i) { return atomic_load(&g_ts[i]); }
+static VkImageLayout layout_of(const tex_t *t) { pthread_mutex_lock(&vkn_tmu); vkn_img *e = vkn_img_get(t->serial); VkImageLayout l = e ? e->layout : (VkImageLayout)-1; pthread_mutex_unlock(&vkn_tmu); return l; }
+static vkn_img *img_of(const tex_t *t) { pthread_mutex_lock(&vkn_tmu); vkn_img *e = vkn_img_get(t->serial); pthread_mutex_unlock(&vkn_tmu); return e; }
+// Level lv of t's host image (w x h texels of 4 bytes) into g_xmap, the queue idle around it; the image goes back to the layout the backend tracks. 1 = read
+static int img_read(const tex_t *t, uint32_t lv, uint32_t w, uint32_t h) {
+    mtl_finish();
+    pthread_mutex_lock(&vkn_qmu); pthread_mutex_lock(&vkn_tmu);
+    vkn_img *e = vkn_img_get(t->serial); int ok = 0;
+    if (e && e->layout != VK_IMAGE_LAYOUT_UNDEFINED && (size_t)w * h * 4 <= XCAP) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        t_vkResetCommandBuffer(g_rcb, 0); vk.vkBeginCommandBuffer(g_rcb, &bi);
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            e->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, e->img, {e->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
+        vk.vkCmdPipelineBarrier2(g_rcb, &di);
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        t_vkCmdCopyImageToBuffer(g_rcb, e->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_xbuf, 1, &r);
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; b.srcAccessMask = 0; b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = e->layout;
+        VkMemoryBarrier2 hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo d2 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &hb, 0, NULL, 1, &b};
+        vk.vkCmdPipelineBarrier2(g_rcb, &d2);
+        vk.vkEndCommandBuffer(g_rcb);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_rcb, 0, NULL};
+        ok = !t_vkQueueSubmit(vd.q, 1, &si, VK_NULL_HANDLE) && !vk.vkQueueWaitIdle(vd.q);
+    }
+    pthread_mutex_unlock(&vkn_tmu); pthread_mutex_unlock(&vkn_qmu);
+    return ok;
+}
+// The linear content of level lv (gen: which version), RGBA8 rows of w texels
+static void tex_pattern(uint8_t *p, uint32_t w, uint32_t h, uint32_t lv, int gen) {
+    for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) { uint8_t *q = p + ((size_t)y * w + x) * 4; q[0] = (uint8_t)(lv * 50 + x + gen * 7); q[1] = (uint8_t)(y * 3 + gen); q[2] = (uint8_t)(x ^ y); q[3] = (uint8_t)(255 - lv - gen); }
+}
+static uint64_t uploads(void) { return ts_n(TS_UP1) + ts_n(TS_RE) + ts_n(TS_REALW); }
+
 int main(void) {
     const char *st = getenv("T_VKN_STRICT"); int strict = st && atoi(st) > 0;
     crash_install();   // the write-fault handler nvn_dirty.c hooks into (B protects pool pages)
@@ -283,6 +371,41 @@ int main(void) {
             munmap(pm, n);
         }
     }
+    // ---------- B: an unprotect under way at the commit's stamp (nvn_vk.c b_commit: the drain and the re-scan) ----------
+    // A writer thread's fault on a protected page is held in nvn_dirty.c's unprotect, BUSY and not yet counted (the interposed mprotect); the commit runs meanwhile with its stamp one ahead of the
+    // tracker (t_dirty_now), so the stamp covers the generation the unprotect is about to take, as when the increment lands before the stamp read and the page's generation store after the scan.
+    // The scan does not pick the page. Without the drain (waiting it out of BUSY, then protecting it) and the re-scan (its generation newer than the last stamp), it would end writable with a
+    // generation no newer than this stamp: no later commit would copy it, and the write would never reach the shadow
+    {
+        size_t pg = (size_t)getpagesize(), n = 2 * pg; uint8_t *pm = pool_new(n);
+        CHECK(g_real_mprotect && atomic_load(&g_mp_n) > 0, "the tracker's mprotect calls reach the test's (resolved %d, %llu calls so far)", g_real_mprotect != NULL, (unsigned long long)atomic_load(&g_mp_n));
+        CHECK(pm != NULL, "a test pool of %zu B", n);
+        if (pm) {
+            memset(pm, 0x11, n);
+            rec_ubo(pm, n); submit();   // both pages read: uploaded, then protected
+            VkBuffer sb; uint64_t off, gpu; int has = shadow_of(pm, n, &sb, &off, &gpu);
+            CHECK(has && buf_read(sb, off, n) && !memcmp(g_xmap, pm, n) && !writable(pm + pg, pg), "set up: the pool's shadow holds it and page 1 is protected");
+            uint64_t f0 = faults(), l0 = atomic_load(&g_bs_late), w0 = b_pages(0);
+            atomic_store(&g_mp_held, 0); atomic_store(&g_mp_hold, (uintptr_t)(pm + pg));
+            pthread_t th; int started = !pthread_create(&th, NULL, t_writer, pm + pg + 8);
+            int held = 0; for (int i = 0; started && i < 2000 && !(held = atomic_load(&g_mp_held)); i++) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+            CHECK(started && held, "the writer's fault is held in the unprotect (thread started %d, held %d)", started, held);
+            if (held) {
+                atomic_store(&g_now_ahead, 1); rec_ubo(pm, n); submit(); atomic_store(&g_now_ahead, 0);   // the stamp is read in b_commit: one ahead across the whole commit
+                CHECK(atomic_load(&g_bs_late) - l0 == 1 && b_pages(0) - w0 == 1, "the commit's scan missed the page and its re-scan after the drain picked it: %llu late, %llu written since",
+                      (unsigned long long)(atomic_load(&g_bs_late) - l0), (unsigned long long)(b_pages(0) - w0));
+            }
+            atomic_store(&g_mp_hold, 0);
+            if (started) pthread_join(th, NULL);
+            CHECK(pm[pg + 8] == 0x5a && faults() - f0 >= 1, "the write landed (%#x) through the tracker (%llu faults)", pm[pg + 8], (unsigned long long)(faults() - f0));
+            rec_ubo(pm, n); submit();
+            CHECK(buf_read(sb, off, n) && !memcmp(g_xmap, pm, n), "the next submission's shadow holds the write (GPU readback: %#x at the written byte)", g_xmap[pg + 8]);
+            uint64_t f1 = faults(); pm[pg + 16] = 0x6b;
+            rec_ubo(pm, n); submit();
+            CHECK(faults() == f1 + 1 && buf_read(sb, off, n) && !memcmp(g_xmap, pm, n), "the page is protected again: a later write faults (%llu) and reaches the shadow", (unsigned long long)(faults() - f1));
+            pool_fin(pm); munmap(pm, n);
+        }
+    }
     // ---------- B: two pools sharing a host page ----------
     // Pool A is [m, m + pg + 4 KB), pool B [m + pg + 4 KB, m + 3 pg): page 1 is in both rounded ranges, an edge page of each (nvn_vk.c mtl_pool_add). Neither protects it (two ranges protecting
     // one page leave one stale), both shadows get it at every submission, and an address in it resolves to the pool whose bytes hold it (the lookup cache included: A is looked up first)
@@ -349,6 +472,226 @@ int main(void) {
         }
         if (gate) vk.vkDestroySemaphore(vd.dev, gate, NULL);
         if (pd) munmap(pd, n);
+    }
+
+    // ---------- Sampled textures (slice 2b) ----------
+    {
+        size_t pg = (size_t)getpagesize(), n = 16 * pg; uint8_t *tp = pool_new(n);
+        tex_t *rtc = tex(64, 64, NVN_FORMAT_RGBA8);   // the target the draws render to (it reads nothing)
+        samp_par lin = {NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR, NVN_MAG_FILTER_LINEAR, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, 0, 0, 0, 0.f, 1000.f, 0.f, 1.f, {0, 0, 0, 0}};
+        mtl_reg_samp(3, &lin);
+        CHECK(tp != NULL, "the texture test pool");
+        if (tp) {
+            // A 40x24 RGBA8 texture with 4 levels, written by the CPU as the guest lays it out (block-linear), at a page boundary of the pool (its end shares a page with the pool's other bytes)
+            tex_t *st = tex_in(tp, 2 * pg, 40, 24, 4, NVN_FORMAT_RGBA8);
+            uint8_t *lin0 = malloc(40 * 24 * 4); int sw_ok = 1;
+            for (uint32_t l = 0; l < 4; l++) { uint32_t w = 40 >> l, h = 24 >> l; tex_pattern(lin0, w, h, l, 0); sw_ok &= nvn_swizzle(&st->d, l, 0, lin0, w * 4, st->mem) == 0; }
+            CHECK(sw_ok && st->L.size < 14 * pg, "the texture is swizzled into the pool (%llu B)", (unsigned long long)st->L.size);
+            mtl_tex_cpu_written(st);
+            mtl_reg_tex(5, st, NULL);
+            uint64_t u1 = ts_n(TS_UP1), made0 = ts_n(TS_MADE);
+            draw_with(rtc, 5, 3);
+            CHECK(ts_n(TS_UP1) == u1 + 1 && ts_n(TS_MADE) == made0 + 1, "its first draw makes its host image and uploads it once (%llu uploads, %llu images)", (unsigned long long)(ts_n(TS_UP1) - u1), (unsigned long long)(ts_n(TS_MADE) - made0));
+            vkn_img *e = img_of(st);
+            CHECK(e && e->levels == 4 && e->fmt == VK_FORMAT_R8G8B8A8_UNORM && layout_of(st) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, "its image: 4 levels, R8G8B8A8_UNORM, shader-read after the submission (levels %u, layout %d)",
+                  e ? e->levels : 0, (int)layout_of(st));
+            for (uint32_t l = 0; l < 4; l++) { uint32_t w = 40 >> l, h = 24 >> l; tex_pattern(lin0, w, h, l, 0);
+                CHECK(img_read(st, l, w, h) && !memcmp(g_xmap, lin0, (size_t)w * h * 4), "level %u (%ux%u) reads back as written (GPU readback of the deswizzled upload)", l, w, h); }
+            CHECK(!writable(tp + 2 * pg, pg), "its pages are protected after the upload");
+            // No guest write: nothing uploaded. A write beside it in the page it shares: compared, not uploaded. A write into level 0: uploaded once, then nothing again
+            uint64_t up0 = uploads(), es0 = ts_n(TS_EDGE), f0 = faults();
+            draw_with(rtc, 5, 3);
+            CHECK(uploads() == up0, "drawn again with no guest write: no upload (%llu)", (unsigned long long)(uploads() - up0));
+            size_t end = 2 * pg + (size_t)st->L.size;
+            if (end % pg) {
+                tp[end + 8] = 0x42;
+                draw_with(rtc, 5, 3);
+                CHECK(faults() > f0 && uploads() == up0 && ts_n(TS_EDGE) == es0 + 1, "a write beside it in its last page faults (%llu) and is only compared: %llu uploads, %llu beside", (unsigned long long)(faults() - f0),
+                      (unsigned long long)(uploads() - up0), (unsigned long long)(ts_n(TS_EDGE) - es0));
+            }
+            uint64_t re0 = ts_n(TS_RE); f0 = faults();
+            tex_pattern(lin0, 40, 24, 0, 1); nvn_swizzle(&st->d, 0, 0, lin0, 40 * 4, st->mem);
+            CHECK(faults() > f0, "the rewrite of level 0 faults (%llu)", (unsigned long long)(faults() - f0));
+            draw_with(rtc, 5, 3);
+            CHECK(ts_n(TS_RE) == re0 + 1 && uploads() == up0 + 1, "a guest write into it: one re-upload (%llu, %llu uploads)", (unsigned long long)(ts_n(TS_RE) - re0), (unsigned long long)(uploads() - up0));
+            CHECK(img_read(st, 0, 40, 24) && !memcmp(g_xmap, lin0, 40 * 24 * 4), "level 0 reads back as rewritten");
+            tex_pattern(lin0, 20, 12, 1, 0);
+            CHECK(img_read(st, 1, 20, 12) && !memcmp(g_xmap, lin0, 20 * 12 * 4), "level 1 as it was");
+            up0 = uploads(); draw_with(rtc, 5, 3);
+            CHECK(uploads() == up0, "and nothing after it (%llu)", (unsigned long long)(uploads() - up0));
+            // ReadTexels of a CPU-written texture: guest memory, de-laid-out
+            { NVNcopyRegion r = {0, 0, 0, 40, 24, 1}; uint8_t *rt = calloc(40 * 24, 4); tex_pattern(lin0, 40, 24, 0, 1);
+              mtl_read_texels(st, 0, 0, &r, rt, 40 * 4, 40 * 24 * 4);
+              CHECK(!memcmp(rt, lin0, 40 * 24 * 4), "ReadTexels reads it from guest memory as written"); free(rt); }
+            // A texture created later, which nothing wrote: cleared to zero at its first use
+            tex_t *zt = tex_in(tp, 8 * pg, 16, 16, 1, NVN_FORMAT_RGBA8); memset(zt->mem, 0xee, (size_t)zt->L.size);   // bytes in guest memory, but not CPU-written: not uploaded
+            mtl_reg_tex(8, zt, NULL);
+            uint64_t z0 = ts_n(TS_ZERO);
+            draw_with(rtc, 8, 3);
+            CHECK(ts_n(TS_ZERO) == z0 + 1 && texel(zt, 3, 3) == 0 && layout_of(zt) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, "a texture nothing wrote is cleared to zero (%llu fills, texel %#x)", (unsigned long long)(ts_n(TS_ZERO) - z0), texel(zt, 3, 3));
+            // It becomes CPU-written later (WriteTexels): uploaded from then on
+            u1 = ts_n(TS_UP1); mtl_tex_cpu_written(zt);
+            draw_with(rtc, 8, 3);
+            CHECK(ts_n(TS_UP1) == u1 + 1 && texel(zt, 3, 3) == 0xeeeeeeee, "once CPU-written it is uploaded (%llu, texel %#x)", (unsigned long long)(ts_n(TS_UP1) - u1), texel(zt, 3, 3));
+            // A format this slice does not upload: no host image (said in red once)
+            tex_t *ft = tex_in(tp, 10 * pg, 16, 16, 1, NVN_FORMAT_RGBA16F); mtl_tex_cpu_written(ft); mtl_reg_tex(9, ft, NULL);
+            draw_with(rtc, 9, 3);
+            CHECK(img_of(ft) == NULL, "a CPU-written RGBA16F texture gets no host image");
+            draw_with(rtc, 0, 0);
+            free(lin0);
+            pool_fin(tp);
+            CHECK(writable(tp, n), "the texture pool's pages are writable once it is freed");
+            munmap(tp, n);
+        }
+        // A pool whose first page is an edge page shared with the memory before it (16 KB hosts): a texture there is never protected and uploaded at every use
+        if (pg > 4096) {
+            uint8_t *m = mmap(NULL, 3 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0), *pa = m + 4096; size_t na = 3 * pg - 4096;
+            CHECK(m != MAP_FAILED, "the edge-page test's memory");
+            if (m != MAP_FAILED) {
+                mtl_pool_add(pa, na); nvn_dirty_add_range(pa, na);
+                tex_t *et = tex_in(pa, 0, 16, 16, 1, NVN_FORMAT_RGBA8); memset(et->mem, 0x33, (size_t)et->L.size); mtl_tex_cpu_written(et); mtl_reg_tex(11, et, NULL);
+                uint64_t u1 = ts_n(TS_UP1), ra = ts_n(TS_REALW);
+                draw_with(rtc, 11, 3);
+                CHECK(ts_n(TS_UP1) == u1 + 1 && texel(et, 1, 1) == 0x33333333, "a texture in a pool's edge page is uploaded (%llu, %#x)", (unsigned long long)(ts_n(TS_UP1) - u1), texel(et, 1, 1));
+                CHECK(writable(m, pg), "its page is not protected");   // (zeros written there by the check)
+                draw_with(rtc, 11, 3);
+                CHECK(ts_n(TS_REALW) == ra + 1 && texel(et, 1, 1) == 0, "it is uploaded at every use, written or not (%llu), and has the bytes as they are (%#x)", (unsigned long long)(ts_n(TS_REALW) - ra), texel(et, 1, 1));
+                draw_with(rtc, 0, 0);
+                nvn_dirty_remove_range(pa); mtl_pool_del(pa); munmap(m, 3 * pg);
+            }
+        }
+        // ---------- Review round 1 (PLAN.md 2.3 "As built, slice 2b") ----------
+        {
+            size_t n2 = 16 * pg; uint8_t *p2 = pool_new(n2); pool_t pp = {0, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED, p2, n2};
+            CHECK(p2 != NULL, "the second texture test pool");
+            uint8_t *pat = malloc(64 * 64 * 4);
+            if (p2 && pat) {
+                // The dirty check's window: nvn_dirty.c's unprotect moves the generation, then stores the page's. A check between the two reads the new generation and finds the page clean.
+                // Staged: one submission's replay reads the generation one ahead (as if a fault's unprotect had just taken it), its commit does not; then the guest write lands and faults (its
+                // unprotect takes that same value). A "the generation has not moved since the last check" shortcut would skip the next check for good; the write must be uploaded
+                tex_t *wt = tex_in_p(p2, &pp, 64, 64, NVN_FORMAT_RGBA8, 0, 0);
+                tex_pattern(pat, 64, 64, 0, 3); nvn_swizzle(&wt->d, 0, 0, pat, 64 * 4, wt->mem); mtl_tex_cpu_written(wt); mtl_reg_tex(21, wt, NULL);
+                draw_with(rtc, 21, 3);
+                CHECK(!writable(p2, (size_t)wt->L.size), "the staged-window texture (%llu B) is uploaded and its pages protected", (unsigned long long)wt->L.size);
+                uint64_t up0 = uploads(), re0 = ts_n(TS_RE), f0 = faults();
+                rec_rt(rtc, NULL); rec_bind(21, 3); rec_draw(); rec(OP_END, NULL, 0);
+                mtl_sub_begin(); atomic_store(&g_now_ahead, 1); mtl_exec(g_rec); atomic_store(&g_now_ahead, 0); mtl_sub_commit(); g_rn = 0;
+                CHECK(uploads() == up0, "the staged submission uploads nothing (%llu)", (unsigned long long)(uploads() - up0));
+                tex_pattern(pat, 64, 64, 0, 4); nvn_swizzle(&wt->d, 0, 0, pat, 64 * 4, wt->mem);
+                CHECK(faults() > f0, "the guest write after it faults (%llu)", (unsigned long long)(faults() - f0));
+                draw_with(rtc, 21, 3);
+                CHECK(ts_n(TS_RE) == re0 + 1 && img_read(wt, 0, 64, 64) && !memcmp(g_xmap, pat, 64 * 64 * 4), "a write whose generation was taken before a check and stored after it is uploaded at the next use (%llu re-uploads)",
+                      (unsigned long long)(ts_n(TS_RE) - re0));
+                draw_with(rtc, 0, 0);
+                // A LINEAR texture the CPU writes straight into its pool (nvn_mtl.m reads the pool memory itself; the front half sends no CPU-written notice): uploaded from the start and
+                // tracked. Stride 0 (the builder's default): rows at nvn_tex_layout's pitch, 20 RGBA8 texels = 80 B rounded up to 96
+                tex_t *lt = tex_in_p(p2 + 4 * pg, &pp, 20, 6, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR, 0);
+                CHECK(lt->L.size == 96 * 6, "a stride-0 linear 20x6 RGBA8 texture is 96 B a row in storage (%llu B)", (unsigned long long)lt->L.size);
+                tex_pattern(pat, 20, 6, 0, 5); for (int y = 0; y < 6; y++) memcpy(lt->mem + 96 * y, pat + 80 * y, 80);
+                mtl_reg_tex(22, lt, NULL);
+                uint64_t u1 = ts_n(TS_UP1), z0 = ts_n(TS_ZERO);
+                draw_with(rtc, 22, 3);
+                CHECK(ts_n(TS_UP1) == u1 + 1 && ts_n(TS_ZERO) == z0 && img_read(lt, 0, 20, 6) && !memcmp(g_xmap, pat, 20 * 6 * 4), "a linear texture written through its pool is uploaded from it, not zero-filled (%llu uploads, %llu fills)",
+                      (unsigned long long)(ts_n(TS_UP1) - u1), (unsigned long long)(ts_n(TS_ZERO) - z0));
+                up0 = uploads(); tex_pattern(pat, 20, 6, 0, 6); for (int y = 0; y < 6; y++) memcpy(lt->mem + 96 * y, pat + 80 * y, 80);
+                draw_with(rtc, 22, 3);
+                CHECK(uploads() == up0 + 1 && img_read(lt, 0, 20, 6) && !memcmp(g_xmap, pat, 20 * 6 * 4), "and uploaded again after the CPU rewrites it there (%llu)", (unsigned long long)(uploads() - up0));
+                // A CPU-written (WriteTexels) linear 32x2 RGBA8 texture with stride 0: 128 B rows, 256 B of storage
+                tex_t *l2 = tex_in_p(p2 + 5 * pg, &pp, 32, 2, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR, 0);
+                tex_pattern(pat, 32, 2, 0, 7); memcpy(l2->mem, pat, 256); mtl_tex_cpu_written(l2); mtl_reg_tex(23, l2, NULL);
+                u1 = ts_n(TS_UP1);
+                draw_with(rtc, 23, 3);
+                CHECK(l2->L.size == 256 && ts_n(TS_UP1) == u1 + 1 && img_read(l2, 0, 32, 2) && !memcmp(g_xmap, pat, 256), "a CPU-written stride-0 linear 32x2 texture (%llu B) is uploaded by rows of 128 B (%llu)",
+                      (unsigned long long)l2->L.size, (unsigned long long)(ts_n(TS_UP1) - u1));
+                // An explicit stride still rules: 16x4 RGBA8 at 256 B a row
+                tex_t *l3 = tex_in_p(p2 + 6 * pg, &pp, 16, 4, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR, 256);
+                tex_pattern(pat, 16, 4, 0, 8); for (int y = 0; y < 4; y++) memcpy(l3->mem + 256 * y, pat + 64 * y, 64);
+                mtl_reg_tex(24, l3, NULL); draw_with(rtc, 24, 3);
+                CHECK(img_read(l3, 0, 16, 4) && !memcmp(g_xmap, pat, 16 * 4 * 4), "a linear texture with a 256 B stride reads back as written");
+                // Storage the CPU flushed before the texture's first use (nvn_flushed), nothing else writing it: filled from it once, not tracked; CPU-written later, uploaded as such
+                tex_t *ff = tex_in_p(p2 + 7 * pg, &pp, 16, 16, NVN_FORMAT_RGBA8, 0, 0);
+                tex_pattern(pat, 16, 16, 0, 9); nvn_swizzle(&ff->d, 0, 0, pat, 16 * 4, ff->mem); g_tflush_lo = ff->mem; g_tflush_hi = ff->mem + 64;
+                mtl_reg_tex(25, ff, NULL);
+                uint64_t i0 = ts_n(TS_INIT); u1 = ts_n(TS_UP1); z0 = ts_n(TS_ZERO);
+                draw_with(rtc, 25, 3);
+                CHECK(ts_n(TS_INIT) == i0 + 1 && ts_n(TS_UP1) == u1 && ts_n(TS_ZERO) == z0 && img_read(ff, 0, 16, 16) && !memcmp(g_xmap, pat, 16 * 16 * 4),
+                      "a texture in flushed storage is filled from it at its first use (%llu fills, %llu uploads, %llu zero fills)", (unsigned long long)(ts_n(TS_INIT) - i0), (unsigned long long)(ts_n(TS_UP1) - u1),
+                      (unsigned long long)(ts_n(TS_ZERO) - z0));
+                draw_with(rtc, 25, 3);
+                CHECK(ts_n(TS_INIT) == i0 + 1 && ts_n(TS_UP1) == u1, "once only (%llu fills)", (unsigned long long)(ts_n(TS_INIT) - i0));
+                g_tflush_lo = g_tflush_hi = NULL;
+                mtl_tex_cpu_written(ff); draw_with(rtc, 25, 3);
+                CHECK(ts_n(TS_UP1) == u1 + 1, "once CPU-written it is uploaded as such (%llu)", (unsigned long long)(ts_n(TS_UP1) - u1));
+                // A texture with an alpha-less format (RGBX8: the view reads alpha as one, a component swizzle) and a sampler with a LOD bias: valid on a portability-subset driver too
+                // (MoltenVK: the features enabled; make check_t_vkn's KosmicKrisp has no such extension). Where the subset lacks the feature: an identity view and no bias (said once)
+                tex_t *xt = tex_in_p(p2 + 8 * pg, &pp, 16, 16, NVN_FORMAT_RGBX8, 0, 0);
+                tex_pattern(pat, 16, 16, 0, 10); nvn_swizzle(&xt->d, 0, 0, pat, 16 * 4, xt->mem); mtl_tex_cpu_written(xt); mtl_reg_tex(26, xt, NULL);
+                samp_par bp = lin; bp.lod_bias = 1.5f; mtl_reg_samp(27, &bp);
+                draw_with(rtc, 26, 27);
+                CHECK(T.tv[4][0] != VK_NULL_HANDLE && T.ts[4][0] != VK_NULL_HANDLE && img_read(xt, 0, 16, 16) && !memcmp(g_xmap, pat, 16 * 16 * 4), "an RGBX8 texture's view and a biased sampler are made, its bytes uploaded as they are");
+                { int sp = vd.port, sb = vd.port_bias, ss = vd.port_swz; const uint8_t sw[4] = {2, 3, 4, 1}; VkComponentSwizzle c[4];
+                  vd.port = 1; vd.port_bias = 1; vd.port_swz = 1; sview_comp(sw, c); float b1 = samp_bias(1.5f);
+                  CHECK(c[0] == VK_COMPONENT_SWIZZLE_IDENTITY && c[3] == VK_COMPONENT_SWIZZLE_ONE && b1 == (1.5f < vd.props.limits.maxSamplerLodBias ? 1.5f : vd.props.limits.maxSamplerLodBias),
+                        "with the portability features: alpha mapped to one (%d), the bias kept (%g)", (int)c[3], b1);
+                  vd.port_bias = 0; vd.port_swz = 0; sview_comp(sw, c); float b0 = samp_bias(1.5f);
+                  CHECK(c[0] == VK_COMPONENT_SWIZZLE_IDENTITY && c[3] == VK_COMPONENT_SWIZZLE_IDENTITY && b0 == 0, "without them: an identity view (%d) and no bias (%g)", (int)c[3], b0);
+                  vd.port = sp; vd.port_bias = sb; vd.port_swz = ss; }
+                draw_with(rtc, 0, 0);
+            }
+            // Initial content in a CPU_NO_ACCESS pool (nvn_mtl.m tex_init_fill): what the storage held when the pool was made is the texture's content, filled once at its first use; a
+            // COMPRESSIBLE one there (a render target) is cleared to zero instead
+            uint8_t *nm = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); pool_t np = {0, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED, nm, 2 * pg};
+            CHECK(nm != MAP_FAILED, "the CPU_NO_ACCESS test pool");
+            if (nm != MAP_FAILED && pat) {
+                tex_t probe; memset(&probe, 0, sizeof probe); probe.d.width = probe.d.height = 32; probe.d.depth = 1; probe.d.levels = 1; probe.d.target = NVN_TEXTURE_TARGET_2D; probe.d.format = NVN_FORMAT_RGBA8;
+                tex_pattern(pat, 32, 32, 0, 11); nvn_swizzle(&probe.d, 0, 0, pat, 32 * 4, nm); memset(nm + pg, 0x5c, pg);   // the pool's bytes before it is made
+                mtl_pool_add(nm, 2 * pg); nvn_dirty_add_range(nm, 2 * pg);
+                tex_t *it = tex_in_p(nm, &np, 32, 32, NVN_FORMAT_RGBA8, 0, 0), *ct = tex_in_p(nm + pg, &np, 32, 32, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_COMPRESSIBLE, 0);
+                CHECK(img_of(it) != NULL && layout_of(it) == VK_IMAGE_LAYOUT_UNDEFINED, "a texture in a CPU_NO_ACCESS pool has its host image from TextureInitialize, holding nothing yet");
+                mtl_reg_tex(28, it, NULL); mtl_reg_tex(29, ct, NULL);
+                uint64_t i0 = ts_n(TS_INIT), up0 = uploads(), z0 = ts_n(TS_ZERO);
+                draw_with(rtc, 28, 3);
+                CHECK(ts_n(TS_INIT) == i0 + 1 && uploads() == up0 && img_read(it, 0, 32, 32) && !memcmp(g_xmap, pat, 32 * 32 * 4), "it is filled from the pool's initial content at its first use (%llu fills, %llu uploads)",
+                      (unsigned long long)(ts_n(TS_INIT) - i0), (unsigned long long)(uploads() - up0));
+                draw_with(rtc, 28, 3);
+                CHECK(ts_n(TS_INIT) == i0 + 1 && uploads() == up0, "once only (%llu)", (unsigned long long)(ts_n(TS_INIT) - i0));
+                draw_with(rtc, 29, 3);
+                CHECK(ts_n(TS_ZERO) == z0 + 1 && ts_n(TS_INIT) == i0 + 1 && texel(ct, 1, 1) == 0, "a COMPRESSIBLE one there is cleared to zero (%llu fills, texel %#x)", (unsigned long long)(ts_n(TS_ZERO) - z0), texel(ct, 1, 1));
+                CHECK(writable(nm, pg), "the pool's pages are not protected");
+                draw_with(rtc, 0, 0);
+                nvn_dirty_remove_range(nm); mtl_pool_del(nm); munmap(nm, 2 * pg);
+            }
+            free(pat);
+            if (p2) { pool_fin(p2); munmap(p2, n2); }
+        }
+        // A render target sampled later: one image. Across submissions (a layout job ahead of the submission), then within one (a barrier in it), then rendered again
+        tex_t *rt = tex(32, 32, NVN_FORMAT_RGBA8);
+        rec_rt(rt, NULL); rec_clear(0.f, 1.f, 0.f, 1.f); rec_draw(); submit();
+        vkn_img *e0 = img_of(rt);
+        CHECK(e0 && layout_of(rt) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, "the target is rendered (layout %d)", (int)layout_of(rt));
+        mtl_reg_tex(7, rt, NULL);
+        uint64_t made0 = ts_n(TS_MADE), lu0 = ts_n(TS_LAY_UP), lc0 = ts_n(TS_LAY_CB), fb0 = ts_n(TS_FEED);
+        draw_with(rtc, 7, 3);
+        CHECK(img_of(rt) == e0 && ts_n(TS_MADE) == made0 && ts_n(TS_LAY_UP) == lu0 + 1 && layout_of(rt) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && texel(rt, 5, 5) == rgba(0.f, 1.f, 0.f, 1.f),
+              "registered as a texture it is the same image (%d, %llu made), moved to shader-read ahead of the submission (%llu), with what was drawn (%#x)", img_of(rt) == e0,
+              (unsigned long long)(ts_n(TS_MADE) - made0), (unsigned long long)(ts_n(TS_LAY_UP) - lu0), texel(rt, 5, 5));
+        rec_rt(rt, NULL); rec_clear(1.f, 0.f, 0.f, 1.f); rec_draw(); rec_rt(rtc, NULL); rec_draw(); submit();   // slot 0 still holds it: bound while it is the target, then sampled after SET_RT
+        CHECK(ts_n(TS_LAY_CB) == lc0 + 1 && ts_n(TS_FEED) == fb0 + 1 && layout_of(rt) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && texel(rt, 5, 5) == rgba(1.f, 0.f, 0.f, 1.f),
+              "rendered and sampled in one submission: left alone while the target (%llu), a barrier to shader-read in it (%llu), layout %d, content %#x", (unsigned long long)(ts_n(TS_FEED) - fb0),
+              (unsigned long long)(ts_n(TS_LAY_CB) - lc0), (int)layout_of(rt), texel(rt, 5, 5));
+        rec_bind(0, 0); rec_rt(rt, NULL); rec_clear(0.f, 0.f, 1.f, 1.f); rec_draw(); submit();
+        CHECK(img_of(rt) == e0 && layout_of(rt) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && texel(rt, 5, 5) == rgba(0.f, 0.f, 1.f, 1.f), "and rendered again (layout %d, %#x)", (int)layout_of(rt), texel(rt, 5, 5));
+        // Samplers: every min / mag filter and wrap mode, and the rest of the parameters; the same parameters share one VkSampler
+        int all_ok = 1, sid = 100; uint64_t sm0 = ts_n(TS_SMADE), nset = 0;
+        for (int mi = 0; mi <= 5; mi++) for (int ma = 0; ma <= 1; ma++) { samp_par p = lin; p.minf = (uint8_t)mi; p.magf = (uint8_t)ma; mtl_reg_samp(sid, &p); all_ok &= samp_lookup(sid++) != VK_NULL_HANDLE; nset += !(mi == 5 && ma == 1); }
+        for (int w = 0; w <= 7; w++) { samp_par p = lin; p.ws = p.wt = p.wr = (uint8_t)w; if (w == 4 || w == 5) p.border[3] = p.border[0] = p.border[1] = p.border[2] = 1.f; mtl_reg_samp(sid, &p); all_ok &= samp_lookup(sid++) != VK_NULL_HANDLE; nset += w != 1; }
+        { samp_par p = lin; p.aniso = 8.f; p.lod_bias = 0.5f; p.lod_min = 1.f; p.lod_max = 3.f; mtl_reg_samp(sid, &p); all_ok &= samp_lookup(sid++) != VK_NULL_HANDLE; nset++; }
+        { samp_par p = lin; p.cmp_mode = 1; p.cmp_func = NVN_COMPARE_FUNC_LEQUAL; p.ws = p.wt = p.wr = NVN_WRAP_MODE_CLAMP_TO_BORDER; p.border[3] = 1.f; mtl_reg_samp(sid, &p); all_ok &= samp_lookup(sid++) != VK_NULL_HANDLE; nset++; }
+        if (vd.minmax) { samp_par p = lin; p.reduction = NVN_SAMPLER_REDUCTION_MIN; p.minf = NVN_MIN_FILTER_NEAREST; mtl_reg_samp(sid, &p); all_ok &= samp_lookup(sid++) != VK_NULL_HANDLE; nset++; }
+        CHECK(all_ok, "a VkSampler for every filter, wrap mode and parameter tried");
+        CHECK(ts_n(TS_SMADE) - sm0 == nset, "one per distinct parameter set: %llu made, %llu sets", (unsigned long long)(ts_n(TS_SMADE) - sm0), (unsigned long long)nset);
+        mtl_reg_samp(sid, &lin);
+        CHECK(samp_lookup(sid) == samp_lookup(3) && ts_n(TS_SMADE) - sm0 == nset, "another ID with the same parameters shares its VkSampler");
     }
 
     mtl_finish();

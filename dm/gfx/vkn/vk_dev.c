@@ -227,15 +227,29 @@ int vkn_dev_init(void) {
     // Buffer device addresses for the shadow buffers (PLAN.md 2.2 B: the address table gives one per pool); required by 1.3, so a driver without it is said and the shadows have none
     if (f12.bufferDeviceAddress) { w12.bufferDeviceAddress = VK_TRUE; vd.bda = 1; } else VLOG("[RED] the device has no bufferDeviceAddress (Vulkan 1.3 requires it): shadow buffers have no device address");
     VkPhysicalDeviceVulkan13Features w13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &w12}; w13.dynamicRendering = VK_TRUE; w13.synchronization2 = VK_TRUE;
+    // Samplers (nvn_vk.c samp_make, PLAN.md 2.3): anisotropic filtering, the mirror-clamp-to-edge wrap and min / max reduction where the device has them; a sampler that needs one it lacks is said there
+    VkPhysicalDeviceFeatures2 w2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &w13};
+    if (f2.features.samplerAnisotropy) { w2.features.samplerAnisotropy = VK_TRUE; vd.aniso = 1; }
+    if (f12.samplerMirrorClampToEdge) { w12.samplerMirrorClampToEdge = VK_TRUE; vd.mirror = 1; }
+    if (f12.samplerFilterMinmax) { w12.samplerFilterMinmax = VK_TRUE; vd.minmax = 1; }
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, de);
     const char *dx[4]; uint32_t ndx = 0;
     if (vd.surface_ext) { if (has_ext(de, nde, "VK_KHR_swapchain")) dx[ndx++] = "VK_KHR_swapchain"; else { VLOG("[RED] the device has no VK_KHR_swapchain: nothing is shown"); vd.surface_ext = NULL; } }
-    if (has_ext(de, nde, "VK_KHR_portability_subset")) dx[ndx++] = "VK_KHR_portability_subset";
+    // Portability subset (MoltenVK): what it lacks is invalid to use, so every feature it offers is enabled; nvn_vk.c avoids the uses whose feature is absent (samp_make, img_sview)
+    vkn_portability_features pf = {VKN_STYPE_PORTABILITY_SUBSET_FEATURES, NULL};
+    if (has_ext(de, nde, "VK_KHR_portability_subset")) {
+        dx[ndx++] = "VK_KHR_portability_subset";
+        VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pf}; vk.vkGetPhysicalDeviceFeatures2(vd.pd, &q2);
+        pf.pNext = NULL; w12.pNext = &pf;
+        vd.port = 1; vd.port_bias = pf.samplerMipLodBias != 0; vd.port_swz = pf.imageViewFormatSwizzle != 0;
+        VLOG("portability subset: on; samplerMipLodBias %d, imageViewFormatSwizzle %d, imageViewFormatReinterpretation %d, mutableComparisonSamplers %d, triangleFans %d, pointPolygons %d",
+             vd.port_bias, vd.port_swz, (int)pf.imageViewFormatReinterpretation, (int)pf.mutableComparisonSamplers, (int)pf.triangleFans, (int)pf.pointPolygons);
+    }
     free(de);
     float prio = 1.f;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, vd.qfam, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &w13, 0, 1, &qi, 0, NULL, ndx, dx, NULL};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &w2, 0, 1, &qi, 0, NULL, ndx, dx, NULL};
     if ((r = vk.vkCreateDevice(vd.pd, &dci, NULL, &vd.dev))) { VLOG("[RED] vkCreateDevice: %d: nothing is drawn", r); vd.dev = NULL; return 0; }
 #define VKN_D(n) vk.n = (PFN_##n)vk.vkGetDeviceProcAddr(vd.dev, #n);
     VKN_DEVICE(VKN_D)

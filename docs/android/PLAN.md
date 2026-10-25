@@ -269,6 +269,47 @@ Open after slice 1:
 - **`ReadTexels`**
 - **Samplers** with custom border colours, replacing Metal's three presets.
 
+**As built, slice 2b (2026-10-26):** sampled textures and samplers in `dm/gfx/vkn/nvn_vk.c`. The format table is `dm/gfx/vkn/nvn_fmt_vk.c`, not in `dm/gfx/tex`, because every host build takes that folder's sources by wildcard. Nothing draws yet (slice 2c), so bound textures and samplers are resolved and made ready at each draw and dispatch, but not used.
+- **Formats:** only the RGBA8 and BGRA8 families (with their sRGB and no-alpha variants) are uploaded. Slice 1's render-target and depth formats are sampled once the GPU has rendered them. Any other format is reported in red once and gets no image.
+- **Images:** one `VkImage` per texture serial, device-local with optimal tiling, made at first use with every usage the format supports. A render target sampled later is the same image, and its layout is tracked as in slice 1 (a texture bound while it is the pass's target is counted, not reported in red). Views are cached on the image, keyed by format, levels, layers and swizzle. Images are freed through the dead list.
+- **Registrations:** the texture and sampler pools are arrays indexed by ID. A bound slot is resolved again only when its bind or a registration changed, so slice 2c can push descriptors from per-stage arrays.
+- **Upload:** done in strategy B's commit, under the pool lock: take the stamp, pick textures used for the first time or written since their stamp, `nvn_dirty_protect_wait` their range, deswizzle on the CPU into the slot's staging after the buffer pages. In the upload command buffer: a barrier to transfer-destination, `vkCmdCopyBufferToImage` per level and layer, a barrier to shader-read. A CPU-written texture registered mid-run works the same way. `ReadTexels` reads guest memory; a texture only the GPU wrote is reported in red once.
+  - **Each use checks the texture's pages against its stamp.** Metal skips the check when the dirty generation has not moved since the last one. That shortcut is unsound: `nvn_dirty.c` moves the generation before it stores the page's, so a check in between would cache "clean" for good. The check costs 1 to 3 µs a frame on the Mac and about 20 µs on the phone.
+  - **A LINEAR texture in a pool the CPU can write** counts as CPU-written from the start, because Metal samples the pool memory itself. If the stride is 0, rows are at `nvn_tex_layout`'s pitch.
+  - **A texture that nothing has written** is filled once from its storage when Metal's `tex_init_fill` would fill it: initial content of a CPU_NO_ACCESS pool, or storage flushed before first use. Otherwise it is cleared to zero.
+- **Pages shared with another pool** (16 KB host pages over 4 KB-aligned pools) are never protected, and a texture that touches one is uploaded again at every use. A write beside a texture, in its own partial pages, is compared with the bytes kept at upload (as Metal's `pkg_edges`) and is not uploaded again when they are unchanged.
+- **Strategy B's buffer pages** (review round 2): a commit's stamp could fall between an unprotect's generation increment and its store of the page's generation. The page was then neither copied nor protected again, and its later writes never reached the shadow. Now the commit, after its stamp, protects every protectable tracked page, so `nvn_dirty_protect_wait` waits out an unprotect under way. It then re-scans the pages it did not pick against the previous stamp, and copies the newer ones after their protect. The argument is in the comment above `b_commit`; `nvn_dirty.c` is unchanged.
+  - **Cost:** pages uploaded and mprotect calls per frame are unchanged, and the re-scan picked nothing in the runs. On the phone (system driver) the commit took 0.287 ms a frame at frame 600 and 0.316 ms at 1800, against 0.264 and 0.308 ms before. On the Mac the copies dominate and the change is within run-to-run noise.
+- **Portability subset** (MoltenVK): every feature the driver offers is enabled. Where `samplerMipLodBias` or `imageViewFormatSwizzle` is missing, the sampler gets no bias and the view an identity swizzle, each reported in red once.
+- **Samplers:** deduplicated by parameters. They cover filters, wrap modes (mirror-clamp-to-edge where the device has it), LOD clamp and bias (bias clamped to the device limit), anisotropy (up to 16), compare, reduction and border. The border is a core colour when it matches one exactly; otherwise the nearest, with a red line once. A min filter without mips becomes nearest-mip with LOD 0 to 0.25.
+- **Test:** `t_vkn` adds:
+  - a swizzled 4-level RGBA8 round trip by readback;
+  - an upload again only after a guest write;
+  - the shared-page rule, `ReadTexels`, and the zero fill;
+  - a render target sampled later: one image, with its layout;
+  - every filter and wrap mode;
+  - a staged dirty-check window;
+  - linear textures, stride 0 included;
+  - flushed and CPU_NO_ACCESS initial content;
+  - an RGBX view and a biased sampler;
+  - a buffer-page write whose unprotect is under way at the commit's stamp, held there by an interposed `mprotect`. It fails with the fix reverted.
+  It runs 103 checks with validation on and 0 messages, on KosmicKrisp and on MoltenVK.
+- **Results**, from the title screen to character creation: 0 `[RED]` and 0 validation messages on KosmicKrisp, the system driver and 842.6.
+  - **Uploads:** 17 first uploads against Metal's 16. The extra one is ser=4, a 2x2 texture that is bound but that the program never samples. Metal resolves only the program's bindings, while 2b resolves every bound slot.
+  - **Samplers:** 4 registered, of which two are identical, so 3 are made.
+  - **Re-uploads:** none on the phone (4 KB pages). On the Mac, three textures (704x2256, 400x655, 288x672) sit in pages shared with another pool and are uploaded every frame, 7.8 MB a frame.
+
+Open after slice 2b:
+- **Mac shared-page cost:** protect the texture's interior pages, and at each use compare its bytes in the shared pages with a copy kept at upload.
+- **Slice 2c** resolves only the slots the program samples.
+- **Metal's row pitch for a stride-0 LINEAR texture** is `width * bpb` (`nvn_mtl.m:1941`). `nvn_tex_layout` rounds the row up to 32 bytes (128 for a linear render target, `nvn_tex.c:108-111`), and that layout sizes the storage the game is given (`nvnTextureBuilderGetStorageSize`). The two differ when a row is not a multiple of 32 bytes. vkn follows `nvn_tex_layout`; Metal is unchanged.
+- **No initial fill when a texture's first use is as a render target.** Metal fills at creation, whatever the first use (`nvn_mtl.m:2095`). vkn fills only at the first sampled use, so a pass that loads such a target first reads undefined content.
+- **Not yet:** BC and the other formats, 3D, cube and buffer textures, and the GPU deswizzle.
+- **Latent in Metal, left as is (Metal must stay exact):** the "generation has not moved" shortcut in the packaged-texture check (`nvn_mtl.m:2028`) and in the index-range cache (`nvn_mtl.m:4074`) can miss a write, for the reason given above.
+- **Shared front half, not changed here:**
+  - A whole-level `WriteTexels` on a LINEAR texture writes nothing and prints no `[RED]`: the whole-level path skips the deswizzle, and the `-1` from `nvn_swizzle` is ignored (`hle_nvn.c:2377`). It still calls `mtl_tex_cpu_written`. A partial region does print `[RED]`.
+  - LINEAR_RENDER_TARGET (0x40) without LINEAR (0x10) is linear for Metal (`nvn_mtl.m:1935-1937`, from Mario Wonder's sky ramps) but block-linear for `nvn_tex_layout` (`nvn_tex.c:108`), which vkn follows. Which one the hardware does is not settled.
+
 ### 2.4 Shader chain, Vulkan target (`dmsh_build.py --target vk`)
 The translator already emits SPIR-V with `TargetApi.Vulkan` (`dm/gfx/tools/dmsh_xlate/Program.cs:160`). What changes are the post-processing passes that work on Metal source text:
 
