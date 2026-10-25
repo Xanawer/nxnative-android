@@ -2,10 +2,15 @@
 # P0.8 shader probe (docs/android/PLAN.md, Phase 0; results in docs/android/probes-shader.md): writes the manifest shader_probe.c reads.
 # Embeds no game data: every key, binding and pair comes from the files given on the command line, and the output stays outside the repository.
 #
-# Usage: python3 -I gen_manifest.py --spv <dir with <key>.spv> [--res <dir with <key>.res.json>] [--pso <pso_manifest.tsv>] [--main <ExeFS/main>]
+# Usage: python3 -I gen_manifest.py --spv <dir with <key>.spv> [--res <dir with <key>.res.json> | --vk <b-<V>-vk dir>] [--pso <pso_manifest.tsv>] [--main <ExeFS/main>]
 #            [--romfs <RomFS dir>] --out <dir>
 #   --spv      the modules the manifest describes (reflection is taken from these; strip them first, spv_strip_caps.py only drops capabilities)
 #   --res      dmsh_xlate's reflection, cross-checked against the SPIR-V (default: the --spv dir)
+#   --vk       dmsh_build_vk.py's output (--spv: its <key>_b.spv.zst decompressed to <key>.spv): the manifest's module, bind and interface lines are written from each <key>_b.json
+#              (what a backend reads), after checking them against the SPIR-V (stage, entry, set, binding, type, count, interface: each location's base type, components, interpolation
+#              and its variable's first location and array lengths); any difference, a missing <key>_b.json or a binding
+#              array sized by a specialization constant stops generation (exit 1, no manifest.txt / pairs.tsv left behind). A module whose status is not ok is left out (logged).
+#              Its res (dmsh_xlate's) replaces --res
 #   --pso      the game's prewarm list (dm/games/<title>/pso_manifest.tsv): its R rows name pipelines the game really built, the strongest pairing evidence
 #   --main     the game's main NSO: MonoGame effects (MGFX) in it name a vertex and a pixel shader per pass, the next strongest evidence
 #   --romfs    the game's RomFS: MGFX effects in LZ4-compressed XNB files (Content/**/*.xnb)
@@ -14,7 +19,7 @@
 #
 # manifest.txt, one record per line, fields separated by single spaces:
 #   module <key> <vert|frag> <entry>
-#   bind <key> <set> <binding> <VkDescriptorType number> <count> <name>
+#   bind <key> <set> <binding> <VkDescriptorType number> <count> <name>       <count>: 0 for a runtime array
 #   vin <key> <location> <f|i|u> <components>                 vertex shader input (built-ins left out)
 #   vout <key> <location> <f|i|u> <components> <interp>       vertex shader output; <interp> is - or a comma list of flat, noperspective, centroid, sample
 #   fin <key> <location> <f|i|u> <components> <interp>        pixel shader input
@@ -111,24 +116,24 @@ class Spv:
             return (b[0], b[1], b[2] * n) if b and n else None
         return None
 
-    def strip_arrays(s, t):
+    def strip_arrays(s, t):   # → (element type, count): 0 for a runtime array, None for one sized by a specialization constant (not an OpConstant)
         count = 1
         while s.types[t][0] in (OP['TypeArray'], OP['TypeRuntimeArray']):
             op, a = s.types[t]
-            count = count * s.const_u(a[1]) if op == OP['TypeArray'] else 0
+            n = s.const_u(a[1]) if op == OP['TypeArray'] else 0
+            count = None if count is None or n is None else count * n
             t = a[0]
         return t, count
 
     def descriptor(s, vid):   # → (VkDescriptorType, count, detail) or None
         ptr, sc = s.vars[vid]
         t = s.types[ptr][1][1]
-        if sc == 12: return VK_SSBO, 1, 'storage buffer'
+        if sc not in (0, 2, 12): return None
+        base, count = s.strip_arrays(t)   # every kind: an array of descriptors is one binding of count n (0 runtime, None specialization-sized), as dmsh_build_vk.py and shader_probe.c spv_binds
+        if sc == 12: return VK_SSBO, count, 'storage buffer'
         if sc == 2:
-            base, count = s.strip_arrays(t)
             if s.has(base, DEC_BUFFERBLOCK): return VK_SSBO, count, 'storage buffer (BufferBlock)'
             return VK_UBO, count, 'uniform buffer'
-        if sc != 0: return None
-        base, count = s.strip_arrays(t)
         op, a = s.types[base]
         if op == OP['TypeSampler']: return VK_SAMPLER, count, 'sampler'
         img = None
@@ -166,8 +171,11 @@ class Spv:
             if not loc or not ty: r['bad'].append(f'{side} %{vid} ({s.names.get(vid, "")}): no location or not a scalar/vector'); continue
             comp = s.decs(vid, DEC_COMPONENT)
             interp = [INTERP[d] for d in INTERP if s.has(vid, d)]
+            t, dims = s.types[ptr][1][1], []
+            while s.types[t][0] == OP['TypeArray']: dims.append(s.const_u(s.types[t][1][1])); t = s.types[t][1][0]
+            arr = (loc[0][0], tuple(dims)) if dims else ()   # the variable an entry belongs to: its first location and array lengths (a stage interface matches variables)
             for k in range(ty[2]):
-                r[side].append(dict(loc=loc[0][0] + k, comp=comp[0][0] if comp else 0, type=ty[0], n=ty[1], interp=interp, name=s.names.get(vid, f'%{vid}')))
+                r[side].append(dict(loc=loc[0][0] + k, comp=comp[0][0] if comp else 0, type=ty[0], n=ty[1], interp=interp, arr=arr, name=s.names.get(vid, f'%{vid}')))
         for side in ('in', 'out'): r[side].sort(key=lambda x: x['loc'])
         return r
 
@@ -435,6 +443,12 @@ def mgfx_effects(main, romfs, log):
 
 
 # ---------------------------------------------------------------- main
+def jio(vj, field):   # a <key>_b.json interface list as the SPIR-V side's (location, f|i|u, components, interp, (first location, array lengths) or ()), sorted
+    T = {'float': 'f', 'sint': 'i', 'uint': 'u'}
+    arr = lambda a: (a.get('location'), tuple(a.get('dims') or ())) if isinstance(a, dict) else ()   # a malformed array entry still compares unequal
+    return sorted(((e['location'], T.get(e['type'], e['type']), e['components'], e.get('interp', []), arr(e['array']) if 'array' in e else ()) for e in vj.get(field, [])), key=repr)
+
+
 def arg(name, default=None):
     a = sys.argv
     return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else default
@@ -443,19 +457,26 @@ def arg(name, default=None):
 def main():
     spv_dir, out_dir = arg('--spv'), arg('--out')
     if not spv_dir or not out_dir: sys.exit(__doc__ or 'usage: see the header of gen_manifest.py')
-    res_dir, pso, nso, romfs = arg('--res', spv_dir), arg('--pso'), arg('--main'), arg('--romfs')
+    res_dir, pso, nso, romfs, vk_dir = arg('--res', spv_dir), arg('--pso'), arg('--main'), arg('--romfs'), arg('--vk')
     os.makedirs(out_dir, exist_ok=True)
     A = []   # analysis lines
     def log(x=''): A.append(x)
 
     keys = sorted(f[:-4] for f in os.listdir(spv_dir) if f.endswith('.spv') and re.fullmatch(r'[0-9a-f]{16}\.spv', f))
-    M = OrderedDict()
+    M, VJ, E, left = OrderedDict(), {}, [], []   # VJ: the <key>_b.json of each module (--vk); E: errors that stop generation
     for k in keys:
+        if vk_dir:
+            jp = os.path.join(vk_dir, k + '_b.json')
+            if not os.path.exists(jp): E.append(f'{k}: no {k}_b.json in {vk_dir}'); continue
+            VJ[k] = json.load(open(jp))
+            if VJ[k].get('status') != 'ok': left.append(f'  {k}: status {VJ[k].get("status")} ({"; ".join(VJ[k].get("unsupported", []))[:200]}): left out'); del VJ[k]; continue
         s = Spv(os.path.join(spv_dir, k + '.spv'))
         b, pc = s.bindings()
         M[k] = dict(spv=s, stage=s.entry[0], entry=s.entry[2], io=s.interface(), binds=b, pc=pc)
+        E += [f'{k}: binding {x["set"]}.{x["binding"]} ({x["name"]}): an array sized by a specialization constant' for x in b if x['count'] is None]
     vs = [k for k in M if M[k]['stage'] == 'vert']; ps = [k for k in M if M[k]['stage'] == 'frag']
-    log(f'modules: {len(M)} ({len(vs)} vertex, {len(ps)} pixel, {len(M) - len(vs) - len(ps)} other) from {spv_dir}')
+    log(f'modules: {len(M)} ({len(vs)} vertex, {len(ps)} pixel, {len(M) - len(vs) - len(ps)} other) from {spv_dir}' + (f'; {len(left)} not ok in {vk_dir}, left out:' if left else ''))
+    for x in left: log(x)
 
     # ---- cross-checks: spirv-cross --reflect and dmsh_xlate's res.json
     log('\n== cross-check against spirv-cross --reflect and res.json (empty = all agree)')
@@ -471,9 +492,21 @@ def main():
             for side, kind in (('in', 'inputs'), ('out', 'outputs')):
                 a = sorted(x['loc'] for x in m['io'][side]); b = sorted(x['location'] for x in r.get(kind, []) if 'location' in x)
                 if a != b: log(f'  {k}: {side} locations differ: mine {a} spirv-cross {b}')
-        rp = os.path.join(res_dir, k + '.res.json')
-        if not os.path.exists(rp): log(f'  {k}: no res.json'); continue
-        rj = json.load(open(rp))
+        if vk_dir:   # the vk chain's reflection is what a backend reads, and what the manifest is written from: it has to say what the SPIR-V says
+            vj = VJ[k]; rj = vj['res']; srt = lambda l: sorted(l, key=lambda t: tuple(-1 if v is None else v for v in t))
+            a = srt((b['set'], b['binding'], b['type'], b['count']) for b in m['binds'])
+            b = srt((x['set'], x['binding'], x['type'], 0 if x.get('runtime') else x['count']) for x in vj['bindings'])   # a runtime array: count 0 in the SPIR-V and the manifest
+            if a != b: E.append(f'{k}: bindings (set, binding, type, count): SPIR-V {a}, {k}_b.json {b}')
+            if any(x['set'] != vj['set'] for x in vj['bindings']): E.append(f'{k}: {k}_b.json bindings outside its set {vj["set"]}')
+            if (vj.get('exec_model'), vj.get('entry')) != (m['stage'], m['entry']): E.append(f'{k}: stage / entry: SPIR-V {m["stage"]} {m["entry"]}, {k}_b.json {vj.get("exec_model")} {vj.get("entry")}')
+            for side, field in (('in', 'vertex_inputs' if m['stage'] == 'vert' else 'inputs'), ('out', 'outputs')):
+                a = sorted(((x['loc'], x['type'], x['n'], x['interp'], x['arr']) for x in m['io'][side]), key=repr)   # per location with its variable's shape; one order (repr: whatever the JSON holds)
+                b = jio(vj, field)
+                if a != b: E.append(f'{k}: {side} interface: SPIR-V {a}, {k}_b.json {field} {b}')
+        else:
+            rp = os.path.join(res_dir, k + '.res.json')
+            if not os.path.exists(rp): log(f'  {k}: no res.json'); continue
+            rj = json.load(open(rp))
         if rj['stage'] != {'vert': 'vs', 'frag': 'ps'}.get(m['stage'], m['stage']): log(f'  {k}: res.json stage {rj["stage"]}, SPIR-V {m["stage"]}')
         ubo = {b['binding'] for b in m['binds'] if b['type'] == VK_UBO and b['name'] != 'support_buffer'}
         if ubo != {c['binding'] for c in rj['cbufs']}: log(f'  {k}: res.json cbuf bindings {[c["binding"] for c in rj["cbufs"]]}, SPIR-V uniform buffers {sorted(ubo)}')
@@ -490,6 +523,13 @@ def main():
         if rj.get('notes'): log(f'  {k}: notes {rj["notes"]}')
         if m['pc']: log(f'  {k}: push constants declared')
         if m['io']['bad']: log(f'  {k}: interface not understood: {m["io"]["bad"]}')
+
+    if E:   # a reflection that does not say what its module says, or a module the manifest cannot describe: no manifest (a stale one removed, so nothing runs on it)
+        log('\n== errors: no manifest written\n' + '\n'.join('  ' + e for e in E))
+        for f in ('manifest.txt', 'pairs.tsv'):
+            if os.path.exists(os.path.join(out_dir, f)): os.unlink(os.path.join(out_dir, f))
+        open(os.path.join(out_dir, 'analysis.txt'), 'w').write('\n'.join(A) + '\n')
+        sys.exit(f'gen_manifest: {len(E)} errors, no manifest written (analysis.txt lists them):\n' + '\n'.join('  ' + e for e in E[:20]))
 
     # ---- pairs
     pairs = OrderedDict()   # (vs, ps) → set of sources
@@ -557,16 +597,19 @@ def main():
     log('\ncompatible vertex shaders per pixel shader (inputs -> count of covering vertex shaders):')
     for p in ps: log(f'  {p} in {[i["loc"] for i in M[p]["io"]["in"]]} -> {sum(1 for v in vs if not cover(v, p))}')
 
-    # ---- descriptor collisions if both stages shared set 0
-    log('\n== descriptor bindings: both stages use set 0 and number their bindings from 0 independently')
-    nt = nr = 0
+    # ---- descriptor collisions: a set and binding both stages of a pair use (the translator's modules: both stages in set 0, bindings numbered from 0 independently)
+    sets = defaultdict(lambda: defaultdict(int))
+    for m in M.values(): sets[m['stage']][','.join(str(x) for x in sorted({b['set'] for b in m['binds']})) or 'none'] += 1
+    log('\n== descriptor bindings: modules per stage by the sets they use: ' + '; '.join(f'{st} {dict(c)}' for st, c in sets.items()))
+    nt = nr = ns = 0
     for (v, p), src in pairs.items():
-        bv = {b['binding']: b for b in M[v]['binds']}; bp = {b['binding']: b for b in M[p]['binds']}
+        bv = {(b['set'], b['binding']): b for b in M[v]['binds']}; bp = {(b['set'], b['binding']): b for b in M[p]['binds']}
         t = [b for b in bp if b in bv and bv[b]['type'] != bp[b]['type']]
         r = [b for b in bp if b in bv and bv[b]['type'] == bp[b]['type'] and bv[b]['name'] != bp[b]['name']]
-        nt += bool(t); nr += bool(r) and not t
-        if t or r: log(f'  {v}+{p}: type collisions at {t} ({", ".join(VKNAME[bv[b]["type"]] + "/" + VKNAME[bp[b]["type"]] for b in t)}); same type, different resource at {r}')
-    log(f'pairs with a type collision in a shared set 0: {nt} of {len(pairs)}; with only same-type collisions on different resources: {nr}')
+        nt += bool(t); nr += bool(r) and not t; ns += bool({b[0] for b in bv} & {b[0] for b in bp})
+        sb = lambda l: [f'{x[0]}.{x[1]}' for x in l]
+        if t or r: log(f'  {v}+{p}: type collisions at set.binding {sb(t)} ({", ".join(VKNAME[bv[b]["type"]] + "/" + VKNAME[bp[b]["type"]] for b in t)}); same type, different resource at {sb(r)}')
+    log(f'pairs with a type collision: {nt} of {len(pairs)}; with only same-type collisions on different resources: {nr}; with both stages in one descriptor set: {ns}')
     shared0 = all(any(b['binding'] == 0 and b['name'] == 'support_buffer' for b in M[k]['binds']) for k in M)
     log(f'binding 0 is support_buffer in every module: {shared0}')
 
@@ -621,8 +664,10 @@ def main():
         f.write(f'# P0.8 shader manifest v1, generated by gen_manifest.py from {spv_dir}; game-derived: keep out of the repository\n')
         for k, m in M.items():
             f.write(f'module {k} {m["stage"]} {m["entry"]}\n')
-            for b in m['binds']: f.write(f'bind {k} {b["set"]} {b["binding"]} {b["type"]} {b["count"]} {b["name"]}\n')
-            io = m['io']
+            binds = [dict(x, count=0 if x.get('runtime') else x['count']) for x in VJ[k]['bindings']] if vk_dir else m['binds']   # --vk: from <key>_b.json (checked equal above)
+            for b in binds: f.write(f'bind {k} {b["set"]} {b["binding"]} {b["type"]} {b["count"]} {b["name"]}\n')
+            io = m['io'] if not vk_dir else {side: [dict(zip(('loc', 'type', 'n', 'interp'), e)) for e in jio(VJ[k], field)]
+                                              for side, field in (('in', 'vertex_inputs' if m['stage'] == 'vert' else 'inputs'), ('out', 'outputs'))}
             if m['stage'] == 'vert':
                 for i in io['in']: f.write(f'vin {k} {i["loc"]} {i["type"]} {i["n"]}\n')
                 for o in io['out']: f.write(f'vout {k} {o["loc"]} {o["type"]} {o["n"]} {",".join(o["interp"]) or "-"}\n')

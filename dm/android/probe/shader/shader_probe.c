@@ -2,7 +2,8 @@
 // Reads a manifest written by gen_manifest.py and the SPIR-V modules it names (pushed at run time; they derive from the user's game and never enter the repository), then:
 //   t1  vkCreateShaderModule for every module, unmodified
 //   t2  a graphics pipeline for every pair: dynamic rendering, one RGBA8 attachment per fragment output, vertex attributes from the vertex shader's inputs,
-//       one descriptor set per stage (vertex: set 0, pixel: set 1, the pixel module's DescriptorSet decorations patched from 0 to 1), dynamic viewport and scissor.
+//       one descriptor set per stage (split: vertex set 0, pixel set 1, the pixel module's DescriptorSet decorations patched from 0 to 1; manifest: the sets the
+//       modules already carry, as dmsh_build_vk.py emits them), dynamic viewport and scissor.
 //       Phases, each on a fresh VkDevice except cold, which runs on the device T1 used (T1 only creates and destroys shader modules): cold (no cache),
 //       cold2 (again without a cache: shows an implicit driver cache), fill (an empty VkPipelineCache), warm (the same cache), reload (a new cache from fill's
 //       serialized data); --cache-in <file>: only the phase disk (a cache from another process's data). Times cover vkCreateGraphicsPipelines only, not vkCreatePipelineCache.
@@ -10,9 +11,12 @@
 //   t4  NaN min / max: a compute shader evaluates FMin / FMax / FClamp and NMin / NMax / NClamp with NaN and signed-zero operands (parameters in a buffer)
 // Writes <out_dir>/res/: summary.txt (every step, RESULT lines), results.tsv, t1.tsv, t2.tsv, t3.txt, t4.tsv, validation.txt (with --validation), cache.bin.
 // Arguments: --label <name> --load system|adrenotools [--drvdir <dir> --drvname <file>] [--expect-lib <s>] [--expect-id <n>] [--expect-info <s>]
-//            --dir <dir with manifest.txt and <set>/<key>.spv> [--set stripped|orig] [--tests t1,t2,t3,t4] [--phases cold,cold2,fill,warm,reload] [--cache-in <file>]
-//            [--layout split|merged] [--validation] [--controls] [--mesa-cache] [--env NAME=VALUE ...]
+//            --dir <dir with manifest.txt and <set>/<key>.spv> [--set stripped|orig|vk] [--tests t1,t2,t3,t4] [--phases cold,cold2,fill,warm,reload] [--cache-in <file>]
+//            [--layout split|merged|manifest] [--validation] [--controls] [--mesa-cache] [--env NAME=VALUE ...]
 //   --layout merged: both stages in set 0 as translated (vertex shader's type wins on a collision); only meant for the validation controls
+//   --layout manifest (the default for --set vk): nothing patched; each stage's layout at the set its bind lines name, empty layouts in the gaps; a module whose
+//            bindings (set, binding, descriptor type, count, read from its SPIR-V) differ from its bind lines or span sets, or a pair with both stages in one set, fails
+//            t2.layout (the shader chain chose the sets, and the layouts are built from the bind lines)
 //   --controls: positive controls for the validation layer (a merged layout, an uncovered pixel shader input, a UINT format on a float input)
 //   macOS (KosmicKrisp through the Homebrew loader, --load system): VKC_LIBVULKAN overrides /opt/homebrew/lib/libvulkan.1.dylib
 #define _GNU_SOURCE
@@ -120,13 +124,14 @@ static int make_instance(int validation, char *err, size_t errn) {
     if (V.vkEnumerateInstanceVersion) V.vkEnumerateInstanceVersion(&V.inst_version);
     V.inst_api = VK_API_VERSION_1_3 < V.inst_version ? VK_API_VERSION_1_3 : V.inst_version;
     const char *layers[1], *exts[2]; uint32_t nl = 0, ne = 0;
-    if (validation) {
+    if (validation) {   // a loader-less vkGetInstanceProcAddr (a driver opened directly) may lack layer enumeration: say so instead of calling NULL (adrenotools keeps the loader)
+        if (!V.vkEnumerateInstanceLayerProperties) { snprintf(err, errn, "no vkEnumerateInstanceLayerProperties (%s): no layer can load", V.load_desc); return -1; }
         uint32_t n = 0; V.vkEnumerateInstanceLayerProperties(&n, NULL);
         VkLayerProperties *lp = calloc(n ? n : 1, sizeof *lp); V.vkEnumerateInstanceLayerProperties(&n, lp);
         int found = 0;
         for (uint32_t i = 0; i < n; i++) { S("instance layer: %s (spec %u.%u.%u, impl %u)", lp[i].layerName, VK_API_VERSION_MAJOR(lp[i].specVersion), VK_API_VERSION_MINOR(lp[i].specVersion), VK_API_VERSION_PATCH(lp[i].specVersion), lp[i].implementationVersion); if (!strcmp(lp[i].layerName, "VK_LAYER_KHRONOS_validation")) found = 1; }
         free(lp);
-        if (!found) { snprintf(err, errn, "VK_LAYER_KHRONOS_validation not among the instance layers (VK_LAYER_PATH?)"); return -1; }
+        if (!found) { snprintf(err, errn, "VK_LAYER_KHRONOS_validation not among the %u instance layers (VK_LAYER_PATH? Android: the layer .so in the APK, the loader in front)", n); return -1; }
         layers[nl++] = "VK_LAYER_KHRONOS_validation"; exts[ne++] = "VK_EXT_debug_utils";
     }
     VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative-shader-probe", 1, "nxnative", 1, V.inst_api };
@@ -204,7 +209,7 @@ typedef struct { int set, binding, type, count; char name[48]; } bind_t;
 typedef struct { int loc, n; char ty; } io_t;
 typedef struct {
     char key[24]; int frag; char entry[32];
-    bind_t b[24]; int nb; io_t vin[32]; int nvin; io_t fout[8]; int nfout;
+    bind_t b[24]; int nb; io_t vin[32]; int nvin; io_t fout[8]; int nfout; int set;   // set: the first bind line's set, -1 without bindings (manifest layout)
     uint32_t *code; size_t bytes;
     VkShaderModule sm; VkDescriptorSetLayout dsl;   // per device
 } mod_t;
@@ -249,6 +254,7 @@ static int load_manifest(const char *dir, const char *set) {
     fclose(f);
     int bad = 0;
     for (int i = 0; i < g_nmod; i++) {
+        g_mod[i].set = g_mod[i].nb ? g_mod[i].b[0].set : -1;
         snprintf(p, sizeof p, "%s/%s/%s.spv", dir, set, g_mod[i].key);
         g_mod[i].code = read_file(p, &g_mod[i].bytes);
         if (!g_mod[i].code || g_mod[i].bytes < 20 || g_mod[i].code[0] != 0x07230203) { S("cannot read %s", p); bad++; }
@@ -263,11 +269,71 @@ static uint32_t *patch_set(const uint32_t *code, size_t bytes, uint32_t to, int 
     size_t nw = bytes / 4; *n_patched = 0;
     for (size_t i = 5; i < nw; ) {
         uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
-        if (!n) break;
+        if (!n || n > nw - i) break;   // a truncated module: stop at its end
         if (op == 71 && n >= 4 && w[i + 2] == 34) { w[i + 3] = to; (*n_patched)++; }   // OpDecorate <id> DescriptorSet <set>
         i += n;
     }
     return w;
+}
+// The DescriptorSet decorations a module carries → bitmask of their set numbers (bit 31: a set above 30)
+static uint32_t spv_sets(const uint32_t *w, size_t bytes) {
+    uint32_t mask = 0; size_t nw = bytes / 4;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || n > nw - i) break;   // a truncated module: stop at its end
+        if (op == 71 && n >= 4 && w[i + 2] == 34) mask |= w[i + 3] < 31 ? 1u << w[i + 3] : 1u << 31;
+        i += n;
+    }
+    return mask;
+}
+
+// The descriptor bindings a module declares (UniformConstant / Uniform / StorageBuffer variables with a Binding), as gen_manifest.py descriptor() reads them: set (0 when undecorated),
+// binding, VkDescriptorType, count (n for an array, 0 for a runtime array, -1 for one sized by a specialization constant). → how many (only the first max stored), -1 for a module not understood
+static int spv_binds(const uint32_t *w, size_t bytes, bind_t *out, int max) {
+    size_t nw = bytes / 4; uint32_t bound = nw > 5 ? w[3] : 0; int n = 0;
+    if (!bound || bound > (1u << 22)) return -1;
+    uint32_t *at = calloc(bound, sizeof *at); int32_t *dset = calloc(bound, sizeof *dset), *dbind = malloc(bound * sizeof *dbind); uint8_t *bblock = calloc(bound, 1);
+    if (!at || !dset || !dbind || !bblock) { free(at); free(dset); free(dbind); free(bblock); return -1; }
+    for (uint32_t i = 0; i < bound; i++) dbind[i] = -1;
+    for (size_t i = 5; i < nw; ) {   // the word each type, constant and variable is defined at; Binding / DescriptorSet / BufferBlock decorations
+        uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
+        if (!len || len > nw - i) break;   // a truncated module: stop at its end
+        if (op == 71 && len >= 3 && w[i + 1] < bound) {
+            if (w[i + 2] == 34 && len >= 4) dset[w[i + 1]] = (int32_t)w[i + 3]; else if (w[i + 2] == 33 && len >= 4) dbind[w[i + 1]] = (int32_t)w[i + 3]; else if (w[i + 2] == 3) bblock[w[i + 1]] = 1;
+        } else if (op >= 19 && op <= 39 && len >= 2 && w[i + 1] < bound) at[w[i + 1]] = (uint32_t)i;                          // OpType*: result first
+        else if ((op == 43 || (op >= 48 && op <= 52) || op == 59) && len >= 3 && w[i + 2] < bound) at[w[i + 2]] = (uint32_t)i;   // constants, OpVariable: result second
+        i += len;
+    }
+#define DEF(id, k) ((id) < bound && at[id] && at[id] + (k) < nw ? at[id] : 0)   // the defining instruction of id with at least word k, 0 when none
+    for (uint32_t v = 0; v < bound && n >= 0; v++) {
+        uint32_t i = DEF(v, 3), t, ty, count = 1;
+        if (dbind[v] < 0 || !i || (w[i] & 0xffff) != 59) continue;
+        uint32_t sc = w[i + 3], p = DEF(w[i + 1], 3); int spec = 0, rt = 0;
+        if (sc != 0 && sc != 2 && sc != 12) continue;
+        if (!p) { n = -1; break; }
+        t = w[p + 3];
+        for (uint32_t d; (d = DEF(t, 2)) && ((w[d] & 0xffff) == 28 || (w[d] & 0xffff) == 29); t = w[d + 2]) {   // OpTypeArray / OpTypeRuntimeArray
+            if ((w[d] & 0xffff) == 29) { rt = 1; continue; }
+            uint32_t c = DEF(t, 3) ? DEF(w[d + 3], 3) : 0;
+            if (c && (w[c] & 0xffff) == 43) count *= w[c + 3]; else spec = 1;
+        }
+        uint32_t b = DEF(t, 1), bo = b ? w[b] & 0xffff : 0;
+        if (!b) { n = -1; break; }
+        if (sc == 12) ty = 7;
+        else if (sc == 2) ty = bblock[t] ? 7 : 6;
+        else if (bo == 26) ty = 0;
+        else if (bo == 27 || bo == 25) {
+            uint32_t img = bo == 27 ? (DEF(t, 2) ? DEF(w[b + 2], 8) : 0) : DEF(t, 8);
+            if (!img) { n = -1; break; }
+            uint32_t dim = w[img + 3], smp = w[img + 7];
+            ty = bo == 27 ? (dim == 5 ? 4 : 1) : dim == 6 ? 10 : smp == 2 ? (dim == 5 ? 5 : 3) : (dim == 5 ? 4 : 2);
+        } else continue;
+        if (n < max) out[n] = (bind_t){ dset[v], dbind[v], (int)ty, spec ? -1 : rt ? 0 : (int)count, "" };
+        n++;
+    }
+#undef DEF
+    free(at); free(dset); free(dbind); free(bblock);
+    return n;
 }
 
 // ---------------------------------------------------------------- T1
@@ -302,14 +368,58 @@ static VkFormat attr_format(char ty, int n) {
 }
 static VkFormat color_format(char ty) { return ty == 'u' ? VK_FORMAT_R8G8B8A8_UINT : ty == 'i' ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM; }
 
-static int g_layout_merged;
+static int g_layout_merged, g_layout_manifest;
+static VkDescriptorSetLayout g_empty_dsl;   // manifest layout: the sets below or between the stages' own
 typedef struct { int ok; VkResult r; double ms; uint32_t fb_flags, fb_vs, fb_fs; double fb_ms; } pres_t;
 
-// Modules and per-stage set layouts for the current device. Fragment modules get their set decorations patched to 1 (split layout).
+// Manifest layout, checked once: every module's bindings in one set, the one its SPIR-V decorations name (nothing is patched, so the sets are the shader chain's), its bind lines
+// the bindings its SPIR-V declares (set, binding, descriptor type, count: the set layouts are built from the bind lines), and no pair with both stages in the same set (each stage gets
+// its own layout: a shared set would need a merged layout, which hides collisions)
+static void layout_check(void) {
+    int bad = 0, same = 0, nbind = 0, nv[9] = { 0 }, nf[9] = { 0 };   // [8]: no bindings
+    for (int i = 0; i < g_nmod; i++) {
+        mod_t *m = &g_mod[i]; uint32_t want = 0;
+        for (int j = 0; j < m->nb; j++) want |= m->b[j].set < 31 ? 1u << m->b[j].set : 1u << 31;
+        uint32_t have = spv_sets(m->code, m->bytes);
+        if (want != have || (want & (want - 1)) || m->set >= 8) { bad++; S("  layout %s: bind lines in sets %#x, DescriptorSet decorations %#x (one set below 8, the same in both, expected)", m->key, want, have); }
+        (m->frag ? nf : nv)[m->set < 0 || m->set >= 8 ? 8 : m->set]++;
+        bind_t sb[24]; int ns = spv_binds(m->code, m->bytes, sb, 24), diff = ns != m->nb;   // the manifest keeps at most 24 bind lines per module: more in the SPIR-V is a difference
+        for (int j = 0; j < m->nb && !diff; j++) {
+            int k = 0; while (k < ns && k < 24 && !(sb[k].set == m->b[j].set && sb[k].binding == m->b[j].binding)) k++;
+            if (k >= ns || k >= 24 || sb[k].type != m->b[j].type || sb[k].count != m->b[j].count) diff = 1;
+        }
+        if (diff) {
+            nbind++; char sv[400] = "", mv[400] = "";
+            for (int k = 0; k < ns && k < 24; k++) snprintf(sv + strlen(sv), sizeof sv - strlen(sv), " %d.%d:%d[%d]", sb[k].set, sb[k].binding, sb[k].type, sb[k].count);
+            for (int j = 0; j < m->nb; j++) snprintf(mv + strlen(mv), sizeof mv - strlen(mv), " %d.%d:%d[%d]", m->b[j].set, m->b[j].binding, m->b[j].type, m->b[j].count);
+            S("  layout %s: bind lines (set.binding:type[count])%s; SPIR-V (%d)%s", m->key, *mv ? mv : " none", ns, ns < 0 ? " not understood" : *sv ? sv : " none");
+        }
+    }
+    for (int i = 0; i < g_npair; i++) {
+        const mod_t *v = &g_mod[g_pair[i].vs], *f = &g_mod[g_pair[i].fs];
+        if (v->set >= 0 && v->set == f->set) { same++; S("  layout pair %d (%s + %s): both stages in set %d", g_pair[i].id, v->key, f->key, v->set); }
+    }
+    char sv[160] = "", sf[160] = "";
+    for (int s = 0; s < 9; s++) {
+        char nm[8] = "none"; if (s < 8) snprintf(nm, sizeof nm, "%d", s);
+        if (nv[s]) snprintf(sv + strlen(sv), sizeof sv - strlen(sv), "%s%s: %d", *sv ? ", " : "", nm, nv[s]);
+        if (nf[s]) snprintf(sf + strlen(sf), sizeof sf - strlen(sf), "%s%s: %d", *sf ? ", " : "", nm, nf[s]);
+    }
+    R("t2.layout", bad || same || nbind ? "FAIL" : "PASS", "manifest: the modules' own DescriptorSet decorations, 0 patched; vertex modules by set: %s; pixel modules by set: %s; "
+      "%d modules whose decorations differ from the manifest or span sets, %d whose bindings (set, binding, type, count) differ from their bind lines, %d pairs with both stages in one set",
+      sv, sf, bad, nbind, same);
+}
+
+// Modules and per-stage set layouts for the current device. Split layout: fragment modules get their set decorations patched to 1; merged and manifest: none patched.
 static int stage_objects(void) {
+    if (g_layout_manifest && !g_empty_dsl) {
+        VkDescriptorSetLayoutCreateInfo e = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL };
+        VkResult r = V.vkCreateDescriptorSetLayout(V.dev, &e, NULL, &g_empty_dsl);
+        if (r) { S("  empty set layout: %s", vkc_result_str(r)); return -1; }
+    }
     for (int i = 0; i < g_nmod; i++) {
         mod_t *m = &g_mod[i];
-        int np = 0; uint32_t *code = (m->frag && !g_layout_merged) ? patch_set(m->code, m->bytes, 1, &np) : m->code;
+        int np = 0; uint32_t *code = (m->frag && !g_layout_merged && !g_layout_manifest) ? patch_set(m->code, m->bytes, 1, &np) : m->code;
         VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, m->bytes, code };
         ctx("t2/module/%s", m->key);
         VkResult r = V.vkCreateShaderModule(V.dev, &ci, NULL, &m->sm);
@@ -330,6 +440,7 @@ static void stage_objects_free(void) {
         if (g_mod[i].dsl) V.vkDestroyDescriptorSetLayout(V.dev, g_mod[i].dsl, NULL);
         g_mod[i].sm = VK_NULL_HANDLE; g_mod[i].dsl = VK_NULL_HANDLE;
     }
+    if (g_empty_dsl) { V.vkDestroyDescriptorSetLayout(V.dev, g_empty_dsl, NULL); g_empty_dsl = VK_NULL_HANDLE; }
 }
 // Merged layout: one set 0 holding both stages' bindings; on a binding both use, the vertex shader's descriptor type wins (the type collision the controls show)
 static VkDescriptorSetLayout merged_dsl(const mod_t *v, const mod_t *f) {
@@ -350,9 +461,14 @@ static VkPipeline make_pipeline(const pair_t *q, VkPipelineCache cache, int bad_
     const mod_t *v = &g_mod[q->vs], *f = &g_mod[q->fs];
     memset(pr, 0, sizeof *pr); pr->r = VK_ERROR_UNKNOWN;
     if (!v->sm || !f->sm) return VK_NULL_HANDLE;
-    VkDescriptorSetLayout sets[2] = { v->dsl, f->dsl }, mdsl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sets[8] = { v->dsl, f->dsl }, mdsl = VK_NULL_HANDLE;
     uint32_t nsets = 2;
     if (g_layout_merged) { mdsl = merged_dsl(v, f); sets[0] = mdsl; nsets = 1; }
+    else if (g_layout_manifest) {   // each stage's layout at its own set, empty ones in the gaps; a shared or out-of-range set is not built (t2.layout says which)
+        if ((v->set >= 0 && v->set == f->set) || v->set >= 8 || f->set >= 8) { pr->r = VK_ERROR_INITIALIZATION_FAILED; return VK_NULL_HANDLE; }
+        nsets = (uint32_t)((v->set > f->set ? v->set : f->set) + 1);
+        for (uint32_t s = 0; s < nsets; s++) sets[s] = (int)s == v->set ? v->dsl : (int)s == f->set ? f->dsl : g_empty_dsl;
+    }
     VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, nsets, sets, 0, NULL };
     VkPipelineLayout pl = VK_NULL_HANDLE;
     if ((pr->r = V.vkCreatePipelineLayout(V.dev, &plci, NULL, &pl))) { if (mdsl) V.vkDestroyDescriptorSetLayout(V.dev, mdsl, NULL); return VK_NULL_HANDLE; }
@@ -432,6 +548,7 @@ static void t2(const char *setname, const char *phases, const char *cache_in, in
     const char *list[] = { "cold", "cold2", "fill", "reload", "disk" };
     VkPipelineCache cache = VK_NULL_HANDLE; void *data = NULL; size_t dsz = 0;
     int ready = first_device_ready;
+    if (g_layout_manifest) layout_check();
     for (int li = 0; li < 5; li++) {
         const char *ph = list[li];
         if (!strcmp(ph, "disk") ? !cache_in : (cache_in || !in_list(phases, ph))) continue;
@@ -490,15 +607,17 @@ static void controls(void) {
     S("== validation controls (each should report at least one error)");
     char err[256];
     drop_device(); if (make_device(err, sizeof err)) { S("controls: device: %s", err); return; }
-    // 1. both stages in set 0, as translated: the first pair with a binding both stages use with different descriptor types
+    // 1. both stages in set 0, as translated: the first pair with a set and binding both stages use with different descriptor types (modules already in their own sets, as the vk
+    //    chain's, have none: the control is skipped, there being nothing a merged layout could collide on)
     int coll = -1;
     for (int i = 0; i < g_npair && coll < 0; i++) {
         const mod_t *v = &g_mod[g_pair[i].vs], *f = &g_mod[g_pair[i].fs];
-        for (int a = 0; a < v->nb; a++) for (int b = 0; b < f->nb; b++) if (v->b[a].binding == f->b[b].binding && v->b[a].type != f->b[b].type) coll = i;
+        for (int a = 0; a < v->nb; a++) for (int b = 0; b < f->nb; b++)
+            if (v->b[a].set == f->b[b].set && v->b[a].binding == f->b[b].binding && v->b[a].type != f->b[b].type) coll = i;
     }
     int save = g_layout_merged;
     if (coll >= 0) { g_layout_merged = 1; stage_objects(); control_one("merged_set0", &g_pair[coll], 0, "VkGraphicsPipelineCreateInfo-layout-07990", "both stages in set 0 (expected: descriptor type mismatch)"); stage_objects_free(); }
-    else R("control.merged_set0", "SKIP", "no pair with a binding type collision");
+    else R("control.merged_set0", "SKIP", "no pair with a set and binding both stages use with different types%s", g_layout_manifest ? " (manifest layout: the stages are in their own sets)" : "");
     g_layout_merged = save;
     stage_objects();
     // 2. a pixel shader input the vertex shader does not write: the vertex shader with the fewest outputs and the pixel shader with the most inputs
@@ -764,7 +883,8 @@ int probe_main(const char *out_dir, int in_app, int argc, char **argv) {
     const char *tests = arg(argc, argv, "--tests", "t1,t2,t3,t4"), *setname = arg(argc, argv, "--set", "stripped");
     const char *phases = arg(argc, argv, "--phases", "cold,cold2,fill,warm,reload"), *cache_in = arg(argc, argv, "--cache-in", NULL);
     int validation = flag(argc, argv, "--validation");
-    g_layout_merged = !strcmp(arg(argc, argv, "--layout", "split"), "merged");
+    const char *layout = arg(argc, argv, "--layout", !strcmp(setname, "vk") ? "manifest" : "split");   // the vk chain's modules carry their own sets
+    g_layout_merged = !strcmp(layout, "merged"); g_layout_manifest = !strcmp(layout, "manifest");
     g_orig = !strcmp(setname, "orig");
     char dir[700]; const char *d = arg(argc, argv, "--dir", "shader");
     if (*d != '/') snprintf(dir, sizeof dir, "%s/%s", out_dir, d); else snprintf(dir, sizeof dir, "%s", d);
@@ -772,7 +892,8 @@ int probe_main(const char *out_dir, int in_app, int argc, char **argv) {
     if (!flag(argc, argv, "--mesa-cache")) { setenv("MESA_SHADER_CACHE_DISABLE", "true", 1); setenv("MESA_DISK_CACHE_SINGLE_FILE", "0", 1); }
     if (validation) { snprintf(p, sizeof p, "%s/validation.txt", g_resdir); g_val = fopen(p, "w"); if (g_val) fprintf(g_val, "context\tseverity\tid\tmessage\n"); }
     S("shader probe: label %s, context %s, pid %d, set %s, tests %s, phases %s, layout %s%s%s", label, in_app ? "app" : "exe", (int)getpid(), setname, tests, phases,
-      g_layout_merged ? "merged" : "split (vertex set 0, pixel set 1)", validation ? ", validation layer" : "", cache_in ? ", cache-in" : "");
+      g_layout_merged ? "merged" : g_layout_manifest ? "manifest (the modules' own sets, unpatched)" : "split (vertex set 0, pixel set 1)", validation ? ", validation layer" : "",
+      cache_in ? ", cache-in" : "");
     for (int i = 0; i < argc; i++) S("arg[%d] %s", i, argv[i]);
     S("MESA_SHADER_CACHE_DISABLE=%s", getenv("MESA_SHADER_CACHE_DISABLE") ? getenv("MESA_SHADER_CACHE_DISABLE") : "(unset)");
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--env")) {   // --env NAME=VALUE (repeatable): driver debug variables such as TU_DEBUG, set before the driver loads

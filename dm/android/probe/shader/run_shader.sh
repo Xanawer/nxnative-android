@@ -2,8 +2,9 @@
 # Runs the P0.8 shader probe and copies its results to <results>/<driver>/<exe|app|mac>/[<tag>/].
 # Usage: run_shader.sh app|exe stock|842|turnip [probe arguments, e.g. --set orig --tests t1,t2]
 #        run_shader.sh mac kk [probe arguments]           (KosmicKrisp through Homebrew's loader, with the Khronos validation layer)
-#   RUN_TAG=<name>: results in <results>/<driver>/<mode>/<name>/ (default: "stripped", or "orig" for --set orig).
-#   DATA (default ~/dm-work/android/probe-build/shader/data): manifest.txt (gen_manifest.py), stripped/<key>.spv, orig/<key>.spv. Game-derived: pushed at run time,
+#   RUN_TAG=<name>: results in <results>/<driver>/<mode>/<name>/ (default: the --set name, "stripped" without one).
+#   DATA (default ~/dm-work/android/probe-build/shader/data): manifest.txt (gen_manifest.py) and <set>/<key>.spv for the --set run (stripped, orig, or vk from
+#        dmsh_build_vk.py, decompressed; only that directory is pushed). Game-derived: pushed at run time,
 #        never in the repository. app: tar'd to /data/local/tmp/nxprobe-shader-push and unpacked into the app's files/shader/; exe: /data/local/tmp/nxprobe-shader/shader/.
 #   EXE_PREFIX (exe only): a command put before the executable, e.g. "taskset 80" to pin it to CPU 7.
 #   CACHE_IN=<file>: push this VkPipelineCache data (a previous run's res/cache.bin) and run only the t2 phase "disk".
@@ -20,6 +21,7 @@ MODE=${1:-} DRV=${2:-}; shift 2 || die "usage: run_shader.sh app|exe stock|842|t
 case $MODE/$DRV in mac/kk|app/stock|app/842|app/turnip|exe/stock|exe/842|exe/turnip) ;; *) die "mode/driver must be app|exe with stock|842|turnip, or mac with kk" ;; esac
 [ -f "$DATA/manifest.txt" ] || die "no $DATA/manifest.txt (run gen_manifest.py, see docs/android/probes-shader.md)"
 tag=stripped; prev=""; for a in "$@"; do [ "$prev" = --set ] && tag=$a; prev=$a; done
+SETDIR=$tag; [ -d "$DATA/$SETDIR" ] || die "no $DATA/$SETDIR (the modules for --set $SETDIR)"
 [ -n "${CACHE_IN:-}" ] && tag=$tag-disk
 DEST=$RES/$DRV/$MODE/${RUN_TAG:-$tag}
 rm -rf "$DEST"; mkdir -p "$DEST"
@@ -58,7 +60,7 @@ cleanup() {
     [ "$MODE" = app ] && "$ADB" shell "run-as $PKG sh -c 'rm -rf files/shader files/cache_in.bin files/res/cache.bin'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
- (cd "$DATA" && COPYFILE_DISABLE=1 tar cf "$TAR" manifest.txt stripped orig)
+ (cd "$DATA" && COPYFILE_DISABLE=1 tar cf "$TAR" manifest.txt "$SETDIR")
 T0=$("$ADB" shell "date +'%m-%d %H:%M:%S.000'" | tr -d '\r')
 
 if [ "$MODE" = exe ]; then

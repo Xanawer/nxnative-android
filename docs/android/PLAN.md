@@ -254,6 +254,19 @@ The translator already emits SPIR-V with `TargetApi.Vulkan` (`dm/gfx/tools/dmsh_
 | `dmsh_fetch` (`_bf`, readable tile), `dmsh_vin` (`_bv`) | Drop. The tile-based optimizations are off by default upstream; vertex input is checked against Vulkan's format rules |
 | `xcrun metal` → metallib | Dropped. Ship zstd-compressed SPIR-V; the output directory is `b-<V>-vk/`, with the target folded into the chain version |
 
+**As built (2026-10-25):** `dm/gfx/tools/dmsh_build_vk.py`, a sibling of `dmsh_build.py` (editing that file would move the Metal chain's version, which hashes it), takes the shared steps from it by name and stops with a `[RED]` line if upstream changes one of them in a way it cannot follow. It writes `b-<V>-vk/<key>_b.spv.zst` and `<key>_b.json`; V folds the target, the Metal chain's version and the translator lock into one. The passes run in order:
+- single-lane rewriting for vertex shaders, then a fix for the `OpSelect` it emits (invalid in SPIR-V 1.3);
+- `N` min/max/clamp;
+- the `gl_PerVertex` cut, only in the last stage before rasterization;
+- removal of unused descriptors;
+- one set per stage (vertex 0, pixel 1, geometry 2, hull 3, domain 4, compute 0);
+- padding and initialising of the vertex outputs the paired pixel shaders read, matched by equivalent type (base type, components, array shape; no widening, since that needs maintenance4); interpolation decorations stay on the pixel side;
+- the capability strip, then `spirv-val` for Vulkan 1.3.
+
+The reflection gives each binding its set, binding, exact descriptor type and count (null with `runtime` or `spec_sized`), each pixel output's value type, and a `status`. A backend must refuse a module marked `unsupported`. That covers geometry and tessellation shaders (they need per-topology variants), capabilities or extensions outside an allowlist of what all four drivers accept, push constants, and modules the passes cannot follow: several entry points, decoration groups, specialization-sized arrays, and aggregate, matrix or Component-decorated interface variables.
+
+Results on Stardew Valley: 65/65 modules ok, and 73/73 pipelines with 0 validation messages on KosmicKrisp, stock, 842.6 and Turnip. The Khronos layer loads under libadrenotools too. `gen_manifest.py --vk` builds the probe's manifest from the reflection and fails if it differs from the SPIR-V. KosmicKrisp has no geometry shaders or transform feedback, so a Mac run refuses those; the phones would run them natively.
+
 **Y direction (settled by P0.8):** on every driver here a positive viewport height puts clip-space y < 0 on memory row 0 and `FragCoord.y` equals the memory row; the Stardew vertex shaders pass Y through unchanged, and the game keeps NVN's lower-left window origin. So for a lower-left origin the backend keeps positive viewport heights, reverses the front-face winding, and flips the picture at present; depth uses `VK_EXT_depth_clip_control` (NVN's near = −w). No shader change.
 
 **Pipelines (P0.8):** Stardew's 73 pipelines take about 0.4 s cold on the Qualcomm drivers on a prime core (3.3–3.6× that on a little core), about 5 ms with a pipeline cache. No driver persists its own cache, so the backend keeps a `VkPipelineCache` file per driver identity (`driverID`, `driverVersion`, `pipelineCacheUUID`), and compiles on worker threads pinned to prime cores. Turnip never reports cache hits, so whether its cache works is judged by timing.
@@ -285,7 +298,7 @@ Several go away on Vulkan: triangle fans are native, indirect-count draws are na
 ### 2.6 Pipelines
 - **Key:** today's `pso_skey` stores Metal pixel formats (`nvn_pso_skey.h:7`; filled from `pixelFormat` in `nvn_mtl.m`). Switch it to NVN formats, so that `pso_manifest.tsv` and `pso_user.tsv` work for both backends. This change could go upstream.
 - **Cache:** a `VkPipelineCache`, plus `VK_KHR_pipeline_binary` where present, saved next to `pso_user.tsv`.
-- **Fewer variants:** graphics pipeline libraries and extended dynamic state.
+- **Fewer variants:** graphics pipeline libraries and extended dynamic state. Separately linked libraries need `graphicsPipelineLibraryIndependentInterpolationDecoration` (842.6 reports 0; stock has no `VK_EXT_graphics_pipeline_library`): without it, a padded vertex output, which carries no interpolation decoration, does not match a flat pixel input.
 - **Prewarm:** in the background, as `warm_start` does (`nvn_mtl.m:4702`).
 - **Stutter is a bigger risk than on iOS:** the driver compiles SPIR-V on the phone, where upstream ships precompiled Metal libraries. The prewarm lists matter more.
 

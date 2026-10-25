@@ -2,7 +2,8 @@
 # Builds the P0.8 shader probe through the P0.7 GPU harness (dm/android/probe/gpu/build_probe_gpu.sh, probe_glue_gpu.c and vk_common.c, used unchanged):
 #   <out>/shader (adb executable, hook libraries in <out>/lib) and <out>/shader.apk (org.nxnative.probe.shader).
 #   build.sh mac: <out>/shader-mac, a macOS executable for KosmicKrisp and the validation layer (Homebrew's loader, dlopen'd at run time).
-# Needs glslangValidator, spirv-val (Homebrew), and for Android libadrenotools built as for P0.7 (ADRENOTOOLS_BUILD, default ~/dm-work/android/src/libadrenotools-build).
+# Needs glslangValidator, spirv-val (Homebrew), and for Android libadrenotools built as for P0.7 (ADRENOTOOLS_BUILD, default ~/dm-work/android/src/libadrenotools-build);
+# optional VALIDATION_LAYER (below).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); GPU=$HERE/../gpu; . "$HERE/../common/env.sh"
 OUT=${PROBE_OUT:-$HOME/dm-work/android/probe-build/shader}
@@ -36,6 +37,9 @@ fi
 AT=${ADRENOTOOLS_BUILD:-$HOME/dm-work/android/src/libadrenotools-build}
 LIBS=("$AT/libadrenotools.so" "$AT/src/hook/libhook_impl.so" "$AT/src/hook/libmain_hook.so" "$AT/src/hook/libfile_redirect_hook.so" "$AT/src/hook/libgsl_alloc_hook.so")
 EXTRA=(); for l in "${LIBS[@]}"; do [ -f "$l" ] || die "missing $l (build libadrenotools first)"; EXTRA+=(--extra-lib "$l"); done
+# VALIDATION_LAYER=<arm64 libVkLayer_khronos_validation.so> (Khronos' android-binaries release): in the debuggable APK's lib dir, where the system loader finds it for
+# --validation, with every driver (adrenotools loads the system loader in its own namespace and redirects only the driver, so 842.6 and Turnip runs load it too)
+if [ -n "${VALIDATION_LAYER:-}" ]; then [ -f "$VALIDATION_LAYER" ] || die "missing $VALIDATION_LAYER"; EXTRA+=(--extra-lib "$VALIDATION_LAYER"); fi
 "$GPU/build_probe_gpu.sh" shader org.nxnative.probe.shader "$OUT" "${EXTRA[@]}" -- "$HERE/shader_probe.c" "$GPU/vk_common.c" -- -I"$VKH" -I"$GEN" -I"$GPU"
 mkdir -p "$OUT/lib"; cp "${LIBS[@]}" "$OUT/lib/"
 echo "hook libraries for the executable in $OUT/lib"
