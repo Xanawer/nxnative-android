@@ -1,0 +1,35 @@
+#version 450
+// P0.8 T4: GLSL.std.450 min / max / clamp with NaN and signed-zero operands. Parameters come from a buffer, not push constants (Turnip a8xx reads garbage from compute
+// push constants, docs/android/probes-gpu.md). -DNAN_OPS: NMin / NMax / NClamp (ext. instructions 79 / 80 / 81) instead of FMin / FMax / FClamp (37 / 40 / 43).
+// -DPRESERVE: OpExecutionMode SignedZeroInfNanPreserve 32 (SPIR-V 1.4 float controls). Ops 2 and 4 are the forms the translator emits: FMax(0.0, x) and FClamp(x, 0.0, 1.0).
+#extension GL_EXT_spirv_intrinsics : require
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer In { uint n; uint pad0, pad1, pad2; uvec2 v[]; } inb;
+layout(std430, set = 0, binding = 1) writeonly buffer Out { uint r[]; } outb;
+#ifdef NAN_OPS
+spirv_instruction(set = "GLSL.std.450", id = 79) float MIN(float a, float b);
+spirv_instruction(set = "GLSL.std.450", id = 80) float MAX(float a, float b);
+spirv_instruction(set = "GLSL.std.450", id = 81) float CLAMP(float x, float lo, float hi);
+#else
+#define MIN min
+#define MAX max
+#define CLAMP clamp
+#endif
+#ifdef PRESERVE
+spirv_execution_mode(capabilities = [4466], 4461, 32);   // SignedZeroInfNanPreserve, width 32
+#endif
+#define NOPS 8
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= inb.n) return;
+    float a = uintBitsToFloat(inb.v[i].x), b = uintBitsToFloat(inb.v[i].y);
+    uint o = i * NOPS;
+    outb.r[o + 0] = floatBitsToUint(MIN(a, b));
+    outb.r[o + 1] = floatBitsToUint(MAX(a, b));
+    outb.r[o + 2] = floatBitsToUint(MAX(0.0, a));
+    outb.r[o + 3] = floatBitsToUint(MAX(a, 0.0));
+    outb.r[o + 4] = floatBitsToUint(CLAMP(a, 0.0, 1.0));
+    outb.r[o + 5] = floatBitsToUint(CLAMP(0.5, a, 1.0));
+    outb.r[o + 6] = floatBitsToUint(CLAMP(0.5, 0.0, a));
+    outb.r[o + 7] = floatBitsToUint(MIN(1.0, a));
+}

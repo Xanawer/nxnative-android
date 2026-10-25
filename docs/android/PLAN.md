@@ -234,18 +234,20 @@ The translator already emits SPIR-V with `TargetApi.Vulkan` (`dm/gfx/tools/dmsh_
 | Step now (`dmsh_build.py`) | Vulkan target |
 |---|---|
 | `vertex_ab`, `dmsh_xlate`, `VertexCounterLowering`, the `softfloat64` retry (`Program.cs:125,170-175`) | Keep (Adreno has no FP64 in most drivers) |
-| `spv_single_lane` (`:700-737`; Metal has no SIMD-group functions in vertex functions) | Drop if subgroup stages include vertex (P0.7) |
-| `precise()` NaN fix on the Metal source (`:40, :826`) | The translator emits `NMin`/`NMax`/`NClamp` |
+| `spv_single_lane` (`:700-737`; Metal has no SIMD-group functions in vertex functions) | Keep the idea: KosmicKrisp has no subgroups in vertex shaders either. Plus `dm/android/tools/spv_strip_caps.py`, which drops the `Float64`, `GroupNonUniform*` and interlock capabilities a module declares but does not use (all 65 Stardew modules declare them; no driver here supports `Float64` or interlock) |
+| `precise()` NaN fix on the Metal source (`:40, :826`) | Today the translator emits `FMax` and `FClamp`, whose NaN result SPIR-V leaves undefined (P0.8: Stardew has 47 and 33, no `N*`). Every driver here happens to return the non-NaN operand, Maxwell's behaviour, in a compute test; the chain still rewrites them to `NMax`/`NMin`/`NClamp` so the result does not depend on the driver |
 | `vs_depth` (`main0` / `main0_z`, `:657-667`) | `VK_EXT_depth_clip_control` per pipeline (`QueryHostSupportsDepthClipControl`, `Program.cs:120`) |
-| `vs_pad` (`:564`, from `shader_pairs.tsv`) | A SPIR-V pass (Vulkan also needs every fragment input written) |
+| `vs_pad` (`:564`, from `shader_pairs.tsv`) | A SPIR-V pass (Vulkan also needs every fragment input written). The same pass shrinks `gl_PerVertex`: every vertex shader declares 8 clip plus 1 cull distance, over the limit of 8 (the validation layer's only error on the stripped modules; drivers accept it) |
 | `vs_init`, `vs_layer`, `vs_tf`, `fs_uint` (`:352-669`) | Check each one; transform feedback goes native through the extension |
 | `gs_slice`, `geometry_finish` (compute emulation) | Native geometry shaders |
-| Reflection by regex over the Metal source (`:454-500`, `arg_id` from `[[id(N)]]`) | Reflection from SPIR-V; `.res.json` already has the binding numbers (`Program.cs:183-195`) |
+| Reflection by regex over the Metal source (`:454-500`, `arg_id` from `[[id(N)]]`) | Reflection from SPIR-V; `.res.json` already has the binding numbers (`Program.cs:183-195`). Each stage gets its own descriptor set: both stages now number from binding 1 in set 0, which collides in 59 of Stardew's 73 pipelines (Metal's per-stage argument tables hid it). Set layouts take the exact descriptor types from reflection, vertex formats the input's type (`uvec4` inputs need `_UINT` formats) |
 | `c1_guard.py`, `cb_extent.py` (over `*_b.metal`) | Skipped at first. The conservative paths already exist: a whole 64 KiB c1 buffer per shader, and whole-binding copies (`dm/gfx/README.md:53-54`). Ported to SPIR-V later |
 | `dmsh_fetch` (`_bf`, readable tile), `dmsh_vin` (`_bv`) | Drop. The tile-based optimizations are off by default upstream; vertex input is checked against Vulkan's format rules |
 | `xcrun metal` → metallib | Dropped. Ship zstd-compressed SPIR-V; the output directory is `b-<V>-vk/`, with the target folded into the chain version |
 
-**Y direction:** the shaders are made with "no Y flip" (`Program.cs:116-117`), Metal's and Vulkan's normalized-coordinate Y axes are opposite, and the replay already flips the viewport for lower-left origins (`nvn_mtl.m:3430-3436`). Settle this with P0.8's test pattern, most likely with negative-height viewports.
+**Y direction (settled by P0.8):** on every driver here a positive viewport height puts clip-space y < 0 on memory row 0 and `FragCoord.y` equals the memory row; the Stardew vertex shaders pass Y through unchanged, and the game keeps NVN's lower-left window origin. So for a lower-left origin the backend keeps positive viewport heights, reverses the front-face winding, and flips the picture at present; depth uses `VK_EXT_depth_clip_control` (NVN's near = −w). No shader change.
+
+**Pipelines (P0.8):** Stardew's 73 pipelines take about 0.4 s cold on the Qualcomm drivers on a prime core (3.3–3.6× that on a little core), about 5 ms with a pipeline cache. No driver persists its own cache, so the backend keeps a `VkPipelineCache` file per driver identity (`driverID`, `driverVersion`, `pipelineCacheUUID`), and compiles on worker threads pinned to prime cores. Turnip never reports cache hits, so whether its cache works is judged by timing.
 
 **Helper kernels.** These are written as Metal source inside `nvn_mtl.m` and need GLSL → SPIR-V counterparts:
 - `ms` (`:6458`)
