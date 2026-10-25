@@ -3,7 +3,8 @@
 // is queued after this read). The surface is made on the front end's window: Android front_native_window() (VK_KHR_android_surface), the Mac front_metal_layer() (VK_EXT_metal_surface, KosmicKrisp).
 // The picture: aspect kept with black bars (filled when the aspects differ by under 1%, as nvn_mtl.m present_encode), the crop, and for NVN's lower-left origin a vertical flip: PLAN.md 2.4's
 // Y paragraph keeps positive viewport heights, so the window image is stored bottom-up. On Android the swapchain takes the surface's current transform as its preTransform and the picture is
-// drawn rotated (no compositor rotation, no SUBOPTIMAL). Present work signals its own timeline semaphore; NVN fence values stay the NVN timeline's
+// drawn rotated (no compositor rotation, no SUBOPTIMAL). Present work signals its own timeline semaphore; NVN fence values stay the NVN timeline's. DM_NVN_SHOT's screenshots are taken on
+// this thread too, after their present and before its ticket is done (shot_one), with or without a window
 #include "vkn.h"
 #include "present_spv.h"
 #include <errno.h>
@@ -18,7 +19,7 @@ void *front_native_window(void);
 
 // ---------- Tickets (any thread → the present thread) ----------
 #define PQ 8
-typedef struct { uint64_t ticket, serial; uint32_t w, h; int crop[4]; } pq_ent;
+typedef struct { uint64_t ticket, serial; uint32_t w, h; int crop[4]; char shot[1024]; } pq_ent;   // shot: DM_NVN_SHOT's path for this present, "" = none (shot_one)
 static pq_ent g_pq[PQ];
 static uint64_t g_pq_in, g_pq_read, g_pq_done;   // under g_pmu
 static int g_lost_req, g_thread_on, g_dead;       // g_dead: the present objects could not be made, or the queue could not be idled to let the swapchain go (wedge): tickets are retired at once
@@ -471,6 +472,119 @@ static void present_one(const pq_ent *q) {
     if ((!r || r == VK_SUBOPTIMAL_KHR) && !g_shown++) VLOG("presenting on the swapchain: frames are shown");   // not worded "first present" (lognorm.py --until-present cuts there)
 }
 
+// ---------- Screenshots (DM_NVN_SHOT: nvn_vk.c picks the presents and the path): the window texture as nvn_mtl.m's shot() writes it, so the two backends' frames diff directly ----------
+// Level 0 of the whole texture at its own size (no crop, no scaling: DM_NVN_SHOT_OUT is not ported), rows flipped for NVN's lower-left origin (the image is stored bottom-up, the file top-down),
+// written as an 8-bit RGB PNG with an sRGB chunk; the bytes as stored (an sRGB target's are not converted, nor are they by Metal's blit). Taken on this thread after the present's own work: the copy
+// is queued behind every NVN submission made before this present, and the ticket is done only after it, so the game has not drawn its next frame into the texture yet (it gets the texture back only
+// then: mtl_present_wait). Independent of the window and the swapchain. Only a shot present waits for the GPU (pres_wait); the others never come here
+static VkCommandPool g_shot_pool; static VkCommandBuffer g_shot_cb; static VkBuffer g_shot_buf; static VkDeviceMemory g_shot_mem; static void *g_shot_map; static VkDeviceSize g_shot_cap;
+static int g_shot_coh, g_shot_dead;   // g_shot_dead: a shot never finished on the GPU, so its buffer may still be written: no more shots (said in red)
+static void shot_buf_free(void) {
+    if (g_shot_map) vk.vkUnmapMemory(vd.dev, g_shot_mem);
+    if (g_shot_buf) vk.vkDestroyBuffer(vd.dev, g_shot_buf, NULL);
+    if (g_shot_mem) vk.vkFreeMemory(vd.dev, g_shot_mem, NULL);
+    g_shot_map = NULL; g_shot_buf = VK_NULL_HANDLE; g_shot_mem = VK_NULL_HANDLE; g_shot_cap = 0;
+}
+static int shot_buf(VkDeviceSize n) {   // a host-visible readback buffer of n bytes at least (the last shot has completed: shot_one waits for each)
+    if (g_shot_cap >= n) return 1;
+    shot_buf_free();
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (vk.vkCreateBuffer(vd.dev, &bi, NULL, &g_shot_buf)) { g_shot_buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(vd.dev, g_shot_buf, &mr);
+    int mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);   // read by the CPU: cached where there is such a type
+    if (mt < 0) mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &g_shot_mem)) { g_shot_mem = VK_NULL_HANDLE; shot_buf_free(); return 0; }
+    if (vk.vkBindBufferMemory(vd.dev, g_shot_buf, g_shot_mem, 0) || vk.vkMapMemory(vd.dev, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &g_shot_map)) { g_shot_map = NULL; shot_buf_free(); return 0; }
+    g_shot_coh = (vd.mem.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0; g_shot_cap = n;
+    return 1;
+}
+// PNG without zlib (the link lines stay as they are): stored deflate blocks, CRC-32 for the chunks, Adler-32 for the stream. 1 = written
+static uint32_t g_crc_t[256];
+static uint32_t crc32_of(uint32_t c, const uint8_t *p, size_t n) {
+    if (!g_crc_t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; g_crc_t[i] = v; }
+    c = ~c; while (n--) c = g_crc_t[(c ^ *p++) & 0xff] ^ (c >> 8);
+    return ~c;
+}
+static void be32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static int png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
+    uint8_t h[8]; be32(h, n); memcpy(h + 4, type, 4);
+    uint32_t c = crc32_of(crc32_of(0, h + 4, 4), d, n); uint8_t t[4]; be32(t, c);
+    return fwrite(h, 1, 8, f) == 8 && (!n || fwrite(d, 1, n, f) == n) && fwrite(t, 1, 4, f) == 4;
+}
+static int png_write(const char *path, uint32_t w, uint32_t h, const uint8_t *raw) {   // raw: h scanlines of a filter byte (0) and 3 * w bytes of RGB
+    size_t rn = (size_t)h * (1 + 3 * (size_t)w), nb = rn / 65535 + 1, zn = 2 + nb * 5 + rn + 4;
+    if (zn > 0x7fffffffu) return 0;   // one IDAT chunk
+    uint8_t *z = malloc(zn); if (!z) return 0;
+    size_t o = 0; z[o++] = 0x78; z[o++] = 0x01;
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < rn; i++) { a += raw[i]; if (a >= 65521) a -= 65521; b += a; if (b >= 65521) b -= 65521; }
+    for (size_t s = 0; s < rn || s == 0; ) {   // an empty image is one empty final block
+        size_t k = rn - s > 65535 ? 65535 : rn - s; int last = s + k == rn;
+        z[o++] = (uint8_t)last; z[o++] = (uint8_t)k; z[o++] = (uint8_t)(k >> 8); z[o++] = (uint8_t)~k; z[o++] = (uint8_t)(~k >> 8);
+        memcpy(z + o, raw + s, k); o += k; s += k;
+        if (last) break;
+    }
+    be32(z + o, b << 16 | a); o += 4;
+    uint8_t ih[13]; be32(ih, w); be32(ih + 4, h); ih[8] = 8; ih[9] = 2; ih[10] = ih[11] = ih[12] = 0;   // 8-bit RGB, no interlace
+    const uint8_t srgb = 0;   // perceptual: the colour space Metal's CGImage is tagged with
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite("\x89PNG\r\n\x1a\n", 1, 8, f) == 8 && png_chunk(f, "IHDR", ih, 13) && png_chunk(f, "sRGB", &srgb, 1) && png_chunk(f, "IDAT", z, (uint32_t)o) && png_chunk(f, "IEND", NULL, 0);
+    if (f && fclose(f)) ok = 0;
+    free(z); return ok;
+}
+static void shot_one(const pq_ent *q) {
+    if (g_shot_dead) return;   // said
+    if (atomic_load(&vkn_lost)) { VRED_ONCE("screenshot %s: the GPU is lost to this run, no screenshots", q->shot); return; }
+    if (!g_shot_pool) {
+        VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, vd.qfam};
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        if (vk.vkCreateCommandPool(vd.dev, &pi, NULL, &g_shot_pool) || (ai.commandPool = g_shot_pool, vk.vkAllocateCommandBuffers(vd.dev, &ai, &g_shot_cb))) {
+            g_shot_dead = 1; VRED_ONCE("screenshot %s: the readback command buffer cannot be made: no screenshots", q->shot); return; }
+    }
+    if (!shot_buf((VkDeviceSize)q->w * q->h * 4)) { VRED_ONCE("screenshot %s: no host-visible readback buffer of %ux%u: not taken (the next ones try again)", q->shot, q->w, q->h); return; }
+    pthread_mutex_lock(&vkn_qmu); pthread_mutex_lock(&vkn_tmu);   // the layout read here is the queue's (see present_one), and the image stays until its use_pres has completed
+    vkn_img *e = vkn_img_get(q->serial); VkImageLayout L = e ? e->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    VkFormatProperties fp = {0}; if (e) vk.vkGetPhysicalDeviceFormatProperties(vd.pd, e->fmt, &fp);
+    int bgra = e && (e->fmt == VK_FORMAT_B8G8R8A8_UNORM || e->fmt == VK_FORMAT_B8G8R8A8_SRGB), rgba = e && (e->fmt == VK_FORMAT_R8G8B8A8_UNORM || e->fmt == VK_FORMAT_R8G8B8A8_SRGB);
+    const char *no = !e ? "the window texture has no host image" : L == VK_IMAGE_LAYOUT_UNDEFINED ? "the window texture was never written" : !bgra && !rgba ? "its format is not RGBA8 / BGRA8"
+                   : !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) ? "its format cannot be copied from" : (VkDeviceSize)e->w * e->h * 4 > g_shot_cap ? "it is larger than the present said" : NULL;
+    uint32_t w = e ? e->w : 0, h = e ? e->h : 0; VkFormat fmt = e ? e->fmt : VK_FORMAT_UNDEFINED; VkResult r = VK_SUCCESS; uint64_t val = 0;
+    if (!no) {
+        VkCommandBuffer cb = g_shot_cb;
+        vk.vkResetCommandPool(vd.dev, g_shot_pool, 0);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        vk.vkBeginCommandBuffer(cb, &bi);
+        img_barrier(cb, e->img, VK_IMAGE_ASPECT_COLOR_BIT, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy rg = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        vk.vkCmdCopyImageToBuffer(cb, e->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot_buf, 1, &rg);
+        img_barrier(cb, e->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                    VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);   // back as the next NVN submission expects it
+        VkMemoryBarrier2 hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &hb, 0, NULL, 0, NULL};
+        vk.vkCmdPipelineBarrier2(cb, &di);
+        vk.vkEndCommandBuffer(cb);
+        val = atomic_load(&g_pval) + 1; e->use_pres = val;
+        if (!(r = submit_one(cb, VK_NULL_HANDLE, VK_NULL_HANDLE, val))) atomic_store(&g_pval, val);   // failed: the GPU lost (said there)
+    }
+    pthread_mutex_unlock(&vkn_tmu); pthread_mutex_unlock(&vkn_qmu);
+    if (no) { VLOG("[RED] screenshot %s: not taken: %s", q->shot, no); return; }
+    if (r) return;
+    if (!pres_wait(val)) { g_shot_dead = 1; VRED_ONCE("screenshot %s: the readback has not finished on the GPU: no more screenshots (its buffer may still be written)", q->shot); return; }
+    VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_shot_mem, 0, VK_WHOLE_SIZE};
+    if (!g_shot_coh && (r = vk.vkInvalidateMappedMemoryRanges(vd.dev, 1, &mr))) { VLOG("[RED] screenshot %s: not taken: the readback memory could not be invalidated (VkResult %d)", q->shot, r); return; }
+    size_t row = 1 + 3 * (size_t)w; uint8_t *raw = malloc(row * h ? row * h : 1); int ll = vkn_origin_ll(), ok = 0;
+    if (raw) {
+        const uint8_t *src = g_shot_map;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *s = src + (size_t)(ll ? h - 1 - y : y) * w * 4; uint8_t *d = raw + y * row; *d++ = 0;
+            for (uint32_t x = 0; x < w; x++, s += 4) { d[0] = s[bgra ? 2 : 0]; d[1] = s[1]; d[2] = s[bgra ? 0 : 2]; d += 3; }
+        }
+        ok = png_write(q->shot, w, h, raw); free(raw);
+    }
+    VLOG("%sscreenshot %ux%u format %d%s → %s %s", ok ? "" : "[RED] ", w, h, fmt, ll ? " (rows flipped: lower-left origin)" : "", q->shot, ok ? "ok" : "failed (memory, or the file cannot be written)");
+}
+
 static void *present_main(void *arg) {
     (void)arg;
     pthread_setname_np(
@@ -495,6 +609,7 @@ static void *present_main(void *arg) {
         pq_ent q = g_pq[g_pq_read % PQ]; g_pq_read++;
         pthread_mutex_unlock(&g_pmu);
         present_one(&q);
+        if (q.shot[0] && !g_wedged) shot_one(&q);   // before the ticket is done (see shot_one); a wedged queue cannot be waited on
         pthread_mutex_lock(&g_pmu); g_pq_done = q.ticket; pthread_cond_broadcast(&g_pcv);
         if (g_wedged) break;
     }
@@ -504,7 +619,7 @@ static void *present_main(void *arg) {
     return NULL;
 }
 
-uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int crop[4], int log) {
+uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int crop[4], int log, const char *shot) {
     if (!vd.dev) return 0;
     pthread_mutex_lock(&g_pmu);
     if (!g_thread_on) {
@@ -512,9 +627,10 @@ uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int 
         pthread_detach(t); g_thread_on = 1;
     }
     while (!g_dead && g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pcv, &g_pmu);   // a full queue holds the game here, as nvn_mtl.m's
-    if (g_dead) { pthread_mutex_unlock(&g_pmu); return 0; }   // after the wait too: the present thread can end while a producer waits, and nothing would retire its ticket
+    if (g_dead) { pthread_mutex_unlock(&g_pmu); if (shot) VRED_ONCE("screenshot %s: the present thread is not running: no screenshots", shot); return 0; }   // after the wait too: the present thread can end while a producer waits, and nothing would retire its ticket
     uint64_t tk = ++g_pq_in; pq_ent *e = &g_pq[(tk - 1) % PQ];   // the present thread reads entry g_pq_read (= tk - 1) next
     e->ticket = tk; e->serial = serial; e->w = w; e->h = h; if (crop) memcpy(e->crop, crop, sizeof e->crop); else memset(e->crop, 0, sizeof e->crop);
+    snprintf(e->shot, sizeof e->shot, "%s", shot ? shot : "");
     if (log) atomic_store(&g_plog, 1);
     pthread_cond_broadcast(&g_pcv); pthread_mutex_unlock(&g_pmu);
     return tk;

@@ -29,7 +29,8 @@ typedef VkResult (VKAPI_PTR *vkn_create_surface_fn)(VkInstance, const void *, co
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCreateSampler) X(vkDestroySampler) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline)
+    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
+    X(vkInvalidateMappedMemoryRanges) X(vkFlushMappedMemoryRanges) X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkGetBufferDeviceAddress)
 typedef struct {
 #define VKN_PFN(n) PFN_##n n;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
@@ -46,6 +47,7 @@ typedef struct {
     int validation;                      // DM_VK_VALIDATION=1: VK_LAYER_KHRONOS_validation and the messenger are on
     const char *surface_ext;             // VK_KHR_android_surface / VK_EXT_metal_surface; NULL = none, nothing is shown
     int absent;                          // vkn_dev_init failed for want of Vulkan itself (no loader library, or a loader with no driver), not a broken one (t_vkn's only skip)
+    int bda;                             // bufferDeviceAddress is on (Vulkan 1.3 requires it): shadow buffers have device addresses (nvn_vk.c mtl_gpu_addr)
 } vkn_dev_t;
 extern vkn_dev_t vd;
 int vkn_dev_init(void);                  // 1 = a device; logs the driver's identity
@@ -69,7 +71,10 @@ vkn_img *vkn_img_get(uint64_t serial);  // under vkn_tmu
 extern pthread_mutex_t vkn_tmu;          // the image table
 extern pthread_mutex_t vkn_qmu;          // the queue (vkQueueSubmit2, vkQueuePresentKHR, vkQueueWaitIdle) and the published layouts
 VkImageView vkn_img_view(vkn_img *e, uint32_t level, uint32_t layer, int present);   // under vkn_tmu
-void vkn_sweep(void);                    // destroys released images whose last uses have completed
+void vkn_sweep(void);                    // destroys released images, and freed pools' shadow buffers, whose last uses have completed
+// Strategy B (nvn_vk.c, PLAN.md 2.2 "As built, slice 2a"): a game address → its pool's shadow VkBuffer (as void *), the offset in it and its device address (0 without bufferDeviceAddress).
+// 0 = no pool with a shadow holds [addr, addr+len): a pool gets one when a replayed record first reads it as a buffer
+int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu);
 // The GPU lost to this run (VK_ERROR_DEVICE_LOST, or a submission the queue refused): said once in red; from then on nothing reaches the device (a lost device's queue would keep failing,
 // and its command buffers stay pending for ever): NVN submissions complete in order without it (the null backend's behaviour) and presents are retired unshown. Any thread
 extern _Atomic int vkn_lost;
@@ -78,8 +83,9 @@ void vkn_gpu_lost(const char *where, VkResult r);
 // The NVN timeline (nvn_vk.c) and the present's own (vk_present.c): never mixed, an NVN fence value is only ever an NVN submission's
 uint64_t vkn_pres_done(void);
 int vkn_origin_ll(void);                 // NVN's window origin is lower left (mtl_set_origin_lower_left)
-// The present thread (vk_present.c): a ticket per present, done once its frame is handed to the queue; log: say what this present shows
-uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int crop[4], int log);
+// The present thread (vk_present.c): a ticket per present, done once its frame is handed to the queue; log: say what this present shows; shot: a PNG path (DM_NVN_SHOT picked this present,
+// nvn_mtl.m's numbering: the present count, which is not the ticket's) or NULL: the window texture is read back and written there before the ticket is done
+uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int crop[4], int log, const char *shot);
 void vkn_present_wait(uint64_t ticket);
 void vkn_present_flush(void);            // every ticket so far done, and the GPU through their present work
 int vkn_present_drain(uint64_t ns);      // the same within ns: 1 = done

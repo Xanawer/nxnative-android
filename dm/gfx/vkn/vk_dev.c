@@ -224,6 +224,8 @@ int vkn_dev_init(void) {
     vk.vkGetPhysicalDeviceFeatures2(vd.pd, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("[RED] the device lacks dynamic rendering, synchronization2 or timeline semaphores: nothing is drawn"); return 0; }
     VkPhysicalDeviceVulkan12Features w12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, NULL}; w12.timelineSemaphore = VK_TRUE;
+    // Buffer device addresses for the shadow buffers (PLAN.md 2.2 B: the address table gives one per pool); required by 1.3, so a driver without it is said and the shadows have none
+    if (f12.bufferDeviceAddress) { w12.bufferDeviceAddress = VK_TRUE; vd.bda = 1; } else VLOG("[RED] the device has no bufferDeviceAddress (Vulkan 1.3 requires it): shadow buffers have no device address");
     VkPhysicalDeviceVulkan13Features w13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &w12}; w13.dynamicRendering = VK_TRUE; w13.synchronization2 = VK_TRUE;
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, de);

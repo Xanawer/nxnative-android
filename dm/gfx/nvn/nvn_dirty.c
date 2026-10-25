@@ -225,7 +225,7 @@ const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_spa
 // the whole run goes back to writable (all its pages were writable, NONE, when the call took them), and r counts as always written from now on, as an untracked pool does: nvn_dirty_since says 1,
 // nvn_dirty_now moves on every read (no caller's "nothing written since" shortcut holds) and r is not protected again. Other ranges sharing those pages hear of the write (prep_write: a page
 // read-only for them is writable now). If even this mprotect fails nothing is known about the run: a write could fault forever or land unseen, so the host stops. Host path only (LOG, die):
-// nvn_dirty_protect is its one caller, never the fault handler
+// nvn_dirty_protect and nvn_dirty_protect_wait are its callers, never the fault handler
 static _Atomic int g_bad_logged;
 static void protect_failed(range_t *r, uintptr_t run, uintptr_t end) {
     uintptr_t a = r->base + (run << g_shift); size_t n = (end - run) << g_shift;
@@ -257,6 +257,47 @@ void nvn_dirty_protect(const void *addr, size_t len) {
             open = 0;
         }
     }
+}
+// nvn_dirty_protect for a caller that stamps first and copies the pages after protecting them (nvn_vk.c b_commit, the Vulkan backend's strategy B). nvn_dirty_protect skips a page another
+// thread holds BUSY; when that is an unprotect (a fault's unprotect_page, a host pre-write's release_pages) that has stamped the page and not yet set NONE, the caller's stamp already covers
+// that generation, the page ends writable with nothing newer, and the write after it is never seen. Here such a page is waited for (busy_wait) and taken if it ended NONE; PROT after the wait
+// is protected already. The run taken so far is protected first, so no page is held BUSY while waiting (as release_pages does).
+// 1 = every page ended PROT, or r is untracked or always written (nvn_dirty_since says 1 there). 0 = not: a set-read-only failed (protect_failed: r is always written now), or a wait timed out
+// (the page's state is unknown, so r counts as always written, as release_page does: the caller is not left waiting BUSY_WAIT_MS at every later call).
+// Deadlock: the wait may run under a caller's lock (nvn_vk.c's g_pmu). Every holder of a BUSY page (on_fault through release_page and unprotect_page, prep_write through release_pages,
+// nvn_dirty_protect and protect_failed, this function) does only atomics and mprotect while holding it (protect_failed's die path logs first: stderr's lock, which nothing holds while it waits
+// for a caller's lock) and takes no lock of its caller's: the fault and host pre-write hooks reach this file only (host/crash.c; nvn_vk.c registers none, and its g_pmu is static there).
+// The wait is capped at BUSY_WAIT_MS anyway.
+// Slot lifetime: the whole call holds g_slot_mu, so the range cannot be removed and its slot reused by another pool while this waits (r->base would then point the index computed here at that
+// pool's memory). Order: a caller's lock (g_pmu), then g_slot_mu. Only nvn_dirty_add_range and nvn_dirty_remove_range take g_slot_mu, and neither is reached from the fault or pre-write
+// hooks or under g_pmu; a BUSY page a removal holds (its prep_write) is released before it lets g_slot_mu go, so this waits for the removal and then finds the range gone
+static int protect_wait_locked(const void *addr, size_t len);
+int nvn_dirty_protect_wait(const void *addr, size_t len) {
+    pthread_mutex_lock(&g_slot_mu);
+    int ok = protect_wait_locked(addr, len);
+    pthread_mutex_unlock(&g_slot_mu);
+    return ok;
+}
+static int protect_wait_locked(const void *addr, size_t len) {
+    range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
+    if (!r || atomic_load(&r->bad)) return 1;
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    uintptr_t run = 0; int open = 0, ok = 1;
+    for (uintptr_t i = p; i <= q + 1; i++) {
+        uint8_t st = PG_NONE;
+        int took = i <= q && ok && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);   // after a failure no more pages are taken
+        if (!took && open) {   // the run so far, before any wait
+            if (!mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ)) for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
+            else { protect_failed(r, run, i); ok = 0; }
+            open = 0;
+        }
+        while (!took && ok && i <= q && st == PG_BUSY) {   // another thread is changing it: wait, then take it if it ended NONE (st PROT: protected already)
+            if (!busy_wait(r, i)) { mark_bad(r); ok = 0; break; }
+            st = PG_NONE; took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+        }
+        if (took && !open) { run = i; open = 1; }
+    }
+    return ok;
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_nbad) ? atomic_fetch_add(&g_now, 1) + 1 : atomic_load(&g_now); }   // see protect_failed
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {

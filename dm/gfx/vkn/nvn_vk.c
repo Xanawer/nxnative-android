@@ -2,7 +2,8 @@
 // Real here: the device (vk_dev.c), NVN render targets as VkImages in plain device memory (PLAN.md 2.2: render-target pools have no shadow), SET_RT, colour and depth-stencil clears (folded
 // into the dynamic-rendering load ops when they come before the pass's first draw, as nvn_mtl.m's rp_begin_ex_ does; vkCmdClearAttachments after it), barriers, submission with one timeline
 // value per submit and a completion thread that performs NVN's completion effects (event values, counter reports, then the done fence: nvn_mtl.m's completion handlers), and the present of the
-// window texture (vk_present.c). As the null backend: draws, binds and texture uploads are counted no-ops, buffer copies / fills / uniform updates run on the CPU at replay, texture reads come
+// window texture (vk_present.c), and memory strategy B (PLAN.md 2.2 "As built, slice 2a"): the pool pages the GPU reads as buffers are copied into shadow VkBuffers at each submission, kept current
+// by nvn_dirty.c's write protection. As the null backend: draws, binds and texture uploads are counted no-ops, buffer copies / fills / uniform updates run on the CPU at replay, texture reads come
 // from guest memory. The ordering convention of nvn_mtl.h holds: a submission's event values and counter records are written before its fence counts as done, and waits look only at that.
 // No Vulkan device (no library, no 1.3 driver): everything runs as the null backend does, said in red
 #include "vkn.h"
@@ -62,12 +63,15 @@ static int gpu_written(uint64_t s) { return (tser_get(s) & 2) != 0; }
 static uint64_t region_bytes(const tex_t *t, const NVNcopyRegion *r) { int bw, bh, bpb = t ? nvn_fmt_bpb(t->d.format, &bw, &bh) : 0; return bpb ? (uint64_t)((r->width + bw - 1) / bw) * (uint64_t)((r->height + bh - 1) / bh) * (uint64_t)(r->depth > 1 ? r->depth : 1) * (uint64_t)bpb : 0; }
 static _Atomic uint64_t g_present_n;   // presents so far = hle_nvn.c's frame index (init = 0), the frame things below are labelled with
 static uint64_t g_every;               // DM_NVN_NULL_EVERY
+static void shot_parse(void);          // DM_NVN_SHOT (the present section)
+static uintptr_t g_pgsz, g_sh;              // the host page (4 KB on Android, 16 KB on the Mac) and its shift: nvn_dirty.c protects by it, so B tracks and uploads by it (vkn_hello)
 
 // ---------- Submission state (below) that mtl_init makes ----------
 // Submission slots, used round-robin: each its own command pool, and the completion effects (post ops) of the submission it holds until that completes
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // kind 1 event, 2 counter report
 #define NSUB 4
-typedef struct { VkCommandPool pool; VkCommandBuffer cb; uint64_t value; int failed; post_op *post; int npost, postcap; } sub_slot;
+// up: B's uploads into the shadows, submitted ahead of cb (b_commit); stg: the slot's staging buffer for them, host-visible and mapped, reused once the slot's last submission has completed
+typedef struct { VkCommandPool pool; VkCommandBuffer cb, up; uint64_t value; int failed; post_op *post; int npost, postcap; VkBuffer stg; VkDeviceMemory stg_mem; void *stg_map; uint64_t stg_cap; int stg_coh; } sub_slot;
 static sub_slot g_sub[NSUB];
 static sub_slot *g_cur;                    // the submission being replayed (submit thread: hle_nvn.c serializes submissions, g_sub_mu)
 static uint64_t g_nbegun, g_ncommit, g_ncomp;   // submissions begun (submit thread), handed to the completion thread and completed (both under g_mu)
@@ -81,17 +85,20 @@ static _Atomic uint64_t g_stat_pass, g_stat_fold, g_stat_clr_mid, g_stat_bar, g_
 static _Atomic int g_leak;
 
 static void vkn_hello(void) {
-    NLOG("Vulkan GPU backend (dm/gfx/vkn): render targets, clears, barriers, submission and present are real; draws, binds and texture uploads are counted only; buffer copies, fills and uniform updates run on the CPU; texture reads come from guest memory");
+    NLOG("Vulkan GPU backend (dm/gfx/vkn): render targets, clears, barriers, submission and present are real, and buffer memory the GPU reads is kept in shadow buffers (strategy B); draws, binds and texture uploads are counted only; buffer copies, fills and uniform updates run on the CPU; texture reads come from guest memory");
     const char *e = getenv("DM_NVN_NULL_EVERY"); g_every = e ? strtoull(e, NULL, 10) : 0;   // the null backend's surface lines, every <n> presents too
+    shot_parse();
+    g_pgsz = (uintptr_t)getpagesize(); g_sh = (uintptr_t)__builtin_ctzl(g_pgsz);
     if (!vkn_dev_init()) { NLOG("[RED] no Vulkan device: running as the null backend does, nothing is drawn or shown"); return; }
     VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
     if (vk.vkCreateSemaphore(vd.dev, &si, NULL, &g_tl)) { NLOG("[RED] the timeline semaphore cannot be made: running as the null backend does"); return; }
     for (int i = 0; i < NSUB; i++) {
         VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, vd.qfam};
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-        if (vk.vkCreateCommandPool(vd.dev, &pi, NULL, &g_sub[i].pool) || (ai.commandPool = g_sub[i].pool, vk.vkAllocateCommandBuffers(vd.dev, &ai, &g_sub[i].cb))) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2}; VkCommandBuffer two[2];
+        if (vk.vkCreateCommandPool(vd.dev, &pi, NULL, &g_sub[i].pool) || (ai.commandPool = g_sub[i].pool, vk.vkAllocateCommandBuffers(vd.dev, &ai, two))) {
             NLOG("[RED] the submission command pools cannot be made: running as the null backend does"); return; }
+        g_sub[i].cb = two[0]; g_sub[i].up = two[1];
     }
     pthread_t t; if (pthread_create(&t, NULL, comp_main, NULL)) { NLOG("[RED] the completion thread cannot start: running as the null backend does"); return; }
     pthread_detach(t);
@@ -99,20 +106,41 @@ static void vkn_hello(void) {
 }
 void mtl_init(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, vkn_hello); }
 
-// ---------- Memory pools: the address ranges only (a copy / fill / update outside every pool is refused, where the Metal layer dies: the CPU would write wherever the game pointed) ----------
-typedef struct { uintptr_t lo, hi; const void *key; } pool_ent;
+// ---------- Memory pools and strategy B (PLAN.md 2.2 "As built, slice 2a"): the address ranges, and a shadow VkBuffer for each pool the GPU reads as buffers ----------
+// Begun as the null backend's B simulation (nvn_null.c DM_NVN_NULL_BSIM), made real. Each pool has a page-class table. A replayed record that reads guest memory as a buffer (vertex, index, uniform,
+// storage, indirect arguments, a copy's source) marks those pages PF_BUF and gives the pool its shadow: one VkBuffer over the pool's page-rounded range, device-local where offered (b_mark). A record's own
+// pages are PF_CMD: command memory, which the game rewrites all the time, is never protected. At each commit (b_commit) the PF_BUF pages written since the last one (nvn_dirty.c's write protection
+// sees them), read for the first time (PF_NEW), or never protected (PF_CMD, PF_ALW) go through the slot's staging buffer into the shadows, by a command buffer that runs ahead of the submission's own.
+// mtl_pool_add gets no pool flags, so pools no record reads as a buffer get no shadow and nothing is protected in them: render-target pools (CPU_NO_ACCESS, which their textures tell mtl_tex_init:
+// a buffer read there is said in red) and shader-code pools (hle_nvn.c reaches those through mtl_addr only, which makes nothing)
+enum { PF_BUF = 1, PF_CMD = 4, PF_NEW = 8, PF_ALW = 16, PF_DUE = 32 };   // ALW: copied at every submission, never protected (see b_commit); DUE: picked by the commit under way
+typedef struct b_shadow { VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress gpu; uint64_t size, use_nvn; struct b_shadow *next; } b_shadow;   // use_nvn: the last submission that used it (vkn_sweep)
+// lo, hi: page-rounded, the shadow's extent (offsets in it are from lo); key, end: the pool's own bytes, the only ones an address resolves to (mtl_addr, mtl_gpu_addr: a page it shares with a
+// neighbour holds the neighbour's bytes too, and this pool's shadow never has those uploaded); span: its nvn_dirty range, cached before any protect (mtl_pool_del keys on it);
+// noacc: a CPU_NO_ACCESS pool (mtl_tex_init); nosh: its shadow could not be made (said once, not tried again)
+typedef struct { uintptr_t lo, hi; const void *key; uintptr_t end; uint8_t *pf; const void *span; b_shadow *sh; uint8_t noacc, nosh; } pool_ent;
 static pool_ent *g_pools; static int g_npool, g_cap, g_plast = -1;
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
 // Every pool made and freed, with its size and frame (the surface lines list each once); under g_pmu
 typedef struct { uintptr_t mem; uint64_t size, born, died, id; uint8_t said; } pool_log;   // died ~0 = live; id: the order made (the number the lines show); said: 1 its creation listed, 2 its end too
 static pool_log *g_plog; static int g_nplog, g_plogcap;
 static uint64_t g_pmade, g_pmade_b, g_pfreed, g_pfreed_b, g_plive_b, g_ppeak_b;
+static uint64_t g_nshadow, g_shadow_b, g_shadow_made;   // shadows in the table and their bytes, shadows made (g_pmu)
+static _Atomic uint64_t g_shadow_freed;     // destroyed by vkn_sweep
+static b_shadow *g_dead_b;                  // shadows of freed pools waiting for their last submission (under vkn_tmu, vkn_sweep)
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init();
-    uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;   // expanded to page boundaries as the Metal layer's zero-copy buffers are, so mtl_addr answers the same
+    uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;   // the shadow spans whole host pages (lo, hi), as the Metal layer's zero-copy buffers do
     pthread_mutex_lock(&g_pmu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, (size_t)g_cap * sizeof *g_pools); if (!g_pools) die("vkn backend: pool table allocation failed"); }
-    g_pools[g_npool++] = (pool_ent){lo & ~(pg - 1), (hi + pg - 1) & ~(pg - 1), mem};
+    pool_ent e = {lo & ~(pg - 1), (hi + pg - 1) & ~(pg - 1), mem, hi, NULL, NULL, NULL, 0, 0};
+    uintptr_t np = (e.hi - e.lo) / pg;
+    if (g_vk && !(e.pf = calloc(np ? np : 1, 1))) die("vkn backend: page class table allocation failed (%llu pages)", (unsigned long long)np);   // no device: no shadows, nothing tracked
+    // Edge pages, those the pool's own bytes do not fill (16 KB host pages over 4 KB-aligned pools): a neighbour's nvn_dirty range can hold the same page, and two ranges protecting one page
+    // break the tracker (a write unprotected and stamped through one leaves the other's state and generations stale). So no pool protects them: copied at every submission (PF_ALW).
+    // With 4 KB host pages and 4 KB-aligned pools there are none. Slice 2b: texture protection must leave these pages alone too
+    if (e.pf && np) { if (lo & (pg - 1)) e.pf[0] |= PF_ALW; if (hi & (pg - 1)) e.pf[np - 1] |= PF_ALW; }
+    g_pools[g_npool++] = e;
     if (g_nplog == g_plogcap && g_nplog >= 4096) {   // bounded: sparse pools re-add their runs at every remap (vrun_set), so freed entries go, listed or not (the totals keep them)
         int k = 0; for (int i = 0; i < g_nplog; i++) if (g_plog[i].died == ~0ull) g_plog[k++] = g_plog[i];
         g_nplog = k;
@@ -122,30 +150,254 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     g_pmade++; g_pmade_b += size; g_plive_b += size; if (g_plive_b > g_ppeak_b) g_ppeak_b = g_plive_b;
     pthread_mutex_unlock(&g_pmu);
 }
+static void b_shadow_free(b_shadow *s) { vk.vkDestroyBuffer(vd.dev, s->buf, NULL); vk.vkFreeMemory(vd.dev, s->mem, NULL); free(s); atomic_fetch_add(&g_shadow_freed, 1); }
 void mtl_pool_del(const void *mem) {
+    b_shadow *dead = NULL;
     pthread_mutex_lock(&g_pmu);
-    for (int i = 0; i < g_npool; i++) if (g_pools[i].key == mem) { g_pools[i] = g_pools[--g_npool]; g_plast = -1; break; }
+    for (int i = 0; i < g_npool; i++) if (g_pools[i].key == mem) {
+        pool_ent *e = &g_pools[i];
+        // Condition 3: nvn_dirty_remove_range ran just before (hle_nvn.c) and released the pool's read-only pages, but a commit protecting them then (b_commit, the submit thread) can take pages
+        // that pass had already gone by; the range is dead, so nothing would release those (a write there reaches the crash handler). Commits protect under g_pmu with the span cached first,
+        // so none runs now and a pool they may have protected has one: other ranges' pages first (a page shared with a neighbour), then all writable (nvn_null.c's fix)
+        if (e->pf && e->span) {
+            dm_guest_write_prepare((void *)e->lo, e->hi - e->lo);
+            if (mprotect((void *)e->lo, e->hi - e->lo, PROT_READ | PROT_WRITE)) NRED_ONCE("B: a freed pool's pages could not be made writable again (errno %d)", errno);
+        }
+        if ((dead = e->sh)) { g_nshadow--; g_shadow_b -= dead->size; }
+        free(e->pf); *e = g_pools[--g_npool]; g_plast = -1; break;
+    }
     for (int i = g_nplog - 1; i >= 0; i--) if (g_plog[i].mem == (uintptr_t)mem && g_plog[i].died == ~0ull) { g_plog[i].died = atomic_load(&g_present_n); g_pfreed++; g_pfreed_b += g_plog[i].size; g_plive_b -= g_plog[i].size; break; }
     pthread_mutex_unlock(&g_pmu);
+    // Out of the table: no later record or commit reaches it. Destroyed once every submission that used it has completed (its use_nvn, final now), through the images' dead list and sweep;
+    // never after g_leak. g_pmu and vkn_tmu are never held together
+    if (dead) { pthread_mutex_lock(&vkn_tmu); dead->next = g_dead_b; g_dead_b = dead; vkn_sweep(); pthread_mutex_unlock(&vkn_tmu); }
 }
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
-// buf: the pool's base address in place of an id<MTLBuffer> (non-null, so callers that only test success behave as with Metal); off from that base
-static int in_pool(int k, uint64_t addr, uint64_t len) { return addr >= g_pools[k].lo && addr <= g_pools[k].hi && len <= g_pools[k].hi - addr; }   // no addr + len: a guest-supplied range near 2^64 wraps
+// buf: the pool's shadow VkBuffer, NULL while it has none (callers that only test success, hle_nvn.c's shader code and the CPU-run ops below, see the pool); off from the page-rounded start.
+// A range resolves to the pool whose own bytes hold it (key, end), never through the page rounding: of two pools sharing a page, the other one's shadow never has this one's bytes there
+static int in_pool(int k, uint64_t addr, uint64_t len) { uint64_t lo = (uintptr_t)g_pools[k].key, hi = g_pools[k].end; return addr >= lo && addr <= hi && len <= hi - addr; }   // no addr + len: a guest-supplied range near 2^64 wraps
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     int ok = 0;
     pthread_mutex_lock(&g_pmu);
     int i = g_plast >= 0 && g_plast < g_npool && in_pool(g_plast, addr, len) ? g_plast : -1;
     for (int k = 0; i < 0 && k < g_npool; k++) if (in_pool(k, addr, len)) i = g_plast = k;
-    if (i >= 0) { *buf = (void *)g_pools[i].lo; *off = addr - g_pools[i].lo; ok = 1; }
+    if (i >= 0) { *buf = g_pools[i].sh ? (void *)g_pools[i].sh->buf : NULL; *off = addr - g_pools[i].lo; ok = 1; }
+    pthread_mutex_unlock(&g_pmu);
+    return ok;
+}
+// The GPU's view (nvn_mtl.m mtl_gpu_addr): the shadow, the offset in it and its device address (0 without bufferDeviceAddress). Only a pool with a shadow answers, by its own bytes (in_pool;
+// the cached g_plast too). 0 = the pool holding the range has no shadow (a CPU_NO_ACCESS pool, a shadow that could not be made: said there), or no pool holds it
+int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
+    int ok = 0;
+    pthread_mutex_lock(&g_pmu);
+    int i = g_plast >= 0 && g_plast < g_npool && g_pools[g_plast].sh && in_pool(g_plast, addr, len) ? g_plast : -1;
+    for (int k = 0; i < 0 && k < g_npool; k++) if (g_pools[k].sh && in_pool(k, addr, len)) i = g_plast = k;
+    if (i >= 0) { b_shadow *s = g_pools[i].sh; *buf = (void *)s->buf; *off = addr - g_pools[i].lo; *gpu = s->gpu ? s->gpu + *off : 0; ok = 1; }
     pthread_mutex_unlock(&g_pmu);
     return ok;
 }
 static int cpu_target(uint64_t addr, uint64_t n, const char *what) {   // 1 = [addr, addr+n) is pool memory the CPU may write; the dirty trackers hear of the write first, as for any host write into guest memory
     void *b; uint64_t o;
     if (!mtl_addr(addr, n, &b, &o)) { NLOG("[RED] %s outside every memory pool dst=%#llx n=%#llx: skipped", what, (unsigned long long)addr, (unsigned long long)n); return 0; }
-    dm_guest_write_prepare((void *)(uintptr_t)addr, (size_t)n);
+    dm_guest_write_prepare((void *)(uintptr_t)addr, (size_t)n);   // B: the pages it writes are picked at the commit (not ordered before the submission's earlier draws: PLAN.md 2.2)
     ST(S_GW_B, n);   // a GPU write into pool memory: what a backend would have to bring back if the CPU reads it
     return 1;
+}
+
+// ---------- B: marks (the replay), shadows, the upload at commit, the statistics line ----------
+// A shadow over the pool's page-rounded range (under g_pmu, at the first buffer read): every buffer use a later slice binds it for, transfers both ways, and a device address. NULL = not made (said)
+static b_shadow *b_shadow_make(const pool_ent *e) {
+    uint64_t n = e->hi - e->lo; const char *no = NULL; VkMemoryRequirements mr = {0}; int mt = -1;
+    b_shadow *s = calloc(1, sizeof *s); if (!s) die("vkn backend: shadow entry allocation failed");
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | (vd.bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    if (vk.vkCreateBuffer(vd.dev, &bi, NULL, &s->buf)) { s->buf = VK_NULL_HANDLE; no = "vkCreateBuffer"; }
+    else {
+        vk.vkGetBufferMemoryRequirements(vd.dev, s->buf, &mr);
+        if ((mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) < 0) mt = vkn_mem_type(mr.memoryTypeBits, 0);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, vd.bda ? &fi : NULL, mr.size, (uint32_t)mt};
+        if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &s->mem)) { s->mem = VK_NULL_HANDLE; no = "device memory"; }
+        else if (vk.vkBindBufferMemory(vd.dev, s->buf, s->mem, 0)) no = "vkBindBufferMemory";
+    }
+    if (no) {
+        NRED_ONCE("B: memory pool %#llx..%#llx (%llu B) has no shadow buffer (%s failed): the GPU reads nothing of it (later pools are not said)", (unsigned long long)e->lo, (unsigned long long)e->hi, (unsigned long long)n, no);
+        if (s->mem) vk.vkFreeMemory(vd.dev, s->mem, NULL);
+        if (s->buf) vk.vkDestroyBuffer(vd.dev, s->buf, NULL);
+        free(s); return NULL;
+    }
+    if (vd.bda) { VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, s->buf}; s->gpu = vk.vkGetBufferDeviceAddress(vd.dev, &di); }
+    s->size = mr.size; g_nshadow++; g_shadow_b += mr.size;
+    if (g_shadow_made++ < 32) NLOG("B: shadow buffer for memory pool %#llx..%#llx: %llu B of %s memory (%llu shadows, %llu B)", (unsigned long long)e->lo, (unsigned long long)e->hi, (unsigned long long)mr.size,
+                                   vd.mem.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local" : "host", (unsigned long long)g_nshadow, (unsigned long long)g_shadow_b);
+    return s;
+}
+// The pages of [addr, addr+len) get flag in every pool holding them (submit thread, during the replay). A buffer read gives a pool its shadow, and only pools whose own bytes it touches (two pools
+// share a page-rounded page: the neighbour gets nothing for it); the shadow's last use is this submission. Command pages (PF_CMD) are marked in any pool
+static void b_mark(uint64_t addr, uint64_t len, uint8_t flag) {
+    if (!len) return;
+    uint64_t end = addr + len < addr ? UINT64_MAX : addr + len;
+    pthread_mutex_lock(&g_pmu);
+    for (int k = 0; k < g_npool; k++) {
+        pool_ent *e = &g_pools[k]; uint64_t lo = addr > e->lo ? addr : e->lo, hi = end < e->hi ? end : e->hi;
+        if (!e->pf || lo >= hi) continue;
+        if (flag == PF_BUF) {
+            if (addr >= e->end || end <= (uintptr_t)e->key) continue;   // only the shared page, none of this pool's bytes
+            if (e->noacc) { NRED_ONCE("B: a record reads %#llx+%#llx as a buffer in a CPU-no-access (render-target) pool: such pools have no shadow, the GPU reads nothing there", (unsigned long long)addr, (unsigned long long)len); continue; }
+            if (!e->sh && !e->nosh && !(e->sh = b_shadow_make(e))) e->nosh = 1;
+            if (!e->sh) continue;
+            e->sh->use_nvn = atomic_load(&g_fence) + 1;   // this submission's value: only this thread moves g_fence (mtl_sub_commit)
+        }
+        for (uint64_t i = (lo - e->lo) >> g_sh, j = (hi - 1 - e->lo) >> g_sh; i <= j; i++) if (!(e->pf[i] & flag)) e->pf[i] |= flag | PF_NEW;   // NEW: copied (and protected) at this commit
+    }
+    pthread_mutex_unlock(&g_pmu);
+}
+static void b_cmd(const uint8_t *p, uint32_t n) {   // a record's pages hold command memory (records follow each other, so only a page change looks the pools up)
+    static uintptr_t last = ~(uintptr_t)0; uintptr_t a = (uintptr_t)p >> g_sh, b = ((uintptr_t)p + (n ? n : 1) - 1) >> g_sh;
+    if (a == last && b == last) return;
+    last = b; b_mark((uint64_t)a << g_sh, (uint64_t)(b - a + 1) << g_sh, PF_CMD);
+}
+// What a record reads as buffers, as the B simulation marks it (nvn_null.c surf_rec): the draw and dispatch slices widen it where they read more (vertex ranges, multi-draw arrays)
+static void b_rec(const op_hdr *h, const uint8_t *p, const uint8_t *a) {
+    b_cmd(p, h->size);
+    switch (h->op) {
+        case OP_DRAW: { p_draw t; const p_draw *d = draw_rec(a, h->size, &t); b_mark(d->ind, d->ind ? 16 : 0, PF_BUF); b_mark(d->mdi_cnt, d->mdi_cnt ? 4 : 0, PF_BUF); break; }
+        case OP_DRAW_IDX: { p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, h->size, &t); int it = d->itype >= 0 && d->itype < 3 ? d->itype : 2;
+            b_mark(d->ibuf, d->count > 0 ? (uint64_t)d->count << it : 0, PF_BUF); b_mark(d->ind, d->ind ? 20 : 0, PF_BUF); b_mark(d->mdi_cnt, d->mdi_cnt ? 4 : 0, PF_BUF); break; }
+        case OP_DISPATCH: { const p_dispatch *d = (const p_dispatch *)a; b_mark(d->ind, d->ind ? 12 : 0, PF_BUF); break; }
+        case OP_COPY_B2B: { uint64_t s_, n; memcpy(&s_, a, 8); memcpy(&n, a + 16, 8); b_mark(s_, n, PF_BUF); break; }
+        case OP_COPY_B2T: { const p_copy_b2t *c = (const p_copy_b2t *)a; b_mark(c->src, region_bytes(c->tex, &c->r), PF_BUF); break; }
+        case OP_BIND_VBUF: { const p_bind_vbuf *v = (const p_bind_vbuf *)a; for (int i = 0; i < v->n && i < 16; i++) b_mark(v->r[i].address, v->r[i].size, PF_BUF); break; }
+        case OP_BIND_UBO: case OP_BIND_SSBO: { const p_bind_buf *u = (const p_bind_buf *)a; b_mark(u->addr, u->size, PF_BUF); break; }
+        default: break;
+    }
+}
+// Cumulative statistics (b_report): uploads made, pages by why (0 written since the last commit, 1 read for the first time, 2 copied every time), bytes, B's CPU time at commit; tracked pages now
+static _Atomic uint64_t g_bs_up, g_bs_pg[3], g_bs_b, g_bs_ns, g_bs_trk, g_bs_alw, g_bs_max;
+static uint64_t g_bstamp;   // the dirty generation at the last commit's scan (under g_pmu)
+static VkBufferCopy *g_upc; static b_shadow **g_ups; static int *g_upk, g_nup, g_upcap;   // the upload being built: regions, their shadows and pools (submit thread, under g_pmu)
+static int stg_ensure(sub_slot *s, uint64_t n) {   // the slot's staging buffer holds n bytes (its last submission has completed: mtl_sub_begin waited). 0 = none (said)
+    if (s->stg_cap >= n) return 1;
+    if (s->stg_map) vk.vkUnmapMemory(vd.dev, s->stg_mem);
+    if (s->stg) vk.vkDestroyBuffer(vd.dev, s->stg, NULL);
+    if (s->stg_mem) vk.vkFreeMemory(vd.dev, s->stg_mem, NULL);
+    s->stg = VK_NULL_HANDLE; s->stg_mem = VK_NULL_HANDLE; s->stg_map = NULL; s->stg_cap = 0;
+    uint64_t cap = 256 * 1024; while (cap < n) cap *= 2;   // grows by doubling: the dirty set settles in a few frames
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkMemoryRequirements mr; int mt = -1; void *map = NULL;
+    if (vk.vkCreateBuffer(vd.dev, &bi, NULL, &s->stg)) { s->stg = VK_NULL_HANDLE; return 0; }
+    vk.vkGetBufferMemoryRequirements(vd.dev, s->stg, &mr);
+    if ((mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) < 0) mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &s->stg_mem)) { s->stg_mem = VK_NULL_HANDLE; vk.vkDestroyBuffer(vd.dev, s->stg, NULL); s->stg = VK_NULL_HANDLE; return 0; }
+    if (vk.vkBindBufferMemory(vd.dev, s->stg, s->stg_mem, 0) || vk.vkMapMemory(vd.dev, s->stg_mem, 0, VK_WHOLE_SIZE, 0, &map)) {
+        vk.vkDestroyBuffer(vd.dev, s->stg, NULL); vk.vkFreeMemory(vd.dev, s->stg_mem, NULL); s->stg = VK_NULL_HANDLE; s->stg_mem = VK_NULL_HANDLE; return 0; }
+    s->stg_map = map; s->stg_cap = cap; s->stg_coh = (vd.mem.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    return 1;
+}
+static int b_may_protect(uint8_t f) { return (f & PF_DUE) && !(f & (PF_CMD | PF_ALW)); }
+// The commit's upload (submit thread, before the submission is queued; v its timeline value): 1 = s->up holds copies into the shadows, to run ahead of s->cb. Under g_pmu, in this order:
+// the dirty generation is stamped; the pages to copy are picked (PF_BUF pages written since the last stamp, NEW ones, and those never protected); the protectable ones are protected; then they are
+// copied to the slot's staging. A write after the protect faults and is newer than the stamp, so the next commit picks it; one before it lands in this copy. The protect waits for a page an
+// unprotect is under way on (nvn_dirty_protect_wait: one that stamped it before this stamp would otherwise end writable with nothing newer, its next write never seen); a run it could not
+// protect goes back to NEW, copied and tried again at the next commit. Pages that hold commands, edge pages (a page shared with a neighbouring pool: mtl_pool_add) and a pool the tracker does
+// not cover (no span) are copied every time and never protected. A run the tracker finds in another range than the pool's own (find_span takes the first range holding it: only pools
+// overlapping in bytes, two pools over the same guest memory, none on this route; edge pages no longer get here) is copied every time too, since protecting it there would leave this
+// pool's generations blind; it is checked per run, so such an overlap that covers only part of a run is not caught.
+// Naive: the whole dirty set is copied and protected again at every submission. The hot-set scheme (stardew-surface.md: copy the pages written k submissions running without protecting them,
+// protect again once their bytes stop changing) is for the gameplay sub-slice
+static int b_commit(sub_slot *s, uint64_t v) {
+    uint64_t t0 = now_ns(), bytes = 0, pg[3] = {0}, trk = 0, alw = 0; int ok = 1;
+    pthread_mutex_lock(&g_pmu);
+    uint64_t stamp = nvn_dirty_now();
+    g_nup = 0;
+    for (int k = 0; k < g_npool; k++) {
+        pool_ent *e = &g_pools[k]; if (!e->sh || !e->pf) continue;
+        if (!e->span) e->span = nvn_dirty_span((const void *)e->lo, e->hi - e->lo);   // before any protect (mtl_pool_del); NULL: untracked (the tracker's table is full), copied every time
+        uintptr_t np = (e->hi - e->lo) >> g_sh;
+        for (uintptr_t i = 0; i < np; i++) {
+            uint8_t f = e->pf[i]; if (!(f & PF_BUF)) continue;
+            int fixed = (f & (PF_CMD | PF_ALW)) || !e->span; trk++; alw += fixed;
+            if (!fixed && !(f & PF_NEW) && !nvn_dirty_since_span(e->span, (const void *)(e->lo + (i << g_sh)), g_pgsz, g_bstamp)) continue;
+            pg[fixed ? 2 : f & PF_NEW ? 1 : 0]++;
+            e->pf[i] = (uint8_t)((f & ~PF_NEW) | PF_DUE);
+        }
+        for (uintptr_t i = 0; e->span && i < np; ) {   // protect, one call per run
+            if (!b_may_protect(e->pf[i])) { i++; continue; }
+            uintptr_t j = i; while (j < np && b_may_protect(e->pf[j])) j++;
+            const void *ra = (const void *)(e->lo + (i << g_sh)); size_t rl = (size_t)(j - i) << g_sh;
+            if (nvn_dirty_span(ra, rl) != e->span) for (uintptr_t q = i; q < j; q++) e->pf[q] |= PF_ALW;
+            else if (!nvn_dirty_protect_wait(ra, rl)) for (uintptr_t q = i; q < j; q++) e->pf[q] |= PF_NEW;   // not all protected (said there): copied now, and copied and tried again next time
+            i = j;
+        }
+        for (uintptr_t i = 0; i < np; ) {   // the copies, one region per run
+            if (!(e->pf[i] & PF_DUE)) { i++; continue; }
+            uintptr_t j = i; while (j < np && (e->pf[j] & PF_DUE)) e->pf[j++] &= (uint8_t)~PF_DUE;
+            if (g_nup == g_upcap) { g_upcap = g_upcap ? g_upcap * 2 : 64; g_upc = realloc(g_upc, (size_t)g_upcap * sizeof *g_upc); g_ups = realloc(g_ups, (size_t)g_upcap * sizeof *g_ups);
+                g_upk = realloc(g_upk, (size_t)g_upcap * sizeof *g_upk); if (!g_upc || !g_ups || !g_upk) die("vkn backend: upload list allocation failed"); }
+            g_upc[g_nup] = (VkBufferCopy){bytes, (VkDeviceSize)i << g_sh, (VkDeviceSize)(j - i) << g_sh}; g_ups[g_nup] = e->sh; g_upk[g_nup++] = k; bytes += (uint64_t)(j - i) << g_sh;
+            i = j;
+        }
+        e->sh->use_nvn = v;
+    }
+    int skip = g_nup && !stg_ensure(s, bytes);
+    if (skip) NRED_ONCE("B: no staging buffer of %llu B: this submission's uploads are skipped (taken at the next one)", (unsigned long long)bytes);
+    else if (g_nup) {
+        for (int r = 0; r < g_nup; r++) memcpy((uint8_t *)s->stg_map + g_upc[r].srcOffset, (const void *)(g_pools[g_upk[r]].lo + g_upc[r].dstOffset), (size_t)g_upc[r].size);
+        VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, s->stg_mem, 0, VK_WHOLE_SIZE}; VkResult fr;
+        if (!s->stg_coh && (fr = vk.vkFlushMappedMemoryRanges(vd.dev, 1, &mr))) { skip = 1; NRED_ONCE("B: flushing the staging buffer failed (VkResult %d): this submission's uploads are skipped (taken at the next one)", fr); }
+    }
+    if (skip) {   // not copied: the pages go back to NEW, so the next commit takes them whatever their protection says now (under g_pmu: g_upk's pool indices hold only here)
+        for (int r = 0; r < g_nup; r++) for (uintptr_t i = g_upc[r].dstOffset >> g_sh, c = g_upc[r].size >> g_sh; c--; i++) g_pools[g_upk[r]].pf[i] |= PF_NEW;
+        g_nup = 0; ok = 0;
+    }
+    g_bstamp = stamp;
+    int n = g_nup;
+    pthread_mutex_unlock(&g_pmu);
+    // Recorded outside the lock: the shadows named stay alive (use_nvn = v, not completed; a pool freed meanwhile only queues its shadow for vkn_sweep)
+    if (n) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        vk.vkBeginCommandBuffer(s->up, &bi);
+        // Before: every earlier submission's GPU work is done with the shadows (reads: write-after-read; an earlier upload's copies: write-after-write)
+        VkMemoryBarrier2 b0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
+        VkDependencyInfo d0 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &b0, 0, NULL, 0, NULL};
+        vk.vkCmdPipelineBarrier2(s->up, &d0);
+        for (int r = 0; r < n; ) { int q = r; while (q < n && g_ups[q] == g_ups[r]) q++; vk.vkCmdCopyBuffer(s->up, s->stg, g_ups[r]->buf, (uint32_t)(q - r), g_upc + r); r = q; }
+        // After: what reads buffers in the submission (and later ones) sees the copies
+        VkMemoryBarrier2 b1 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                VK_ACCESS_2_TRANSFER_READ_BIT};
+        VkDependencyInfo d1 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &b1, 0, NULL, 0, NULL};
+        vk.vkCmdPipelineBarrier2(s->up, &d1);
+        vk.vkEndCommandBuffer(s->up);
+    }
+    atomic_fetch_add(&g_bs_up, n != 0); for (int i = 0; i < 3; i++) atomic_fetch_add(&g_bs_pg[i], ok ? pg[i] : 0); atomic_fetch_add(&g_bs_b, n ? bytes : 0);
+    atomic_store(&g_bs_trk, trk); atomic_store(&g_bs_alw, alw); if (ok && pg[0] + pg[1] + pg[2] > atomic_load(&g_bs_max)) atomic_store(&g_bs_max, pg[0] + pg[1] + pg[2]);
+    atomic_fetch_add(&g_bs_ns, now_ns() - t0);
+    return n != 0;
+}
+// The B line (periodic as the surface lines, and at mtl_drain): per frame since the last line, and the state now. Faults and pre-write unprotects are the process's (nvn_dirty.c counts them;
+// on this backend only B protects). Compare stardew-surface.md section 4: the title screen at 4 KB pages (the phone) 4.13 pages a frame, 31 tracked; at 16 KB (the Mac) about 3.3 a frame, 52 KiB
+static void b_report(const char *why) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t p_n, p_up, p_pg[3], p_b, p_ns, p_fa, p_pr, p_mc;
+    pthread_mutex_lock(&mu);
+    uint64_t n = atomic_load(&g_present_n), up = atomic_load(&g_bs_up), pg[3], b = atomic_load(&g_bs_b), ns = atomic_load(&g_bs_ns), fa, pr, mc, mp, mn;
+    for (int i = 0; i < 3; i++) pg[i] = atomic_load(&g_bs_pg[i]);
+    nvn_dirty_stats(&fa, &pr); nvn_dirty_mp_stats(&mc, &mp, &mn);
+    pthread_mutex_lock(&g_pmu); uint64_t nsh = g_nshadow, shb = g_shadow_b, made = g_shadow_made; pthread_mutex_unlock(&g_pmu);
+    double f = n > p_n ? (double)(n - p_n) : 1.0, all = (double)(pg[0] + pg[1] + pg[2] - p_pg[0] - p_pg[1] - p_pg[2]);
+    NLOG("B (shadow buffers) up to frame %llu (%s), per frame over the last %llu: pages uploaded %.2f (written since the last submission %.2f, read for the first time %.2f, copied every time %.2f), %.1f KiB, "
+         "submissions with an upload %.2f; write faults %.2f, host pre-write unprotects %.2f (process-wide), mprotect calls %.2f; B at commit %.3f ms; now %llu pages tracked (%llu B pages), %llu of them copied every time, "
+         "%llu shadows %llu B; totals: %llu pages, %llu B, at most %llu pages in one submission, shadows made %llu destroyed %llu",
+         (unsigned long long)n, why, (unsigned long long)(n - p_n), all / f, (double)(pg[0] - p_pg[0]) / f, (double)(pg[1] - p_pg[1]) / f, (double)(pg[2] - p_pg[2]) / f, (double)(b - p_b) / 1024.0 / f,
+         (double)(up - p_up) / f, (double)(fa - p_fa) / f, (double)(pr - p_pr) / f, (double)(mc - p_mc) / f, (double)(ns - p_ns) / 1e6 / f,
+         (unsigned long long)atomic_load(&g_bs_trk), (unsigned long long)g_pgsz, (unsigned long long)atomic_load(&g_bs_alw), (unsigned long long)nsh, (unsigned long long)shb,
+         (unsigned long long)(pg[0] + pg[1] + pg[2]), (unsigned long long)b, (unsigned long long)atomic_load(&g_bs_max), (unsigned long long)made, (unsigned long long)atomic_load(&g_shadow_freed));
+    p_n = n; p_up = up; for (int i = 0; i < 3; i++) p_pg[i] = pg[i]; p_b = b; p_ns = ns; p_fa = fa; p_pr = pr; p_mc = mc;
+    pthread_mutex_unlock(&mu);
 }
 
 // ---------- Host images (vkn.h vkn_img), by serial: VkImages in device memory, made when a texture in a CPU-no-access pool is initialized (render-target pools) or first set as a target ----------
@@ -249,10 +501,11 @@ static void img_free(vkn_img *e) {
 // such a submission is never paired with a g_leak read as 0 (read first, g_leak could be 0, then the retirement, then a g_done past an image the GPU still uses). The present timeline is
 // the GPU's own counter (vk_present.c retires nothing without it; vkn_pres_done reads one it cannot get as 0: nothing done)
 void vkn_sweep(void) {
-    if (!g_dead_l) return;
+    if (!g_dead_l && !g_dead_b) return;
     uint64_t dn = atomic_load(&g_done), dp = vkn_pres_done();
     if (atomic_load(&g_leak)) return;   // a submission retired without the GPU's answer: g_done says nothing of what the GPU still uses
     for (vkn_img **p = &g_dead_l; *p; ) { vkn_img *e = *p; if (e->use_nvn <= dn && e->use_pres <= dp) { *p = e->next; img_free(e); } else p = &e->next; }
+    for (b_shadow **p = &g_dead_b; *p; ) { b_shadow *s = *p; if (s->use_nvn <= dn) { *p = s->next; b_shadow_free(s); } else p = &s->next; }   // freed pools' shadows (mtl_pool_del): NVN submissions only
 }
 
 
@@ -587,6 +840,7 @@ void mtl_exec(const uint8_t *p) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const uint8_t *a = p + 8;
         surf_rec(&h, p, a);
+        if (g_vk && !g_cur->failed) b_rec(&h, p, a);   // B: what this record reads as buffers, and its own command pages
         switch (h.op) {
             case OP_END: return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
@@ -627,14 +881,17 @@ uint64_t mtl_sub_commit(void) {
     rp_flush();   // an open pass or recorded clears land in this submission's command buffer (cb_now: g_cur, still s)
     vk.vkEndCommandBuffer(s->cb);
     g_cur = NULL;
+    uint64_t vb = atomic_load(&g_fence) + 1;   // this submission's value (only this thread moves g_fence): the shadows' last use
+    int up = b_commit(s, vb);   // B: the pages it reads, into the shadows, by s->up ahead of s->cb
     // Under the queue lock: the layouts this submission leaves become the published ones as it is queued, so the present thread (which samples the window texture and restores its layout
     // under the same lock) always records against the layout the queue will have
     pthread_mutex_lock(&vkn_qmu);
     uint64_t v = atomic_load(&g_fence) + 1;
     for (int i = 0; i < g_ntouch; i++) g_touch[i]->layout = g_touch[i]->rec;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, g_tl, v, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
-    VkCommandBufferSubmitInfo c = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, s->cb, 0};
-    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, 1, &c, 1, &sig};
+    VkCommandBufferSubmitInfo c[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, s->up, 0}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, s->cb, 0}};
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, up ? 2 : 1, up ? c : c + 1, 1, &sig};   // the uploads first: their barriers order them after every earlier submission and before this one's reads
+    if (v != vb) NRED_ONCE("submission %llu: its value moved to %llu while it was committed (its shadows' last use may be wrong)", (unsigned long long)vb, (unsigned long long)v);
     VkResult r = vk.vkQueueSubmit2(vd.q, 1, &si, VK_NULL_HANDLE);
     atomic_store(&g_fence, v);
     pthread_mutex_unlock(&vkn_qmu);
@@ -679,7 +936,8 @@ void mtl_drain(void) {   // the last lines of a run (the graceful exit ends in _
         ok = ok && used < DRAIN_NS && mtl_wait(atomic_load(&g_fence), DRAIN_NS - used);
         if (!ok) NLOG("[RED] graphics suspend: the GPU work in flight has not finished in %llu s: suspended regardless (it completes behind it)", (unsigned long long)(DRAIN_NS / 1000000000ull));
     }
-    if (atomic_load(&g_present_n) >= STATS_FROM) { if (g_vk) vkn_report("graphics suspended: exit, or the app in the background"); surf_report("graphics suspended: exit, or the app in the background"); }
+    if (atomic_load(&g_present_n) >= STATS_FROM) { if (g_vk) { vkn_report("graphics suspended: exit, or the app in the background"); b_report("graphics suspended: exit, or the app in the background"); }
+        surf_report("graphics suspended: exit, or the app in the background"); }
 }
 
 // ---------- The surface lines (see the statistics at the top): one line of counts and the pools made or freed since the last one ----------
@@ -736,21 +994,63 @@ static void surf_report(const char *why) {
 }
 
 // ---------- Present: counted, then handed to the present thread (vk_present.c); pacing stays with hle_nvn.c's own clock (no display link, as the null backend) ----------
+// DM_NVN_SHOT=<present>[,<present>...]:<path> (nvn_mtl.m present_now's switch, up to 4096 presents; %d in the path is the present number): those presents' window textures are written as PNG by the
+// present thread (vk_present.c shot_one), in nvn_mtl.m shot()'s form. Presents are numbered as Metal numbers them, 1 = the first (the count, not the present thread's ticket). DM_NVN_SHOT_OUT
+// (Metal's upscaled copy) is not ported: said once, the shots stay at the texture's own size
+static long g_shots[4096]; static int g_nshot; static const char *g_shot_path;
+static void shot_parse(void) {   // mtl_init
+    const char *e = getenv("DM_NVN_SHOT"), *c = e ? strchr(e, ':') : NULL;
+    if (!e || !*e) return;
+    if (!c || !c[1]) { NLOG("[RED] DM_NVN_SHOT=%s: not <present>[,<present>...]:<path>: no screenshots", e); return; }
+    for (const char *q = e; q < c && g_nshot < 4096; ) { g_shots[g_nshot++] = atol(q); const char *k = memchr(q, ',', (size_t)(c - q)); q = k ? k + 1 : c; }
+    g_shot_path = c + 1;
+    const char *o = getenv("DM_NVN_SHOT_OUT"); if (o && *o) NLOG("[RED] DM_NVN_SHOT_OUT=%s: not on the Vulkan backend: screenshots are of the window texture at its own size", o);
+}
+static const char *shot_for(uint64_t n, char *path, size_t cap) {   // this present's screenshot path, or NULL: %d is the present number, %% a percent sign, the rest as it is
+    int hit = 0; for (int i = 0; i < g_nshot && !hit; i++) hit = (uint64_t)g_shots[i] == n;
+    if (!hit) return NULL;
+    size_t o = 0;
+    for (const char *p = g_shot_path; *p && o + 1 < cap; p++) {
+        if (p[0] == '%' && p[1] == 'd') { int k = snprintf(path + o, cap - o, "%llu", (unsigned long long)n); o = k < 0 ? o : o + (size_t)k < cap ? o + (size_t)k : cap - 1; p++; }
+        else if (p[0] == '%' && p[1] == '%') { path[o++] = '%'; p++; }
+        else path[o++] = *p;
+    }
+    path[o] = 0;
+    return path;
+}
 extern _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP): when the last present was made
 static uint64_t present_count(void) {
     mtl_init();   // DM_NVN_NULL_EVERY
     atomic_store(&dm_present_ns, now_ns());
     uint64_t n = atomic_fetch_add(&g_present_n, 1) + 1;
     // Not worded "first present": lognorm.py --until-present ends the parity cut at that phrase, and this line comes before the host's own (DM_DETCLOCK, [nvn] frame 1) that end it on the Metal backend
-    if (n == 1) { NLOG("%s", g_vk ? "presenting: frames go to the swapchain" : "presenting: frames are counted, nothing is shown"); if (getenv("DM_NVN_SHOT")) NLOG("[RED] DM_NVN_SHOT: no screenshots on the Vulkan backend yet"); }
-    if (n >= STATS_FROM && (n == 60 || n == 600 || n % 1800 == 0 || (g_every && n % g_every == 0))) { surf_report("periodic"); if (g_vk) vkn_report("periodic"); }   // the count before this present: labelled with the frame just ended
+    if (n == 1) { NLOG("%s", g_vk ? "presenting: frames go to the swapchain" : "presenting: frames are counted, nothing is shown"); if (g_nshot && !g_vk) NLOG("[RED] DM_NVN_SHOT: no Vulkan device, no screenshots"); }
+    if (n >= STATS_FROM && (n == 60 || n == 600 || n % 1800 == 0 || (g_every && n % g_every == 0))) { surf_report("periodic"); if (g_vk) { vkn_report("periodic"); b_report("periodic"); } }   // the count before this present: labelled with the frame just ended
     return n;
+}
+// DM_DETCLOCK (hle_os.c) stops the guest clock at the first present (hle_nvn.c dump_frame, after mtl_present) and from then on moves it one step per present. A frame loop that sleeps until a
+// whole step has gone by since its last tick (Stardew Valley's fixed time step: SleepThread on the guest clock) then sleeps for ever if less than a step of wall time passed between that tick
+// and the switch: Metal's first frame builds its pipelines and takes longer; this backend's took a few ms and the slice 2a Mac run stopped at present 1. One step of wall time at the
+// first present keeps the switch at least a step after the tick. Test runs only (DM_DETCLOCK unset: nothing)
+static void detclock_first_present(void) {
+    const char *e = getenv("DM_DETCLOCK"); uint64_t step = e ? strtoull(e, 0, 0) : 0;
+    if (!step || step > 1000000000ull) return;
+    uint64_t end = mono_ns() + step;
+    for (uint64_t t; (t = mono_ns()) < end; ) { struct timespec ts = {0, (long)(end - t)}; nanosleep(&ts, NULL); }
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {   // ticket 0 = nothing pending: the next acquire does not wait
     (void)period_s; uint64_t n = present_count();
-    return g_vk && t ? vkn_present_enqueue(t->serial, t->d.width, t->d.height, crop, n == 1 || n == 60 || n == 600 || n % 1800 == 0) : 0;
+    if (n == 1) detclock_first_present();
+    char sp[1024]; const char *shot = g_nshot && g_vk ? shot_for(n, sp, sizeof sp) : NULL;
+    if (shot && !t) { NRED_ONCE("screenshot %s: present %llu has no window texture: not taken", shot, (unsigned long long)n); shot = NULL; }
+    return g_vk && t ? vkn_present_enqueue(t->serial, t->d.width, t->d.height, crop, n == 1 || n == 60 || n == 600 || n % 1800 == 0, shot) : 0;
 }
-uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]) { (void)serial; (void)period; (void)ev; (void)ev_val; (void)crop; present_count(); return 0; }   // no external producers (dm/gfx/vk is not built)
+uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]) {   // no external producers (dm/gfx/vk is not built)
+    (void)serial; (void)period; (void)ev; (void)ev_val; (void)crop; uint64_t n = present_count();
+    char sp[1024]; const char *shot = g_nshot && g_vk ? shot_for(n, sp, sizeof sp) : NULL;
+    if (shot) NRED_ONCE("screenshot %s: present %llu is an external producer's: not taken", shot, (unsigned long long)n);
+    return 0;
+}
 uint64_t mtl_present_count(void) { return atomic_load(&g_present_n); }
 void mtl_present_wait(uint64_t ticket) { if (g_vk && ticket) vkn_present_wait(ticket); }
 void mtl_present_flush(void) { if (g_vk) vkn_present_flush(); }
@@ -783,6 +1083,7 @@ void mtl_tex_init(const tex_t *t) {   // a texture in a CPU-no-access pool (the 
     if (!t || !t->serial) return;
     uint64_t s = t->serial; pthread_mutex_lock(&g_tsmu); nvn_hm_put(&g_tser, &s, (void *)1); pthread_mutex_unlock(&g_tsmu);   // live (without a device too: the statistics use it)
     if (!g_vk || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return;
+    pthread_mutex_lock(&g_pmu); for (int k = 0; k < g_npool; k++) if (g_pools[k].key == t->pool->mem) { g_pools[k].noacc = 1; break; } pthread_mutex_unlock(&g_pmu);   // B: no shadow there (b_mark)
     pthread_mutex_lock(&vkn_tmu); if (!vkn_img_get(t->serial)) img_make(t, NULL); pthread_mutex_unlock(&vkn_tmu);
 }
 void mtl_tex_release(tex_t *t) {   // out of the table now; destroyed once the submissions and presents that used it have completed

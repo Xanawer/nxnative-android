@@ -27,6 +27,8 @@ t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_di
 	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
 t_dirty_fail: t_dirty_fail.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h
 	clang $(CFLAGS) -o $@ t_dirty_fail.c ../../host/crash.c
+t_dirty_wait: t_dirty_wait.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h
+	clang $(CFLAGS) -o $@ t_dirty_wait.c ../../host/crash.c
 t_builtin: t_builtin.m ../nvn/nvn_builtin.h
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_builtin.m -framework Metal -framework Foundation
 t_vin: t_vin.m
@@ -110,8 +112,8 @@ t_stencil_view: t_stencil_view.m $(MTL_T_DEP)
 # The Vulkan backend (dm/gfx/vkn, #included) on a real device: KosmicKrisp with the validation layer, as Homebrew installs them (mesa, vulkan-loader, vulkan-validationlayers).
 # check_t_vkn is strict (T_VKN_STRICT=1: no device or validation off fails); make run's run_t_vkn is not: a machine with no Vulkan at all is said SKIPPED and passes
 VKN_ENV=DM_VK_VALIDATION=1 VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
-t_vkn: t_vkn.c $(wildcard ../vkn/*.c ../vkn/*.h) ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c $(GFX_H)
-	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -o $@ t_vkn.c ../vkn/vk_dev.c ../vkn/vk_present.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c
+t_vkn: t_vkn.c $(wildcard ../vkn/*.c ../vkn/*.h) ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h ../../host/crash.c $(GFX_H)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -o $@ t_vkn.c ../vkn/vk_dev.c ../vkn/vk_present.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../../host/crash.c
 .PHONY: check_t_vkn run_t_vkn
 check_t_vkn: t_vkn
 	T_VKN_STRICT=1 $(VKN_ENV) ./t_vkn
@@ -121,11 +123,12 @@ run: run_t_vkn
 # The Vulkan layer (#included) over the whole NVN layer, whose device and present path it uses
 t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
-run: t_nvn t_dirty_slots t_dirty_race t_dirty_fail t_builtin t_vin t_tbuf2d t_deswz_gpu t_pace t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pso_archive t_pso_pending t_pfv t_view_levels t_view_swizzle t_vk_desc t_integer_blend t_primitive_restart t_clear_ds t_upgrade_alias t_stencil_view
+run: t_nvn t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_builtin t_vin t_tbuf2d t_deswz_gpu t_pace t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pso_archive t_pso_pending t_pfv t_view_levels t_view_swizzle t_vk_desc t_integer_blend t_primitive_restart t_clear_ds t_upgrade_alias t_stencil_view
 	./t_nvn
 	./t_dirty_slots
 	./t_dirty_race
 	./t_dirty_fail
+	./t_dirty_wait
 	./t_builtin
 	./t_vin
 	./t_tbuf2d
