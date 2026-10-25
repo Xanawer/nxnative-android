@@ -1,6 +1,7 @@
-# The host (dmhost) for Android arm64, headless, with the null GPU backend (docs/android/PLAN.md 1.1). Driven by build.sh beside this file; build outputs stay under build/ (.gitignore).
-# Source lists follow dm/host/Makefile (SRC, GFX) minus its Objective-C files (nvn_mtl.m, nvn_refl.m, hle_vk.m, hle_gl.m, tex/nvn_deswizzle_gpu.m, memstat.m, haptics_apple.m, front_mac.m),
-# plus the platform layer (dm/host/plat), the null backend (dm/gfx/null) and the headless front end (dm/android/front). New hle_*.c / dm/gfx sources are picked up by the same wildcards as the Makefile's
+# The host for Android arm64 with the null GPU backend (docs/android/PLAN.md 1.1): dmhost, headless (the adb loop), and libdmhost.so, the NativeActivity of dm/android/app.
+# Driven by build.sh beside this file; build outputs stay under build/ (.gitignore). Source lists follow dm/host/Makefile (SRC, GFX) minus its Objective-C files (nvn_mtl.m, nvn_refl.m,
+# hle_vk.m, hle_gl.m, tex/nvn_deswizzle_gpu.m, memstat.m, haptics_apple.m, front_mac.m), plus the platform layer (dm/host/plat), the null backend (dm/gfx/null) and a front end
+# (dm/android/front). New hle_*.c / dm/gfx sources are picked up by the same wildcards as the Makefile's
 cmake_minimum_required(VERSION 3.22)
 project(nxhost C ASM)
 
@@ -43,18 +44,29 @@ file(GLOB GFX_SRC "${DM}/gfx/*.c" "${DM}/gfx/nvn/*.c" "${DM}/gfx/tex/*.c")
 list(SORT HLE_SRC)
 list(SORT GFX_SRC)
 set(HOST_SRC
-    "${DM}/host/main.c" "${DM}/host/loader.c" "${DM}/host/hle.c" "${DM}/host/crash.c" "${DM}/host/probe.c" "${DM}/host/thread.c" ${HLE_SRC} "${DM}/host/entry.S"
+    "${DM}/host/loader.c" "${DM}/host/hle.c" "${DM}/host/crash.c" "${DM}/host/probe.c" "${DM}/host/thread.c" ${HLE_SRC} "${DM}/host/entry.S"
     "${DM}/host/plat/plat_linux.c"
     ${GFX_SRC} "${DM}/gfx/nvn/nvn_entry.S" "${GEN}/nvn_thunks_elf.S"
-    "${DM}/gfx/null/nvn_null.c"
-    "${DM}/android/front/front_headless.c")
-add_executable(dmhost ${HOST_SRC})
+    "${DM}/gfx/null/nvn_null.c")
+add_executable(dmhost ${HOST_SRC} "${DM}/host/main.c" "${DM}/android/front/front_headless.c")
 add_dependencies(dmhost game_profile)
 target_compile_options(dmhost PRIVATE ${DM_CFLAGS})
 target_include_directories(dmhost PRIVATE ${DM_INC})
 # --export-dynamic: dladdr names host functions in crash dumps and stack scans (Mach-O executables export theirs). 16 KB segment alignment: runs on 4 KB and 16 KB page kernels alike
 target_link_options(dmhost PRIVATE -Wl,--export-dynamic -Wl,-z,max-page-size=16384)
 target_link_libraries(dmhost PRIVATE vpx aaudio log m dl)
+
+# libdmhost.so: the same sources compiled as PIC, main.c's main as dm_main (front/host_main.c, as the iOS app builds it) and front_android.c (ANativeActivity_onCreate) in place of the headless front.
+# Nothing may use initial-exec TLS (bionic refuses to dlopen such a library, docs/android/probes-cpu.md P0.2): the __thread variables stay general-dynamic (TLSDESC) under -fPIC.
+# -Bsymbolic: the host's own names bind inside the library, as in the executable (a dlopen'd library is searched after the app's global group, where another library's die or module_of could win);
+# the C library's (sigaction, sigprocmask) stay undefined, so ART's libsigchain still stands in front of them. No text relocations (-z text, lld's default, makes one a link error)
+add_library(dmhost_lib SHARED ${HOST_SRC} "${DM}/android/front/host_main.c" "${DM}/android/front/front_android.c")
+set_target_properties(dmhost_lib PROPERTIES OUTPUT_NAME dmhost)
+add_dependencies(dmhost_lib game_profile)
+target_compile_options(dmhost_lib PRIVATE ${DM_CFLAGS})
+target_include_directories(dmhost_lib PRIVATE ${DM_INC} "${DM}/host")
+target_link_options(dmhost_lib PRIVATE -Wl,-soname,libdmhost.so -Wl,-Bsymbolic -Wl,-z,text -Wl,-z,max-page-size=16384)
+target_link_libraries(dmhost_lib PRIVATE vpx aaudio android log m dl)
 
 # Unit tests that run on the phone (build.sh --tests): the portable ones of dm/gfx/tests and dm/gfx/tex/tests, built as their Makefiles build them
 set(T "${DM}/gfx/tests")
@@ -64,7 +76,8 @@ foreach(t t_hmap t_cover t_pace t_fstep)
 endforeach()
 add_executable(t_dirty_slots EXCLUDE_FROM_ALL "${T}/t_dirty_slots.c" "${DM}/host/crash.c" "${DM}/gfx/nvn/nvn_dirty.c" "${DM}/host/plat/plat_linux.c")
 add_executable(t_dirty_race EXCLUDE_FROM_ALL "${T}/t_dirty_race.c" "${DM}/host/crash.c" "${DM}/host/plat/plat_linux.c")
-foreach(t t_dirty_slots t_dirty_race)
+add_executable(t_dirty_fail EXCLUDE_FROM_ALL "${T}/t_dirty_fail.c" "${DM}/host/crash.c" "${DM}/host/plat/plat_linux.c")
+foreach(t t_dirty_slots t_dirty_race t_dirty_fail)
     add_dependencies(${t} game_profile)
     target_compile_options(${t} PRIVATE ${DM_CFLAGS})
     target_include_directories(${t} PRIVATE "${DM}/gfx/nvn/include" "${GEN}/${GAME}")
@@ -74,4 +87,10 @@ target_compile_options(t_tex PRIVATE -O2 -g -Wall -Wextra)
 target_link_libraries(t_tex PRIVATE m)
 add_executable(t_sha256 EXCLUDE_FROM_ALL "${DM}/host/plat/tests/t_sha256.c")   # the vendored SHA-256 that stands in for CommonCrypto (known digests; on the Mac it is checked against CommonCrypto too)
 target_compile_options(t_sha256 PRIVATE -O1 -Wall)
-add_custom_target(tests DEPENDS t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_tex t_sha256)
+# The signal guard of crash.c (Linux only): rescans at each thread start, the handshake signals left unblocked, android_run_on_all_threads returning
+add_executable(t_sig_guard EXCLUDE_FROM_ALL "${DM}/host/tests/t_sig_guard.c" "${DM}/host/crash.c" "${DM}/host/plat/plat_linux.c")
+add_dependencies(t_sig_guard game_profile)
+target_compile_options(t_sig_guard PRIVATE ${DM_CFLAGS})
+target_include_directories(t_sig_guard PRIVATE ${DM_INC})
+target_link_libraries(t_sig_guard PRIVATE dl)
+add_custom_target(tests DEPENDS t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_sig_guard t_tex t_sha256)

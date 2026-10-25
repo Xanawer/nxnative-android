@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build the Android host (docs/android/PLAN.md 1.1): build.sh <GAME> [--tests] [--clean]
+# Build the Android host (docs/android/PLAN.md 1.1): build.sh <GAME> [--tests] [--clean]: dmhost (the adb loop) and libdmhost.so (the app, dm/android/app/build_app.sh)
 #   GAME: base game title ID (dm/games/<id>/), as make GAME= for the Mac host
-#   --tests: also the unit tests that run on the phone (t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_tex t_sha256)
+#   --tests: also the unit tests that run on the phone (t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_sig_guard t_tex t_sha256)
 #   --clean: start from an empty build directory
-# Output: dm/android/cmake/build/dmhost (arm64-v8a, android-35), the tests beside it. ANDROID_HOME / ANDROID_NDK_HOME override the SDK / NDK locations;
+# Output: dm/android/cmake/build/dmhost and libdmhost.so (arm64-v8a, android-35), the tests beside them. ANDROID_HOME / ANDROID_NDK_HOME override the SDK / NDK locations;
 # cmake comes from PATH (Homebrew) or the SDK, ninja from PATH or the SDK's cmake; python3 from PATH runs the generators (game.py, gen_protos.py)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -25,6 +25,6 @@ B="$HERE/build"
 "$CMAKE" -Wno-deprecated -S "$HERE" -B "$B" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_BUILD_TYPE= \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
     -DPython3_EXECUTABLE="$PY" -DGAME="$GAME" >/dev/null
-"$CMAKE" --build "$B" --target dmhost
+"$CMAKE" --build "$B" --target dmhost dmhost_lib
 [ $TESTS = 1 ] && "$CMAKE" --build "$B" --target tests
-file "$B/dmhost"
+file "$B/dmhost" "$B/libdmhost.so"

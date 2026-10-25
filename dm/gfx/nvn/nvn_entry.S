@@ -1,6 +1,12 @@
     .arch_extension lse
 // Symbols through SYM() / PAGE() / PAGEOFF() (dm/host/plat/plat.h): Mach-O prefixes C names with _ and spells page offsets @PAGE / @PAGEOFF, ELF uses sym / :lo12:sym
 #include "../../host/plat/plat.h"
+#ifndef __APPLE__   // ELF: the tables reached with adrp / add below bind inside this image (hidden), so a shared library (libdmhost.so) links them without text relocations
+    .hidden nvn_slot
+    .hidden nvn_real
+    .hidden nvn_big_real
+    .hidden nvn_prof_ticks
+#endif
 // Common entry for unimplemented NVN functions: when the thunk comes in, x16 = this function's slot address (nvn_slot[i]).
 // Calls nvn_unimpl_c(slot, x0, x1, x2) to report a failure and log the name, returns 0.
     .text
@@ -17,6 +23,7 @@ SYM(nvn_unimpl_entry):
     bl SYM(nvn_unimpl_c)
     ldp x29, x30, [sp], #16
     ret
+    FUNC_END(SYM(nvn_unimpl_entry))
 
 // Timing wrapper entry (the slot table points here when DM_NVN_PROF=1): when the thunk comes in, x16 = this function's slot address.
 // Save x0-x7 / q0-q7 (NVN functions pass no arguments on the stack, verified by the generator), take mach_absolute_time -> call the real implementation (nvn_real[i]) -> take it again,
@@ -78,6 +85,7 @@ SYM(nvn_prof_entry):
     ldp x29, x30, [sp]
     add sp, sp, #240
     ret
+    FUNC_END(SYM(nvn_prof_entry))
 
 // Big-stack entry: when the thunk comes in, x16 = this function's slot address. Load nvn_big_real[i] into x16 and hand over to dm_bigstack_enter (dm/host/hle_bigstack.c):
 // on a guest thread stack it switches to this thread's big host stack before calling the implementation. The host's NVN implementations do Metal work when submitting, presenting and creating textures, and the Metal driver compiles internal programs (the fast-clear blit program, ...) on a deep stack,
@@ -94,3 +102,4 @@ SYM(nvn_big_entry):
     add x17, x17, PAGEOFF(nvn_big_real)
     ldr x16, [x17, x16, lsl #3]
     b SYM(dm_bigstack_enter)
+    FUNC_END(SYM(nvn_big_entry))

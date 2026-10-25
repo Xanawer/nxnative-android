@@ -17,9 +17,16 @@ static int64_t fixed_time(void) {
 }
 HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
-// Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
+// Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match.
+// Linux's CLOCK_MONOTONIC stops while the system sleeps (Darwin's counts through it): CLOCK_BOOTTIME there, so a span across a phone's sleep is the time that passed, as on the Switch.
+// This read only: the waits on CLOCK_MONOTONIC (pthread_cond_clockwait, sem_clockwait) take nothing else
+#ifdef __APPLE__
+#define DM_STEADY_CLOCK CLOCK_MONOTONIC
+#else
+#define DM_STEADY_CLOCK CLOCK_BOOTTIME
+#endif
 HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
-    int64_t s = (int64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000ull);
+    int64_t s = (int64_t)(clock_gettime_nsec_np(DM_STEADY_CLOCK) / 1000000000ull);
     memcpy(out, &s, 8); memcpy(out + 8, "dmhost-steady-01", 16); return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }

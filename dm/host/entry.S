@@ -8,6 +8,7 @@
     .text
     .globl SYM(unimpl_stubs)
     .p2align 3
+    FUNC(SYM(unimpl_stubs))
 SYM(unimpl_stubs):
     .set k, 0
     .rept 4096                // = hle.c MAX_STUB
@@ -15,6 +16,7 @@ SYM(unimpl_stubs):
     b SYM(unimpl_entry)
     .set k, k + 1
     .endr
+    FUNC_END(SYM(unimpl_stubs))
 
     .globl SYM(unimpl_entry)
     .p2align 2
@@ -32,6 +34,7 @@ SYM(unimpl_entry):
     bl SYM(unimpl_c)
     ldp x29, x30, [sp], #96
     ret
+    FUNC_END(SYM(unimpl_entry))
 
     .globl SYM(dm_gate)
     .p2align 2
@@ -122,6 +125,7 @@ SYM(dm_gate):
     ldr x30, [sp, #240]
     add sp, sp, #800
     ret
+    FUNC_END(SYM(dm_gate))
 
 // 3) dm_thread_enter(entry, arg, sp): guest thread start. Switch to the guest stack given by the SDK and call entry with x0 = argument;
 //    Horizon threads must exit via ExitThread; returning from entry is reported as an error.
@@ -137,3 +141,4 @@ SYM(dm_thread_enter):
     br x16
 1:  bl SYM(dm_thread_returned)
     brk #0
+    FUNC_END(SYM(dm_thread_enter))

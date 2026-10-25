@@ -76,3 +76,5 @@ t_stencil_view
 t_stencil_view.dSYM/
 t_pso_archive
 t_pso_archive.dSYM/
+t_dirty_fail
+t_dirty_fail.dSYM/

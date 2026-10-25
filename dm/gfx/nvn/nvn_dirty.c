@@ -1,9 +1,10 @@
 // Write-protect dirty-page tracking for guest memory: pool pages of packaged textures (CPU writes, GPU reads) are set read-only after upload, and as soon as the game writes it faults -> mark dirty, unprotect;
 // before use, check the write generation of the covered pages and re-upload if newer than at upload time. NVN semantics: a texture descriptor points to pool memory, and the GPU reads the current content every time
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
-// Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
+// Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks, no stdio (its red lines are rline's: one write(2)).
 #include "nvn_dirty.h"
 #include "../../host/dm.h"
+#include <errno.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -29,12 +30,13 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; } range_t;
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live, bad; } range_t;   // bad: counts as always written (protect_failed, mark_bad)
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
 static uintptr_t g_pg, g_shift;
 static _Atomic uint64_t g_now = 1;
+static _Atomic int g_nbad;   // ranges that count as always written (protect_failed, mark_bad); nvn_dirty_now moves on every read while there is one
 static _Atomic uint64_t g_faults, g_preps;
 static _Atomic uint64_t g_adds_total;
 static _Atomic int g_live, g_live_peak;   // number of registered pools and peak (for the memory readout line)
@@ -42,21 +44,46 @@ void nvn_dirty_stat(int *live, int *peak, int *cap) { *live = atomic_load(&g_liv
 static _Atomic int g_overflow_logged;
 static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // Pool creation / destruction (guest threads, possibly concurrent) pick slots under a mutex; the page-fault handling path does not touch it
 static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
-static void mp(uintptr_t a, size_t len, int prot) {
-    uint64_t t = mach_absolute_time(); mprotect((void *)a, len, prot);
+static _Atomic int g_mp_red;
+// The fault path's red lines (mp, busy_wait): LOG's fprintf takes stderr's lock, which another thread may hold (or was stopped holding) while this page stays BUSY, so the line LOG would print
+// is built here by hand and goes out in one write(2)
+typedef struct { char b[320]; size_t n; } rline;
+static void rl_s(rline *l, const char *s) { while (*s && l->n < sizeof l->b - 1) l->b[l->n++] = *s++; }
+static void rl_n(rline *l, uint64_t v, int hex) {   // as %d / %#zx / %p print v (never 0 in hex here)
+    char t[24]; int k = 0; unsigned b = hex ? 16 : 10;
+    do t[k++] = "0123456789abcdef"[v % b]; while ((v /= b));
+    if (hex) rl_s(l, "0x");
+    while (k && l->n < sizeof l->b - 1) l->b[l->n++] = t[--k];
+}
+static void rl_out(rline *l) { l->b[l->n++] = '\n'; if (write(2, l->b, l->n) < 0) {} }
+// A range left holding a page read-only it could not make writable counts as always written: another range over the same page may make it writable behind its back, and its writes would go
+// unseen (atomics only: the fault path calls it)
+static void mark_bad(range_t *r) { if (atomic_load_explicit(&r->live, memory_order_acquire) && !atomic_exchange(&r->bad, 1)) atomic_fetch_add(&g_nbad, 1); }   // a removed range: nothing to count (see nvn_dirty_add_range)
+// 0 = the protection changed. It can fail: Linux refuses a split past vm.max_map_count (65,530 mappings; split KGSL mappings never merge back, docs/android/probes-gpu.md P0.7), and over several
+// mappings it may change the first ones and then fail on a later one (ENOMEM). Every caller makes the states true again (a one-page call is all or nothing: one mapping) and marks the range
+// always written (mark_bad, protect_failed), and a fault it cannot resolve goes to the crash report instead of retrying forever. Reported red once
+static int mp(uintptr_t a, size_t len, int prot) {
+    uint64_t t = mach_absolute_time(); int rc = mprotect((void *)a, len, prot), err = errno;
     atomic_fetch_add(&g_mp_ticks, mach_absolute_time() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    if (rc && !atomic_exchange(&g_mp_red, 1)) {
+        rline l; l.n = 0; rl_s(&l, "[dm] [RED] dirty-page tracking: mprotect("); rl_n(&l, a, 1); rl_s(&l, ", "); rl_n(&l, len, 1);
+        rl_s(&l, prot & PROT_WRITE ? ", writable) failed (errno " : ", read-only) failed (errno "); rl_n(&l, (uint64_t)err, 0);
+        rl_s(&l, "): the tracker makes those pages' states true again and counts the pool as always written, or stops (only the first failure is reported)"); rl_out(&l);
+    }
+    errno = err; return rc;
 }
 
 static mach_timebase_info_data_t g_tb;   // obtained when the first pool is registered (the fault path only multiplies and divides)
 static _Atomic int g_busy_red;
-// Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, mach_absolute_time and sched_yield
+// Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, mach_absolute_time, sched_yield and rline
 static int busy_wait(range_t *r, uintptr_t p) {
     uint64_t t0 = 0;
     for (unsigned n = 1; atomic_load(&r->state[p]) == PG_BUSY; n++) {
         if (n & 0x3ff) continue;
         uint64_t now = mach_absolute_time(); if (!t0) t0 = now;
         if ((now - t0) * g_tb.numer / g_tb.denom > (uint64_t)BUSY_WAIT_MS * 1000000ull) {
-            if (!atomic_exchange(&g_busy_red, 1)) LOG("[RED] dirty-page tracking: page %p stuck 'busy' for over %d ms (the thread changing its protection has not finished), no longer waiting", (void *)(r->base + (p << g_shift)), BUSY_WAIT_MS);
+            if (!atomic_exchange(&g_busy_red, 1)) { rline l; l.n = 0; rl_s(&l, "[dm] [RED] dirty-page tracking: page "); rl_n(&l, r->base + (p << g_shift), 1); rl_s(&l, " stuck 'busy' for over ");
+                rl_n(&l, BUSY_WAIT_MS, 0); rl_s(&l, " ms (the thread changing its protection has not finished), no longer waiting"); rl_out(&l); }
             return 0; }
         sched_yield();
     }
@@ -69,28 +96,41 @@ static range_t *find_span(uintptr_t a, size_t len) {
     for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a + len <= r->end) return r; }
     return NULL;
 }
-static void unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY
-    mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
+static int unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY. 0 = the page stayed read-only (mp failed): PROT again, the range always written
+    if (mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE)) { atomic_store(&r->state[p], PG_PROT); mark_bad(r); return 0; }
     atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
     atomic_store(&r->state[p], PG_NONE);
+    return 1;
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
-// (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page is managed by this module; 0 = it is not, or the wait on BUSY timed out
+// (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page is managed by this module; 0 = it is not, or the wait on BUSY timed out (the
+// page's state is unknown then, so the range counts as always written); -1 = it could not be unprotected (still read-only for this range, which now counts as always written)
 static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = PG_PROT;
-        if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); if (count) atomic_fetch_add(count, 1); return 1; }
+        if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { if (!unprotect_page(r, p)) return -1; if (count) atomic_fetch_add(count, 1); return 1; }
         if (st != PG_BUSY) return atomic_load(&r->gen[p]) != 0;   // already NONE: just unprotected by another thread (the fault happened before the unprotect) -> re-execute; pages never protected are not ours
-        if (!busy_wait(r, p)) return 0;
+        if (!busy_wait(r, p)) { mark_bad(r); return 0; }
     }
 }
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    uintptr_t a = (uintptr_t)addr; int ours = 0, stuck = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
-    return ours;
+        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) { int v = release_page(r, (a - r->base) >> g_shift, &g_faults); if (v < 0) stuck = 1; else ours |= v; } }
+    if (!stuck) return ours;
+    // A range's set-writable failed (it counts as always written), so the loop cannot tell whether the page is writable: another range's set-writable, here or on a thread that held it BUSY
+    // meanwhile, may have made it so, and an "already writable" range may be stale. One direct set-writable decides (it also succeeds, changing nothing, on a page already writable)
+    if (mp(a & ~(g_pg - 1), g_pg, PROT_READ | PROT_WRITE)) return 0;   // still read-only: it would fault again at once, so the crash handler reports the write instead
+    // Writable now, but a range may have started a set-read-only since the loop passed it (its mprotect landing before the direct one, its PROT after), or still be BUSY after a timed-out
+    // wait: either would end up PROT over a writable page. So every covering range is released again: the failed one's set-writable now succeeds (NONE, true and stamped), a BUSY one is
+    // waited for and released (or counts as always written if the wait times out), and one still PROT after that counts as always written. What is left is the window of the normal path:
+    // a set-read-only that starts after this pass has visited its range, racing another range's set-writable of the same page
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) release_page(r, (a - r->base) >> g_shift, NULL); }   // not counted: the first loop counted the fault
+    for (int i = 0; i < n; i++)
+        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end && atomic_load(&r->state[(a - r->base) >> g_shift]) == PG_PROT) mark_bad(r); }
+    return 1;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
 // Link's Awakening, about 275 a frame). Pages another thread is changing are handled one by one after the run so far is finished, so no BUSY page is held while waiting
@@ -100,9 +140,16 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         uint8_t st = PG_PROT; int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took) { if (!open) { run = i; open = 1; } continue; }
         if (open) {
-            mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE);
-            for (uintptr_t k = run; k < i; k++) { atomic_store(&r->gen[k], atomic_fetch_add(&g_now, 1) + 1); atomic_store(&r->state[k], PG_NONE); }
-            if (count) atomic_fetch_add(count, i - run);
+            if (!mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE)) {
+                for (uintptr_t k = run; k < i; k++) { atomic_store(&r->gen[k], atomic_fetch_add(&g_now, 1) + 1); atomic_store(&r->state[k], PG_NONE); }
+                if (count) atomic_fetch_add(count, i - run);
+            } else for (uintptr_t k = run; k < i; k++) {   // it may have made the first pages writable: one page at a time, each all or nothing, so each state is true
+                // Still read-only (mark_bad: another range may unprotect it). The host's own stores there then fault into on_fault (hle_fpslock.c, nvn_null.c cpu_target, hle_nvn.c write_texels),
+                // but a system call writing into it gets EFAULT: hle_fs.c ReadFile's pread prepares again up to 8 times, then fails the read with a red line (not changed here)
+                if (mp(r->base + (k << g_shift), g_pg, PROT_READ | PROT_WRITE)) { atomic_store(&r->state[k], PG_PROT); mark_bad(r); continue; }
+                atomic_store(&r->gen[k], atomic_fetch_add(&g_now, 1) + 1); atomic_store(&r->state[k], PG_NONE);
+                if (count) atomic_fetch_add(count, 1);
+            }
             open = 0;
         }
         if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
@@ -141,6 +188,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     }
     { int lv = atomic_fetch_add(&g_live, 1) + 1, pk = atomic_load(&g_live_peak); while (lv > pk && !atomic_compare_exchange_weak(&g_live_peak, &pk, lv)) {} }
     range_t *r = rg(slot);
+    if (atomic_exchange(&r->bad, 0)) atomic_fetch_sub(&g_nbad, 1);   // a fault that timed out on the previous pool here may have marked it after its removal: not this pool's
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
@@ -163,7 +211,7 @@ void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base); if (atomic_exchange(&r->bad, 0)) atomic_fetch_sub(&g_nbad, 1); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }   // a fault's mark_bad landing between the clear and live 0 is undone when the slot is reused (nvn_dirty_add_range)
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {
@@ -171,27 +219,49 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 }
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
+// A set-read-only of pages run..end-1 of r failed. Linux may have made the run's first mappings read-only before failing on a later one, so which of its pages are read-only is not known:
+// the whole run goes back to writable (all its pages were writable, NONE, when the call took them), and r counts as always written from now on, as an untracked pool does: nvn_dirty_since says 1,
+// nvn_dirty_now moves on every read (no caller's "nothing written since" shortcut holds) and r is not protected again. Other ranges sharing those pages hear of the write (prep_write: a page
+// read-only for them is writable now). If even this mprotect fails nothing is known about the run: a write could fault forever or land unseen, so the host stops. Host path only (LOG, die):
+// nvn_dirty_protect is its one caller, never the fault handler
+static _Atomic int g_bad_logged;
+static void protect_failed(range_t *r, uintptr_t run, uintptr_t end) {
+    uintptr_t a = r->base + (run << g_shift); size_t n = (end - run) << g_shift;
+    if (mp(a, n, PROT_READ | PROT_WRITE)) {
+        int err = errno;
+        LOG("[RED] dirty-page tracking: a failed set-read-only of %p..%p could not be undone (mprotect back to writable failed, errno %d): those pages' protection is unknown", (void *)a, (void *)(a + n), err);
+        die("dirty-page tracking: stopping rather than risk a write that faults forever or lands unseen (pool %p)", (void *)r->mem);
+    }
+    for (uintptr_t k = run; k < end; k++) { atomic_store(&r->gen[k], atomic_fetch_add(&g_now, 1) + 1); atomic_store(&r->state[k], PG_NONE); }   // stamped: a write fault waiting on BUSY then takes NONE as "ours" and re-executes
+    mark_bad(r);
+    if (!atomic_exchange(&g_bad_logged, 1)) LOG("dirty-page tracking: pool %p counts as always written from now on (its textures are uploaded at every use); later such pools are not reported", (void *)r->mem);
+    prep_write((void *)a, n);   // r's own pages there are NONE now, so only other ranges' read-only pages are released
+}
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
 void nvn_dirty_protect(const void *addr, size_t len) {
     range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
-    if (!r) return;
+    if (!r || atomic_load(&r->bad)) return;   // always written (protect_failed): not protected again
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
     // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing
-    uintptr_t run = 0; int open = 0;
+    uintptr_t run = 0; int open = 0, failed = 0;
     for (uintptr_t i = p; i <= q + 1; i++) {
         uint8_t st = PG_NONE;
-        int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+        int took = i <= q && !failed && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);   // after a failure no more pages are taken
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) {
+            if (!mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ)) for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
+            else { protect_failed(r, run, i); failed = 1; }
+            open = 0;
+        }
     }
 }
-uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
+uint64_t nvn_dirty_now(void) { return atomic_load(&g_nbad) ? atomic_fetch_add(&g_now, 1) + 1 : atomic_load(&g_now); }   // see protect_failed
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
     range_t *r = (range_t *)span; uintptr_t a0 = (uintptr_t)addr;   // the kept handle still holds the span (a slot reused by another pool over the same memory is as good): no scan
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a0 < r->base || a0 + len > r->end) r = find_span(a0, len);
-    if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
+    if (!r || atomic_load_explicit(&r->bad, memory_order_relaxed)) return 1;   // When untracked (or always written: protect_failed), conservatively treat as dirty: better to upload more than to show stale content
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;

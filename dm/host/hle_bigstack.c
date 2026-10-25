@@ -82,4 +82,5 @@ __asm__(
     "    ldp x29, x30, [sp, #0x90]\n"
     "    add sp, sp, #0xa0\n"
     "    br x16\n"
+    DM_ASM_FUNC_END(DM_ASM_S("dm_bigstack_enter"))
     DM_ASM_TEXT_END);

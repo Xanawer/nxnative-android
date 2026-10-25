@@ -42,7 +42,7 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
     extern const char cname##_bs[];                                                               \
     __asm__(DM_ASM_TEXT ".p2align 2\n.globl " DM_ASM_S(#cname "_bs") "\n" DM_ASM_HIDDEN " " DM_ASM_S(#cname "_bs") "\n" DM_ASM_FUNC(DM_ASM_S(#cname "_bs")) DM_ASM_S(#cname "_bs") ":\n" \
-            "    adrp x16, " DM_ASM_PAGE(#cname) "\n    add x16, x16, " DM_ASM_PAGEOFF(#cname) "\n    b " DM_ASM_S("dm_bigstack_enter") "\n" DM_ASM_TEXT_END); \
+            "    adrp x16, " DM_ASM_PAGE(#cname) "\n    add x16, x16, " DM_ASM_PAGEOFF(#cname) "\n    b " DM_ASM_S("dm_bigstack_enter") "\n" DM_ASM_FUNC_END(DM_ASM_S(#cname "_bs")) DM_ASM_TEXT_END); \
     __attribute__((used, DM_SECT(swforce))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
     static ret cname(__VA_ARGS__)
 

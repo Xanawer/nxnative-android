@@ -7,5 +7,6 @@ __pycache__/
 # Made from each shader build's Mac outputs (c1_guard.py, cb_extent.py; the NSP script makes them), not committed
 dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
-# Android host build (dm/android/cmake/build.sh)
+# Android host build (dm/android/cmake/build.sh) and the app (dm/android/app/build_app.sh)
 dm/android/cmake/build/
+dm/android/app/build/

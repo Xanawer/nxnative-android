@@ -7,6 +7,7 @@
 
 // ---------- Object format: symbol names in assembly, linker-built tables ----------
 // Mach-O prefixes C symbols with _, ELF does not; .private_extern is ELF's .hidden; adrp / add take sym@PAGE / sym@PAGEOFF on Mach-O and sym / :lo12:sym on ELF.
+// FUNC / FUNC_END give an ELF function its type and size: bionic's dladdr names a symbol only for addresses inside st_size, so a crash dump names an assembly function only with them
 #ifdef __APPLE__
 #ifdef __ASSEMBLER__
 #define SYM(s) _##s
@@ -14,6 +15,7 @@
 #define PAGEOFF(s) _##s@PAGEOFF
 #define HIDDEN .private_extern
 #define FUNC(s)
+#define FUNC_END(s)
 #else
 #define DM_ASM_S(s) "_" s                 // s: a string literal
 #define DM_ASM_HIDDEN ".private_extern"
@@ -22,6 +24,7 @@
 #define DM_ASM_TEXT ".text\n"
 #define DM_ASM_TEXT_END ""
 #define DM_ASM_FUNC(s) ""
+#define DM_ASM_FUNC_END(s) ""
 // A table the linker gathers from every object (HLE entries, forced take-overs, NVN implementations): a __DATA section, read back with getsectiondata (mach-o/getsect.h at the caller)
 #define DM_SECT(name) section("__DATA," #name)
 #define DM_SECT_DATA(seg, name, szp) getsectiondata(&_mh_execute_header, seg, #name, szp)
@@ -33,6 +36,7 @@
 #define PAGEOFF(s) :lo12:s
 #define HIDDEN .hidden
 #define FUNC(s) .type s, %function
+#define FUNC_END(s) .size s, . - s
 #else
 #define DM_ASM_S(s) s
 #define DM_ASM_HIDDEN ".hidden"
@@ -41,6 +45,7 @@
 #define DM_ASM_TEXT ".pushsection .text\n"
 #define DM_ASM_TEXT_END ".popsection\n"
 #define DM_ASM_FUNC(s) ".type " s ", %function\n"
+#define DM_ASM_FUNC_END(s) ".size " s ", . - " s "\n"
 // ELF: a section named like an identifier gets __start_ / __stop_ symbols from the linker. retain (SHF_GNU_RETAIN) keeps it under --gc-sections, where lld's default -z start-stop-gc
 // no longer counts a __start_ reference as a use; the bounds are weak (an empty table reads as NULL / 0, as getsectiondata gives) and hidden (resolved inside this image)
 #define DM_SECT(name) section(#name), retain

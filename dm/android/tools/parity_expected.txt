@@ -1,0 +1,24 @@
+# The lines a phone log of Stardew Valley differs from the Mac reference by, up to the first present (parity.py; lines as lognorm.py normalizes them, each pattern matched whole)
+# Lines only the phone log has
+[+]
+# The app's front end (dm/android/front/front_android.c): its directories, env.txt, the game files
+boot: files <path>, external files (<path>|\(none\))
+boot: env [A-Z][A-Z0-9_]*=.* \(env\.txt\)
+boot: game language [A-Za-z-]+
+boot: game files <path>
+boot: modules <path>
+# The signal guard (dm/host/crash.c, Linux only): the first scan's handlers and summary, a rescan's changes, the mask read back on the first two threads that run guest code
+\[dm\] signals: <n> \((SIG[A-Z0-9]+|__SIGRTMIN\+<n>)\) handler \S+( \S+)?\+(<hex>|<n>), flags (<hex>|<n>), no SA_ONSTACK: (reinstalled with SA_ONSTACK \(bionic's own; flags now <hex>\)|(bionic's, not reinstalled \(only the first scan writes\), )?(blocked on guest threads( that start from here)?|kept \((a fault or the host's own signal: never blocked|bionic's POSIX timer signal: never touched|a bionic cross-thread handshake: never blocked)\)))
+\[dm\] signals: <n> handlers installed, <n> without SA_ONSTACK, <n> of them bionic's put on the alternate stack; threads that run guest code block(( <n>)+| none)
+\[dm\] signals: <n> \((SIG[A-Z0-9]+|__SIGRTMIN\+<n>)\) now (on the alternate stack|ignored|default): no longer blocked on guest threads that start from here
+\[dm\] signals: guest threads that start from here block (<hex>|<n>) \(was (<hex>|<n>)\)
+\[dm\] signals: thread <n> blocks (<hex>|<n>) \(the guest set (<hex>|<n>) held\)
+# The app's window (the activity's, painted black until the Vulkan backend draws to it)
+\[dm\] front end: window \d+x\d+
+# The thread-slot mechanism's startup check (docs/android/probes.md P0.2)
+\[dm\] thread slots: bionic key data at \*\(tpidr_el0 - <n>\) \+ <hex> / <hex> / <hex> / <hex>, checked
+# The present thread's priority: a nice value where Darwin has a time-constraint policy
+\[dm\] \[nvn\] present thread nice -<n> in place of a time-constraint policy \(period <n>, computation <n>\) set
+# Lines only the Mac reference has
+[-]
+\[dm\] \[nvn\] present thread time-constraint policy \(period <n>, computation <n>\) set

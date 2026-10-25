@@ -265,7 +265,7 @@ static void backend_stop(aout *a) {
     if (a->backend == BK_AU) { AudioOutputUnitStop(a->au); a->backend = BK_NONE; }
     else if (a->backend == BK_NULL) null_stop(a);
 }
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }   // Android (TARGET_OS_IPHONE 0): the Mac default for now, the silent sink; DM_AUDIO=1 opens AAudio
+static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }   // Android (TARGET_OS_IPHONE 0): adb-shell runs get the Mac default, the silent sink, and DM_AUDIO=1 opens AAudio; the app sets DM_AUDIO=1 (front_android.c)
 // Start the AudioUnit of an output whose backend is BK_NONE (callers hold g_aos_lock). When the device refuses (the session is held by a call, or is being reset), the silent sink stands in and the watchdog retries
 static void au_go(aout *a, uint64_t now) {
 #ifdef __ANDROID__   // a disconnected stream (headphones unplugged, the output device changed) never calls back again and refuses every start: the watchdog's retry opens a new one on the current device,

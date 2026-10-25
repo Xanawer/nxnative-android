@@ -192,8 +192,97 @@ static pthread_key_t g_altstack_key;
 static pthread_once_t g_altstack_once = PTHREAD_ONCE_INIT;
 static void altstack_free(void *p) { stack_t off = {.ss_flags = SS_DISABLE}; sigaltstack(&off, 0); free(p); }
 static void altstack_key_init(void) { if (pthread_key_create(&g_altstack_key, altstack_free)) die("altstack key"); }
+#ifndef __APPLE__
+// Linux: a handler installed without SA_ONSTACK runs on the interrupted thread's own stack, and the rewriter's stubs keep scratch below sp (no red zone; docs/android/probes-cpu.md P0.3), so one
+// arriving while a guest thread runs guest code corrupts it silently. Bionic installs two so (36, the platform profilers' __SIGRTMIN+4, SA_SIGINFO | SA_RESTART; 39, fdtrack's __SIGRTMIN+7,
+// through signal()) and ART or another library may add more at any time. So every thread that runs guest code scans, when it starts (crash_thread_init), what the kernel will run (raw rt_sigaction,
+// past libsigchain, which answers sigaction with the handler it chains to; 64 reads), and blocks what the scan says (raw rt_sigprocmask: bionic's sigprocmask quietly leaves its reserved 33-41 alone):
+//  - the first scan (crash_install) puts bionic's own handlers (in libc.so) back as they were plus SA_ONSTACK, so they run on the thread's alternate stack (bionic gives every thread one; guest
+//    threads get crash_thread_init's). Later scans only read: a write could freeze a handler someone holds in place for a moment (android_run_on_all_threads' on 40)
+//  - anything else's handler without SA_ONSTACK (ART's, another library's) is blocked, apart from the set below. Two of those are in bionic's "33-41 must stay unblocked" (reserved_signals.h), and
+//    blocking them only moves them: 34 (libcore's AsynchronousCloseMonitor pthread_kills only a Java thread blocked in I/O, which a guest thread never is) and 38 (perfetto_hprof's heap dump,
+//    process-directed: the kernel gives it to a thread that does not block it, an activity or host thread)
+//  - never blocked: the synchronous faults and seccomp's SIGSYS (blocked, the kernel kills the process instead of running the handler); the host's own SIGUSR2 (stop the world), SIGALRM, SIGTERM and
+//    SIGABRT, which a foreign handler may still hold when a scan runs; bionic's POSIX timer signal 32, which bionic itself keeps blocked (never touched either way); and bionic's cross-thread
+//    handshakes, thread-directed signals whose sender waits for each thread to answer: 33 (libunwindstack's ThreadUnwinder: tgkill, then waits for the ucontext; ART dumps unattached threads in an
+//    ANR trace through it), 40 (android_run_on_all_threads: tgkill to every thread, then sem_wait for each holding g_thread_creation_lock for writing, so one thread blocking it would stop every
+//    pthread_create and pthread_exit in the process for good) and 41 (MTE's per-thread re-enable). A thread that inherited 33, 40 or 41 blocked has them unblocked
+//  - a thread inherits its creator's mask: what an earlier scan blocked and the latest no longer does is unblocked, unless the first scan's thread blocked it already (ART's SIGQUIT, SIGUSR1, SIGPIPE)
+// Left open (the full fix is a rewriter change, stubs that move sp before they save; docs/android/PLAN.md P0.3):
+//  - a handler without SA_ONSTACK that appears (or loses SA_ONSTACK) after a guest thread started is not blocked on that thread, as only a thread changes its own mask: its signal, landing there
+//    while guest code runs, corrupts up to 112 bytes below sp. Threads started between the handler's arrival and its removal block it; others do not
+//  - the handshakes stay unblocked whatever their handler: 40's never has SA_ONSTACK (SA_SIGINFO only). On this phone's bionic (android16) its one caller is SetHeapTaggingLevel, which signals
+//    only in a process that runs MTE (ASYNC / SYNC; TBI -> NONE skips it) and this device has none; 33's handler (libunwindstack) has SA_ONSTACK; 41's is installed only under MTE
+struct dm_kact { uintptr_t handler; unsigned long flags; uintptr_t restorer; uint64_t mask; };   // the kernel's arm64 struct sigaction: 64-bit mask, sigsetsize 8
+#define SIG_BIT(s) (1ull << ((s) - 1))
+static const uint64_t g_sig_shake = SIG_BIT(33) | SIG_BIT(40) | SIG_BIT(41);   // bionic's cross-thread handshakes (above): never blocked, unblocked when inherited
+static pthread_mutex_t g_sig_mu = PTHREAD_MUTEX_INITIALIZER;   // the scan state: threads that run guest code start concurrently
+static uint64_t g_sig_block;   // bit sig - 1: what a thread that runs guest code blocks, by the latest scan
+static uint64_t g_sig_ours;    // every bit a scan has put in g_sig_block
+static uint64_t g_sig_base;    // the first scan's thread's mask before anything was blocked: the process's own reasons, never unblocked here
+static struct { uintptr_t handler; unsigned long flags; } g_sig_seen[65];   // each signal's handler at the last scan: a rescan decides, looks up and logs only what changed
+static int g_sig_scans;
+static _Atomic int g_sig_shown;
+static int sig_kept(int s) {
+    switch (s) { case SIGSEGV: case SIGBUS: case SIGILL: case SIGFPE: case SIGTRAP: case SIGSYS: case SIGKILL: case SIGSTOP: case SIGUSR2: case SIGALRM: case SIGTERM: case SIGABRT: return 1; }
+    return 0;
+}
+static void sig_scan(void) {   // holding g_sig_mu
+    int first = !g_sig_scans++, n = 0, lack = 0, reinst = 0; char list[256] = ""; size_t ll = 0; uint64_t was = g_sig_block;
+    if (first) syscall(SYS_rt_sigprocmask, SIG_BLOCK, NULL, &g_sig_base, sizeof g_sig_base);
+    for (int s = 1; s <= 64; s++) {
+        struct dm_kact k; if (syscall(SYS_rt_sigaction, s, NULL, &k, sizeof k.mask)) continue;
+        if (k.handler > 1) { n++; lack += !(k.flags & SA_ONSTACK); }   // SIG_DFL 0, SIG_IGN 1
+        if (k.handler == g_sig_seen[s].handler && k.flags == g_sig_seen[s].flags) continue;   // as at the last scan, and so is the decision
+        g_sig_seen[s].handler = k.handler; g_sig_seen[s].flags = k.flags;
+        static const char *const ab[32] = {"", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT",
+                                           "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS"};   // the generic Linux numbering arm64 uses
+        char nm[24]; if (s < 32) snprintf(nm, sizeof nm, "SIG%s", ab[s]); else snprintf(nm, sizeof nm, "__SIGRTMIN+%d", s - 32);
+        uint64_t bit = SIG_BIT(s); int had = (g_sig_block & bit) != 0; g_sig_block &= ~bit;
+        if (k.handler <= 1 || (k.flags & SA_ONSTACK)) {   // nothing to guard against (any more)
+            if (had) LOG("signals: %d (%s) now %s: no longer blocked on guest threads that start from here", s, nm, k.handler > 1 ? "on the alternate stack" : k.handler ? "ignored" : "default");
+            continue;
+        }
+        Dl_info di = {0}; char how[128], pre[64] = ""; const char *red = "";
+        int found = dladdr((void *)k.handler, &di) && di.dli_fname; const char *lib = found ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+        int bionic = found && !strcmp(lib, "libc.so"), never = sig_kept(s) || s == 32 || (g_sig_shake & bit);
+        unsigned long fl = k.flags; struct dm_kact back = {0}; int onstack = 0;
+        if (bionic && first && !never) {   // bionic's own: the same handler, mask and restorer with SA_ONSTACK, read back
+            k.flags |= SA_ONSTACK;
+            if (!syscall(SYS_rt_sigaction, s, &k, NULL, sizeof k.mask) && !syscall(SYS_rt_sigaction, s, NULL, &back, sizeof back.mask) && back.handler == k.handler && (back.flags & SA_ONSTACK)) {
+                snprintf(how, sizeof how, "reinstalled with SA_ONSTACK (bionic's own; flags now %#lx)", back.flags); reinst++; onstack = 1; g_sig_seen[s].flags = back.flags;
+            } else { red = "[RED] "; snprintf(pre, sizeof pre, "not reinstalled (errno %d), ", errno); }   // then treated as anyone else's
+        } else if (bionic && !never) snprintf(pre, sizeof pre, "bionic's, not reinstalled (only the first scan writes), ");
+        if (!onstack) {
+            if (sig_kept(s)) snprintf(how, sizeof how, "%skept (a fault or the host's own signal: never blocked)", pre);
+            else if (s == 32) snprintf(how, sizeof how, "%skept (bionic's POSIX timer signal: never touched)", pre);
+            else if (never) snprintf(how, sizeof how, "%skept (a bionic cross-thread handshake: never blocked)", pre);
+            else {
+                snprintf(how, sizeof how, "%sblocked on guest threads%s", pre, first ? "" : " that start from here"); g_sig_block |= bit; g_sig_ours |= bit;
+                int w = snprintf(list + ll, sizeof list - ll, " %d", s); if (w > 0 && (size_t)w < sizeof list - ll) ll += (size_t)w;
+            }
+        }
+        LOG("%ssignals: %d (%s) handler %s%s%s+%#lx, flags %#lx, no SA_ONSTACK: %s", red, s, nm, lib, di.dli_sname ? " " : "", di.dli_sname ? di.dli_sname : "",
+            (unsigned long)(k.handler - (uintptr_t)(di.dli_sname ? di.dli_saddr : di.dli_fbase)), fl, how);
+    }
+    if (first) LOG("signals: %d handlers installed, %d without SA_ONSTACK, %d of them bionic's put on the alternate stack; threads that run guest code block%s", n, lack, reinst, *list ? list : " none");
+    else if (g_sig_block != was) LOG("signals: guest threads that start from here block %#llx (was %#llx)", (unsigned long long)g_sig_block, (unsigned long long)was);
+}
+static void sig_guard_thread(int show) {
+    pthread_mutex_lock(&g_sig_mu); sig_scan(); uint64_t blk = g_sig_block, un = (g_sig_ours & ~blk & ~g_sig_base) | g_sig_shake; pthread_mutex_unlock(&g_sig_mu);
+    if (syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &un, NULL, sizeof un) || (blk && syscall(SYS_rt_sigprocmask, SIG_BLOCK, &blk, NULL, sizeof blk))) LOG("[RED] signals: rt_sigprocmask failed (errno %d)", errno);
+    if (!show || atomic_fetch_add(&g_sig_shown, 1) >= 2) return;   // the mask read back on the first two such threads (the host thread that runs guest_main, the first CreateThread one)
+    uint64_t now = 0; syscall(SYS_rt_sigprocmask, SIG_BLOCK, NULL, &now, sizeof now);
+    int held = (now & blk) == blk, shake = (now & g_sig_shake) != 0;
+    LOG("%ssignals: thread %d blocks %#llx (the guest set %#llx %s)", held && !shake ? "" : "[RED] ", (int)gettid(), (unsigned long long)now, (unsigned long long)blk,
+        !held ? "missing" : shake ? "held, and a handshake signal too" : "held");
+}
+#endif
 void crash_thread_init(void) {
     pthread_once(&g_altstack_once, altstack_key_init);
+#ifndef __APPLE__
+    sig_guard_thread(!pthread_getspecific(g_altstack_key));   // every call: a thread that runs guest code scans and sets its mask as it starts (main.c comes back here after an early load)
+#endif
     if (pthread_getspecific(g_altstack_key)) return;                 // Repeated calls on the same thread do not allocate again
     stack_t ss = {.ss_sp = malloc(65536), .ss_size = 65536}; sigaltstack(&ss, 0);
     pthread_setspecific(g_altstack_key, ss.ss_sp);

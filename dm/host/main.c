@@ -19,6 +19,9 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
 
 static void guest_main(void) {
+#ifndef __APPLE__
+    { void crash_thread_init(void); crash_thread_init(); }   // this thread's signal scan ran at crash_install, before the modules and the front end's libraries loaded: rescan and set its mask again right before its first guest instruction
+#endif
     guest_thread_init();
     { void dm_oodle_serve_maybe(int); dm_oodle_serve_maybe(0); }   // DM_OODLE_SERVE tool mode: the game's own Oodle decoder over stdin / stdout (hle_oodle.c, exits when the input ends)
     uint32_t hmain = svc_thread_main_init();   // Main thread handle: x0 of nnosInitialize (stored in an sdk global, used by ThreadManagerImplByHorizon); x1 = pointer to the argument area
