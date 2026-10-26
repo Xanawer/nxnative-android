@@ -55,6 +55,7 @@ public class HostActivity extends NativeActivity {
             .setNegativeButton(android.R.string.cancel, null);
         if (!message.isEmpty()) b.setMessage(message);
         final AlertDialog d = b.create();
+        d.setCanceledOnTouchOutside(false);   // the theme's default closes it on a touch outside: a stray tap on the game would lose the text (the Switch applet has no such way out)
         final Runnable ok = new Runnable() { public void run() {
             if (done[0] || f.length() < minChars) return;
             done[0] = true; d.dismiss();
