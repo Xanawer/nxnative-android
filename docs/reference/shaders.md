@@ -674,6 +674,14 @@ Cross/helper lowering and the optional Metal checks. Shader acceptance does not
 imply admission of every native host layout. None of these tests executes a
 shader on a GPU.
 
+### Buffer images declared as buffers for image atomics
+
+- **Symptom:** `FATAL [RED] image atomics: unsupported or overflowing IMG extent` at the first dispatch of a shader whose atomics go to a buffer image (a `texture_buffer` IMG with its `device atomic_uint*` IMGA), with the image bound to a buffer texture (`target 10` in the `image atomics on image slot` line).
+- **Cause:** the host's reflection (`nvn_refl.m`) gives each IMG binding the type of its placeholder from its MSL type, and that table has no buffer type, so a `texture_buffer` IMG was declared 2D. The image-atomic admission (`imga_extent`, [contract](../image-atomic-binding-contract.md)) takes a bound image only of the declared type, so every real buffer image failed it. An unbound one got a 2D placeholder, and its atomics went to the shared zero buffer (`dummy_buf`) that unbound buffers read.
+- **Fix:** a `texture_buffer` IMG is declared a buffer, as a sampled `texture_buffer` (TEXD) already was. An unbound one gets a one-texel buffer texture of its own (`dummy_img_tbuf`, its row aligned as Metal requires for the format), and an unbound IMGA a scratch of its own (`dummy_atom_buf`), so atomics through an unbound slot no longer write the buffer unbound buffers read as zeros.
+- **Check:** `make -C dm/gfx/tests GAME=<id> check_t_imga_tbuf` (on Metal, with the API validation layer: the declared type, a bound buffer texture admitted, the unbound placeholder and scratch); `test_imga_binding_source.py`.
+- **Found on:** SHIN MEGAMI TENSEI Ⅴ, whose profile is in [PR #173](https://github.com/seedds/nxnative/pull/173): Unreal's compute shader `05fe2caae79b6e53` (an atomic on a 448,800-byte buffer image) stopped the Mac host about 60 s into a new game once the admission came in (PR #178). With the fix the game runs to its first classroom at 60 fps.
+
 ## Shaders compiled at run time
 
 ### Built-in shaders compiled with the game's own GLSLC

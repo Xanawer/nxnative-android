@@ -76,6 +76,8 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 if (r->kind == NVN_RB_TEXA) dummy_kind(el, &r->dtt, &r->dpf);
             }
             else if ([k isEqualToString:@"img"]) { r->kind = NVN_RB_IMG; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf);   // rw: the shader writes it (access::write / read_write; a load-only view of the slot is not)
+                // a buffer image is declared as one (as TEXD): image atomics admit a bound image only of the declared type (imga_extent), and an unbound one gets a buffer dummy (img_binding)
+                if ([ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"texture_buffer"]) r->dtt = (uint8_t)MTLTextureTypeTextureBuffer;
                 r->rw = [ty isKindOfClass:[NSString class]] && ([ty containsString:@"access::write"] || [ty containsString:@"access::read_write"]); }
             else if ([k isEqualToString:@"tbuf"]) { r->kind = NVN_RB_TBUF; uint8_t tt; dummy_kind(b[@"msl_type"], &tt, &r->dpf); }
             else if ([k isEqualToString:@"sbuf"]) { r->kind = NVN_RB_SBUFP; r->rw = sbuf_rw(b); }

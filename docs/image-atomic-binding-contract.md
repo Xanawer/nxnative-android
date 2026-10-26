@@ -27,7 +27,10 @@ resource lifetime.
   arithmetic and actual IMG dimensions ensure the existing request covers the
   matched image; no request is enlarged to conceal a mismatch.
 - An unbound IMG may retain the existing dummy pointer only if its actual dummy
-  extent fits and neither side resolves to a real image.
+  extent fits and neither side resolves to a real image. The placeholder has the
+  declared type (a buffer image's is a one-texel buffer texture), and the unbound
+  IMGA points at an atomic scratch of its own, not at the zero buffer unbound
+  buffers read.
 
 ## Fail-closed limits
 
@@ -67,7 +70,11 @@ layout mismatch, or residency caused an earlier GPU fault.
 make -C dm/gfx/tests GAME=0100F43008C44000 imga-layout
 ASAN_OPTIONS=detect_leaks=0 make -C dm/gfx/tests GAME=0100F43008C44000 imga-layout-sanitize
 python3 dm/gfx/tests/test_imga_binding_source.py
+make -C dm/gfx/tests GAME=0100F43008C44000 check_t_imga_tbuf
 ```
+
+`t_imga_tbuf` runs on Metal: a buffer image's declared type, the admission of a
+bound buffer texture, and an unbound buffer image's placeholder and scratch.
 
 The portable fixture executes production checked arithmetic/admission helpers:
 3 MiB versus 64 KiB capacity, valid packed layouts, overflow, zero dimensions,

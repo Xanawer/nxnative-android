@@ -27,6 +27,11 @@ class BindingWiring(unittest.TestCase):
         self.assertNotIn('atom_scratch', branch)
         self.assertNotIn('dummy_buf', branch)
 
+    def test_unbound_atomics_do_not_write_the_zero_buffer(self):
+        branch = SOURCE.split('unmatched unbound IMG/IMGA pair', 1)[0].rsplit('} else {', 1)[1]
+        self.assertIn('storage = dummy_atom_buf();', branch)
+        self.assertNotIn('dummy_buf()', branch)
+
     def test_rejection_precedes_argument_publication(self):
         body = SOURCE.split('static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {', 1)[1]
         self.assertLess(body.index('refusing short dummy'), body.index('memcpy((uint8_t *)ab.contents'))

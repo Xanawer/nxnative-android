@@ -186,6 +186,12 @@ check_t_copy_alias: t_copy_alias
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_copy_alias
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_copy_alias
 run: check_t_copy_alias
+t_imga_tbuf: t_imga_tbuf.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_imga_tbuf.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+.PHONY: check_t_imga_tbuf
+check_t_imga_tbuf: t_imga_tbuf
+	MTL_DEBUG_LAYER=1 ./t_imga_tbuf
+run: check_t_imga_tbuf
 .PHONY: check_t_linear_readback
 check_t_linear_readback: t_linear_readback
 	MTL_DEBUG_LAYER=1 ./t_linear_readback

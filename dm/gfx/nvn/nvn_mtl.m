@@ -5644,7 +5644,7 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
 }
 // Argument buffer: filled item by item per the B reflection (uniform slot r, separate texture / sampler slot r, storage buffer slot r, driver segments c0 / c2, c1, support_buffer)
 // Unbound resources read 0: give all-zero dummy resources (NVN descriptors 0..255 are reserved for the driver; the game binding handle 0 means 'this slot is empty')
-static uint64_t g_dummy_img_rid[8][4], g_dummy_tbuf_rid[4];
+static uint64_t g_dummy_img_rid[8][4], g_dummy_tbuf_rid[4], g_dummy_img_tbuf_rid[4];
 static id<MTLTexture> dummy_tex(int dtt, int dpf) {
     static __strong id<MTLTexture> cache[8][4];
     MTLTextureType tt = (MTLTextureType)dtt;
@@ -5668,6 +5668,17 @@ static id<MTLTexture> dummy_img(int dtt, int dpf) {
     d.width = d.height = d.depth = 1; d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     t = [g_dev newTextureWithDescriptor:d]; cache[dtt & 7][dpf & 3] = t; g_dummy_img_rid[dtt & 7][dpf & 3] = t.gpuResourceID._impl; res_add(t); return t;
 }
+// The same for an unbound buffer image (texture_buffer; dummy_img's cache cannot hold it, type 9 falls on 1D's index): one texel on a buffer of its own, not dummy_buf, which reads 0
+static id<MTLTexture> dummy_img_tbuf(int dpf) {
+    static __strong id<MTLTexture> cache[4];
+    id<MTLTexture> t = cache[dpf & 3]; if (t) return t;
+    MTLPixelFormat pf = dpf == NVN_DPF_UINT ? MTLPixelFormatRGBA32Uint : dpf == NVN_DPF_SINT ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA32Float;
+    NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:pf], row = (16 + al - 1) / al * al;   // one 16-byte texel, its row aligned as for any buffer texture
+    id<MTLBuffer> b = [g_dev newBufferWithLength:row options:MTLResourceStorageModePrivate]; res_add(b);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:pf width:1 resourceOptions:b.resourceOptions usage:MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite];
+    t = [b newTextureWithDescriptor:d offset:0 bytesPerRow:row];
+    cache[dpf & 3] = t; g_dummy_img_tbuf_rid[dpf & 3] = t.gpuResourceID._impl; res_add(t); return t;
+}
 static id<MTLBuffer> dummy_buf(void);
 static id<MTLTexture> dummy_tbuf(int dpf) {   // Unbound typed buffer: all zeros (pixel class matches the shader's texture_buffer<T>)
     static __strong id<MTLTexture> cache[4];
@@ -5685,6 +5696,9 @@ static id<MTLSamplerState> dummy_samp(void) {
 static uint64_t dummy_samp_rid(void) { static uint64_t rid; if (!rid) rid = dummy_samp().gpuResourceID._impl; return rid; }
 static id<MTLBuffer> dummy_buf(void) { static id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:64 << 10 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
 static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy_buf().gpuAddress; return gpu; }
+// The atomics of an unbound image: a scratch of their own. dummy_buf would do for the capacity, but unbound buffers read it as 0, and the IR guard lets the atomics through to the
+// dummy image's one texel (its first word)
+static id<MTLBuffer> dummy_atom_buf(void) { static id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:256 options:MTLResourceStorageModePrivate]; res_add(b); } return b; }
 // Image atomics on block-linear images retain discard scratch at least as large as the matched IMG extent; linear images require proven direct backing below. SPIRV-Cross indexes
 // the IMGA pointer using that image's dimensions (including the array layer), so a full image paired with a 64 KB dummy can run past its end into whatever GPU memory followed:
 // Pokémon Legends: Z-A's atomic max into an r32ui 2D array (texture ID 302, fragment shader 2bd5037003980716) wrote into zero-copy pools over the game's heap, which broke pointers in the game's
@@ -5717,7 +5731,8 @@ static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, in
         if (v) { t = v; *rid = r2; } else if (swz_only) t = nil;
     }
     *real = t != nil;
-    if (!t) { t = dummy_img(b->dtt, b->dpf); *rid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }
+    if (!t && b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) { t = dummy_img_tbuf(b->dpf); *rid = g_dummy_img_tbuf_rid[b->dpf & 3]; }
+    else if (!t) { t = dummy_img(b->dtt, b->dpf); *rid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }
     return t;
 }
 static int imga_extent(id<MTLTexture> t, const nvn_rbind *b, uint64_t *bytes) {
@@ -5926,7 +5941,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (!storage || !gpu || !nvn_imga_capacity(need, storage.length, 0))
                     MDIE("[RED] image atomics: scratch allocation or capacity failed; refusing short dummy (shader %s stage %d slot %d texture %d need %llu)", sh->key, nvn_stage, reg, tid, (unsigned long long)need);
             } else {
-                storage = dummy_buf(); gpu = storage.gpuAddress;
+                storage = dummy_atom_buf(); gpu = storage.gpuAddress;
                 if (atomic_real[reg] || !storage || !gpu || !nvn_imga_capacity(need, storage.length, 0))
                     MDIE("[RED] image atomics: unmatched unbound IMG/IMGA pair (shader %s stage %d slot %d)", sh->key, nvn_stage, reg);
             }

@@ -88,6 +88,8 @@ t_linear_readback
 t_linear_readback.dSYM/
 t_copy_alias
 t_copy_alias.dSYM/
+t_imga_tbuf
+t_imga_tbuf.dSYM/
 t_pso_pending
 t_pso_pending.dSYM/
 t_integer_blend
