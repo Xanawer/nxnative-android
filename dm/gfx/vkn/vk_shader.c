@@ -1,6 +1,7 @@
 // Shader modules of the draws (docs/android/PLAN.md 2.4, slice 2c): a program's NVN stages → slice 0's SPIR-V modules, as nvn_mtl.m maps them to metallibs (shmap_load, prog_get, shader_get).
 // The shader map (DM_NVN_SHMAP, else <DM_VK_SHADERS>/shader_map.tsv) names each key's stage; the module is <DM_VK_SHADERS>/<key>_b.json (dmsh_build_vk.py's reflection) beside <key>_b.spv (the
-// .spv.zst decompressed: a development-time directory, packaging is Phase 3's). Each module's resources are moved into the draws' one push-descriptor set (set 0): vertex bindings keep their
+// .spv.zst decompressed). A game's APK carries that directory (scripts/build_apk_from_nsp.py: assets/nx/vksh), and the Android front end points DM_VK_SHADERS at it once unpacked
+// (<files>/pkg/vksh, front_android.c) unless env.txt names another; on the Mac and for development it is a directory given by hand. Each module's resources are moved into the draws' one push-descriptor set (set 0): vertex bindings keep their
 // numbers, pixel bindings get 32 more (the DescriptorSet / Binding decorations are patched; nothing else of the module changes). A module that cannot be used as built (its status, chain, stage,
 // a binding kind or image type this slice does not bind, a descriptor array, a slot out of its range, decoration groups, a capability the device does not take, a size, SHA-256 or magic that does not
 // match, an entry point not of its stage) is refused, said once in red with why, and its draws are skipped. Only the decompressed <key>_b.spv is read.
@@ -125,7 +126,7 @@ static void shaders_init(void) {
     char *t = mp ? slurp(mp, NULL) : NULL;
     if (!t) VLOG("[RED] no shader map (%s; DM_NVN_SHMAP or <DM_VK_SHADERS>/shader_map.tsv names it): nothing is drawn", mp ? mp : "none given");
     else { map_text(t, mp); free(t); }
-    if (!g_dir) { VLOG("[RED] no shader module directory (DM_VK_SHADERS, slice 0's modules decompressed): nothing is drawn"); return; }
+    if (!g_dir) { VLOG("[RED] no shader module directory (DM_VK_SHADERS: the modules decompressed; a game's APK sets it to the ones it carries, scripts/build_apk_from_nsp.py): nothing is drawn"); return; }
     // The directory's stamp (inputs.tsv, as nvn_mtl.m's shmap_load reads it): the game it was built for
     snprintf(path, sizeof path, "%s/inputs.tsv", g_dir);
     char *st = slurp(path, NULL), game[64] = "", inputs[64] = "";

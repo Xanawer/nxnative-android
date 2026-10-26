@@ -9,6 +9,7 @@
 #include "front.h"
 #include "dm_input.h"
 #include "game_profile.h"   // DM_GAME_ROMFS_MARKER
+#include <android/asset_manager.h>
 #include <android/input.h>
 #include <android/keycodes.h>
 #include <android/log.h>
@@ -16,6 +17,9 @@
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <android/window.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <ftw.h>
 #include <jni.h>
 #include <math.h>
 #include <pthread.h>
@@ -212,25 +216,39 @@ static void log_open(void) {
 // (files_derive). boot_env checks it against internalDataPath and reads a file missed there late
 static const char *const g_ctor_env[] = {"DM_NVN_LOG", "DM_NVN_PROF", "DM_FD_LOG"};   // read by constructors: hle_nvn.c nvn_init_slots and nvn_nops_register, hle_fdstat.c fdstat_init
 static char g_env_keys[2048]; static size_t g_env_kl; static int g_env_early_read;
-static int env_file(const char *path, char *ctor, size_t ctor_cap) {   // 1 = the file was there; ctor gets the constructor-read variables it set
-    FILE *f = fopen(path, "r"); if (!f) return 0;
-    char ln[4096]; size_t cl = 0;
-    while (fgets(ln, sizeof ln, f)) {
-        char *s = ln, *e = ln + strlen(ln);
+// The rule of a line (scripts/build_apk_from_nsp.py env_pairs reads an --env-file by the same rule before baking it into the APK, and dm/tools/tests/test_nsp_apk.py runs this function on
+// the same lines): it ends at \n; spaces and tabs are cut at its start, at its end (with \r) and before the first =; # starts a comment; a line without = or without a name is skipped; a
+// name already set is skipped (the first wins). A line over ENV_LINE_MAX bytes (the \n not counted) or with a NUL byte is ignored whole, in red, never read in pieces
+#define ENV_LINE_MAX 4095
+static void env_lines(FILE *f, const char *src, char *ctor, size_t ctor_cap) {   // ctor gets the constructor-read variables the lines set
+    char *ln = NULL; size_t cap = 0, cl = 0; ssize_t len; int n = 0;
+    while ((len = getline(&ln, &cap, f)) != -1) {
+        n++;
+        size_t body = (size_t)len - (len > 0 && ln[len - 1] == '\n');
+        if (body > ENV_LINE_MAX || memchr(ln, 0, (size_t)len)) {
+            fprintf(stderr, "boot: [RED] %s line %d %s: ignored\n", src, n, body > ENV_LINE_MAX ? "is longer than 4095 bytes" : "has a NUL byte"); continue;
+        }
+        char *s = ln, *e = ln + len;
         while (*s == ' ' || *s == '\t') s++;
         while (e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
-        char *eq = strchr(s, '=');
-        if (!*s || *s == '#' || !eq || eq == s) continue;
-        *eq = 0;
+        char *eq = strchr(s, '='), *ke = eq;
+        if (!*s || *s == '#' || !eq) continue;
+        while (ke > s && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+        if (ke == s) continue;
+        *ke = 0; *eq = 0;
         if (getenv(s)) continue;
         setenv(s, eq + 1, 0);
         int w = snprintf(g_env_keys + g_env_kl, sizeof g_env_keys - g_env_kl, "%s%s", g_env_kl ? " " : "", s); g_env_kl = w > 0 && (size_t)w < sizeof g_env_keys - g_env_kl ? g_env_kl + (size_t)w : g_env_kl;
         for (size_t k = 0; ctor && k < sizeof g_ctor_env / sizeof *g_ctor_env; k++)
             if (!strcmp(s, g_ctor_env[k])) { int c = snprintf(ctor + cl, ctor_cap - cl, "%s%s", cl ? " " : "", s); cl = c > 0 && (size_t)c < ctor_cap - cl ? cl + (size_t)c : cl; }
-        fprintf(stderr, "boot: env %s=%s (env.txt)\n", s, eq + 1);
+        fprintf(stderr, "boot: env %s=%s (%s)\n", s, eq + 1, src);
     }
-    fclose(f);
+    free(ln);
     setenv("DM_ENV_FILE_KEYS", g_env_keys, 1);   // as iOS sets it for its launcher: what an env file set
+}
+static int env_file(const char *path, char *ctor, size_t ctor_cap) {   // 1 = the file was there
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    env_lines(f, "env.txt", ctor, ctor_cap); fclose(f);
     return 1;
 }
 static void env_early(void) {
@@ -249,6 +267,77 @@ static const char *romfs_locate(char *buf, size_t n) {
 static void set_dir(const char *var, const char *sub) {   // a directory under <files>, made if missing, unless an env file set the variable
     char d[600]; snprintf(d, sizeof d, "%s/%s", g_files, sub); mkdir(d, 0700); setenv(var, d, 0);
 }
+// ---------- The game's package in the APK (scripts/build_apk_from_nsp.py; docs/android/PLAN.md Phase 3) ----------
+// A game's APK carries assets/nx/: stamp (16 hex digits of the payload's content hash), index.txt (one "<size>\t<path>" line per file), env.txt (the build's defaults, below the user's env.txt),
+// mods/ (patch_nso.py --target android), vksh/ (the Vulkan shader modules decompressed, their reflection, inputs.tsv and the shader map) and font/. Those files are unpacked into <files>/pkg/ on
+// the host thread, before dm_main, whenever the APK's stamp is not the one unpacked there: into pkg.new, its stamp written last, then swapped in, so a start cut short leaves the last whole set
+// (or none) and never a mix. The loader reads the modules into anonymous memory and makes that executable (loader.c; docs/android/probes.md P0.1), so no file has to be in nativeLibraryDir.
+// The development APK (build_app.sh without --assets) has no assets/nx and runs as before: modules in <files>/mods, shaders from DM_VK_SHADERS in env.txt
+static char g_pkg[32];   // the APK's payload stamp, "" = no payload
+static char *asset_read(const char *name, size_t *n) {   // a small asset whole, NUL-terminated (NULL: none)
+    AAsset *a = AAssetManager_open(g_act->assetManager, name, AASSET_MODE_BUFFER); if (!a) return NULL;
+    off_t z = AAsset_getLength(a); char *b = z >= 0 && z < (1 << 24) ? malloc((size_t)z + 1) : NULL;
+    if (b && AAsset_read(a, b, (size_t)z) != (int)z) { free(b); b = NULL; }
+    AAsset_close(a); if (b) { b[z] = 0; if (n) *n = (size_t)z; }
+    return b;
+}
+static void pkg_probe(void) {   // onCreate: the APK's stamp, checked to be 16 lowercase hex digits
+    char *s = asset_read("nx/stamp", NULL); if (!s) return;
+    size_t n = strspn(s, "0123456789abcdef");
+    if (n == 16 && (!s[n] || s[n] == '\n')) memcpy(g_pkg, s, 16), g_pkg[16] = 0;
+    else fprintf(stderr, "boot: [RED] the APK's assets/nx/stamp is not 16 hex digits: its package is not used\n");
+    free(s);
+}
+static int rm_one(const char *p, const struct stat *sb, int fl, struct FTW *fw) { (void)sb; (void)fl; (void)fw; return remove(p) && errno != ENOENT ? -1 : 0; }
+static void rm_tree(const char *p) { if (!access(p, F_OK)) nftw(p, rm_one, 16, FTW_DEPTH | FTW_PHYS); }
+static int path_ok(const char *s) {   // an index path: relative, [A-Za-z0-9._-] parts, none empty or starting with '.'
+    if (!*s || *s == '/') return 0;
+    for (const char *p = s; *p; p++) {
+        if ((p == s || p[-1] == '/') && (*p == '.' || *p == '/')) return 0;
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-' || *p == '/')) return 0;
+    }
+    return s[strlen(s) - 1] != '/';
+}
+static int pkg_unpack(void) {   // the host thread: 1 = <files>/pkg holds the APK's payload
+    char cur[600], nw[600], old[600], p[1200], have[32] = "";
+    snprintf(cur, sizeof cur, "%s/pkg", g_files); snprintf(nw, sizeof nw, "%s/pkg.new", g_files); snprintf(old, sizeof old, "%s/pkg.old", g_files);
+    rm_tree(nw); rm_tree(old);   // what a start cut short left
+    snprintf(p, sizeof p, "%s/stamp", cur);
+    FILE *sf = fopen(p, "r"); if (sf) { if (!fgets(have, sizeof have, sf)) *have = 0; fclose(sf); have[strcspn(have, "\n")] = 0; }
+    if (!strcmp(have, g_pkg)) { fprintf(stderr, "boot: package %s: unpacked in %s\n", g_pkg, cur); return 1; }
+    uint64_t t0 = now_ns(); size_t ni = 0; char *idx = asset_read("nx/index.txt", &ni), *buf = malloc(1 << 20);
+    int nf = 0, ok = idx && buf && !mkdir(nw, 0700); uint64_t nb = 0;
+    if (!ok) fprintf(stderr, "boot: [RED] package %s: %s\n", g_pkg, !idx ? "the APK has no assets/nx/index.txt" : !buf ? "no memory" : "cannot make pkg.new");
+    for (char *l = idx, *e; ok && l && *l; l = e ? e + 1 : NULL) {
+        e = strchr(l, '\n'); if (e) *e = 0;
+        if (!*l) continue;
+        char *tab = strchr(l, '\t'), *end; unsigned long long want = strtoull(l, &end, 10);
+        if (!tab || end != tab || !path_ok(tab + 1)) { fprintf(stderr, "boot: [RED] package %s: index line '%.200s' is not \"<size>\\t<path>\"\n", g_pkg, l); ok = 0; break; }
+        const char *rel = tab + 1;
+        snprintf(p, sizeof p, "%s/%s", nw, rel);
+        for (char *s = p + strlen(nw) + 1; (s = strchr(s, '/')); s++) { *s = 0; if (mkdir(p, 0700) && errno != EEXIST) ok = 0; *s = '/'; }
+        char an[700]; snprintf(an, sizeof an, "nx/%s", rel);
+        AAsset *a = ok ? AAssetManager_open(g_act->assetManager, an, AASSET_MODE_STREAMING) : NULL;   // streaming: a 200 MB module is inflated piece by piece, never whole in memory
+        int fd = a ? open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1; unsigned long long got = 0; int r = 0;
+        while (fd >= 0 && (r = AAsset_read(a, buf, 1 << 20)) > 0) {
+            for (int w = 0, k; w < r; w += k) if ((k = (int)write(fd, buf + w, (size_t)(r - w))) <= 0) { r = -1; break; }
+            if (r < 0) break;
+            got += (unsigned)r;
+        }
+        if (fd >= 0 && close(fd)) r = -1;
+        if (a) AAsset_close(a);
+        if (!a || fd < 0 || r < 0 || got != want) { fprintf(stderr, "boot: [RED] package %s: %s %s (errno %d; %llu of %llu bytes)\n", g_pkg, !a ? "no asset" : "cannot write", rel, errno, got, want); ok = 0; break; }
+        nf++; nb += got;
+    }
+    free(idx); free(buf);
+    if (ok) { snprintf(p, sizeof p, "%s/stamp", nw); FILE *f = fopen(p, "w"); ok = f && fprintf(f, "%s\n", g_pkg) > 0; if (f && fclose(f)) ok = 0; }
+    if (ok && !access(cur, F_OK) && rename(cur, old)) ok = 0;
+    if (ok && rename(nw, cur)) { ok = 0; rename(old, cur); }
+    if (!ok) { fprintf(stderr, "boot: [RED] package %s could not be unpacked into %s (errno %d): the host does not start\n", g_pkg, cur, errno); rm_tree(nw); return 0; }
+    rm_tree(old);
+    fprintf(stderr, "boot: package %s: unpacked into %s (%d files, %llu bytes, %.2f s)%s%s\n", g_pkg, cur, nf, (unsigned long long)nb, (now_ns() - t0) / 1e9, *have ? "; it held " : "", have);
+    return 1;
+}
 static int boot_env(void) {
     log_open();
     fprintf(stderr, "boot: files %s, external files %s\n", g_files, *g_ext ? g_ext : "(none)");
@@ -257,6 +346,14 @@ static int boot_env(void) {
         char late[256] = "";
         if (env_file(ef, late, sizeof late) && *late)
             fprintf(stderr, "boot: [RED] env.txt was read only after the library's constructors (they looked in %s): %s took no effect\n", *g_files_early ? g_files_early : "(no directory)", late);
+    }
+    pkg_probe();
+    if (*g_pkg) {   // the build's defaults (build_apk_from_nsp.py: the game language, --env-file), below env.txt: the first line that sets a variable wins
+        size_t n = 0; char *t = asset_read("nx/env.txt", &n), late[256] = "";
+        FILE *f = t && n ? fmemopen(t, n, "r") : NULL;
+        if (f) { env_lines(f, "the APK's env.txt", late, sizeof late); fclose(f); }
+        if (*late) fprintf(stderr, "boot: [RED] the APK's env.txt is read after the library's constructors: %s took no effect (put it in %s instead)\n", late, ef);
+        free(t);
     }
     setenv("DM_ROOT", g_files, 0);
     set_dir("DM_SAVE", "save"); set_dir("DM_TEMP", "temp");
@@ -267,19 +364,27 @@ static int boot_env(void) {
         snprintf(d, sizeof d, "%s/font", g_ext); if (!access(d, R_OK)) setenv("DM_FONT_DIR", d, 0);
         snprintf(d, sizeof d, "%s/aoc", g_ext); if (!access(d, R_OK)) setenv("DM_AOC_DIR", d, 0);
     }
+    if (*g_pkg) {   // the APK's own: the Vulkan shader modules and the generated button-icon font, unpacked before dm_main (host_thread)
+        snprintf(d, sizeof d, "%s/pkg/vksh", g_files); setenv("DM_VK_SHADERS", d, 0);
+        snprintf(d, sizeof d, "%s/pkg/font", g_files); setenv("DM_FONT_DIR", d, 0);
+    }
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
     char rb[600]; const char *romfs = romfs_locate(rb, sizeof rb);
     if (!romfs) { fprintf(stderr, "boot: game files not found (%s/romfs or %s/romfs holding %s): the host does not start\n", *g_ext ? g_ext : "<external files>", g_files, DM_GAME_ROMFS_MARKER); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs);
     setenv("DM_ROMFS", romfs, 0);
-    snprintf(d, sizeof d, "%s/mods", g_files); mkdir(d, 0700);   // the rewritten modules (patch_nso.py --target android output), pushed by run_app.sh
+    // The rewritten modules (patch_nso.py --target android output): the APK's package, else pushed by run_app.sh
+    if (*g_pkg) snprintf(d, sizeof d, "%s/pkg/mods", g_files);
+    else { snprintf(d, sizeof d, "%s/mods", g_files); mkdir(d, 0700); }
     fprintf(stderr, "boot: modules %s\n", d);
+    if (*g_pkg) fprintf(stderr, "boot: package %s in the APK: modules, Vulkan shaders (DM_VK_SHADERS %s) and font (DM_FONT_DIR %s)\n", g_pkg, getenv("DM_VK_SHADERS"), getenv("DM_FONT_DIR"));
     if (chdir(g_files)) fprintf(stderr, "boot: cannot enter %s (errno %d)\n", g_files, errno);
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(d);
     return 1;
 }
 static void *host_thread(void *p) {
     (void)p;
+    if (*g_pkg && !pkg_unpack()) { ANativeActivity_finish(g_act); return NULL; }   // off the UI thread: a first start inflates some 200 MB
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
     ANativeActivity_finish(g_act);   // any thread may ask; onDestroy then ends the process

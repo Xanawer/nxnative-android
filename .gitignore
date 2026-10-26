@@ -11,3 +11,9 @@ dm/games/*/cb_extent.tsv
 dm/android/cmake/build/
 dm/android/cmake/build-vkn/
 dm/android/app/build/
+# The Android NSP script's output and work folders (scripts/build_apk_from_nsp.py: <NSP folder>/<id>_android/ and <id>_build/ by default, which are outside the repository;
+# these cover --out / --work pointed inside it by mistake). The APK holds the game's code and must never be committed
+*_android/
+*_build/
+*.apk
+*.apk.idsig

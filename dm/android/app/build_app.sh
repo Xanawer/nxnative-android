@@ -1,7 +1,13 @@
 #!/bin/bash
 # Build the app (docs/android/PLAN.md, dm/android/app): libdmhost.so (dm/android/cmake/build.sh) in an APK whose activity, HostActivity (java/), is a NativeActivity with the software keyboard's
-# input box, made as the Phase 0 probe APKs are (javac and d8 for classes.dex, aapt2 link, zip, zipalign, apksigner with the debug keystore; no Gradle). The APK carries no game files: run_app.sh pushes the modules, the RomFS and env.txt to the phone.
-# Usage: build_app.sh <GAME> [--gpu null|vkn] [build.sh options: --tests, --clean]    Output: dm/android/app/build/nxhost.apk (org.nxnative.host; build/ is not committed), nxhost-vkn.apk with --gpu vkn.
+# input box, made as the Phase 0 probe APKs are (javac and d8 for classes.dex, aapt2 compile and link, zip, zipalign, apksigner with the debug keystore; no Gradle). By itself it makes the development
+# APK, org.nxnative.host, which carries no game files: run_app.sh pushes the modules, the RomFS and env.txt to the phone. scripts/build_apk_from_nsp.py makes a game's APK with the options below.
+# Usage: build_app.sh <GAME> [--gpu null|vkn] [--manifest F] [--res DIR] [--assets DIR] [--out APK] [--version-code N] [--version-name S] [build.sh options: --tests, --clean]
+#   Output: dm/android/app/build/nxhost.apk (org.nxnative.host; build/ is not committed), nxhost-vkn.apk with --gpu vkn, or --out.
+#   --manifest F    the manifest to link instead of AndroidManifest.xml (a game's: its package, label and icon, made from AndroidManifest.xml by build_apk_from_nsp.py)
+#   --res DIR       Android resources (DIR/mipmap-*/, drawable-*/, values/: a game's icon), compiled with aapt2 compile --dir and linked in
+#   --assets DIR    DIR's files go into the APK under assets/ (deflated): a game's package, DIR/nx/ (front_android.c unpacks it at start)
+#   --version-code N, --version-name S   aapt2 link's (--replace-version: over the manifest's)
 # --gpu vkn: the Vulkan backend (build.sh --gpu vkn, dm/android/cmake/build-vkn), with libadrenotools and its hook libraries beside libdmhost.so (DM_VK_DRIVER=842 / turnip: vk_dev.c opens
 # them from its own directory), built as for the P0.7 probe (ADRENOTOOLS_BUILD, default ~/dm-work/android/src/libadrenotools-build), and VALIDATION_LAYER=<arm64 libVkLayer_khronos_validation.so>
 # (optional, Khronos' android-binaries release) in the same directory, where the system loader finds it for DM_VK_VALIDATION=1 with every driver, as dm/android/probe/shader/build.sh packages it.
@@ -15,10 +21,17 @@ BT=${APP_BUILD_TOOLS:-$ANDROID_HOME/build-tools/36.1.0}
 ANDROID_JAR=$ANDROID_HOME/platforms/android-36/android.jar
 KEYSTORE=${APP_KEYSTORE:-$HOME/.android/debug.keystore}
 die() { echo "error: $*" >&2; exit 1; }
-GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build_app.sh <GAME> [--gpu null|vkn] [build.sh options]"; shift
-GPU=null BARGS=()
-while [ $# -gt 0 ]; do case $1 in --gpu) GPU=${2:-}; shift 2 || die "--gpu takes null or vkn" ;; *) BARGS+=("$1"); shift ;; esac; done   # the rest go to build.sh (it refuses what it does not know)
+GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build_app.sh <GAME> [--gpu null|vkn] [--manifest F] [--res DIR] [--assets DIR] [--out APK] [--version-code N] [--version-name S] [build.sh options]"; shift
+GPU=null BARGS=() MANIFEST=$HERE/AndroidManifest.xml RES="" ASSETS="" OUTAPK="" VARGS=()
+need() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 takes a value"; }
+while [ $# -gt 0 ]; do case $1 in
+    --gpu) need "$@"; GPU=$2; shift 2 ;; --manifest) need "$@"; MANIFEST=$2; shift 2 ;; --res) need "$@"; RES=$2; shift 2 ;; --assets) need "$@"; ASSETS=$2; shift 2 ;;
+    --out) need "$@"; OUTAPK=$2; shift 2 ;; --version-code) need "$@"; VARGS+=(--version-code "$2"); shift 2 ;; --version-name) need "$@"; VARGS+=(--version-name "$2"); shift 2 ;;
+    *) BARGS+=("$1"); shift ;; esac; done   # the rest go to build.sh (it refuses what it does not know)
 case $GPU in null) LIB=$HERE/../cmake/build/libdmhost.so APKN=nxhost.apk ;; vkn) LIB=$HERE/../cmake/build-vkn/libdmhost.so APKN=nxhost-vkn.apk ;; *) die "--gpu takes null or vkn, not '$GPU'" ;; esac
+[ -f "$MANIFEST" ] || die "no manifest $MANIFEST"
+[ -z "$RES" ] || [ -d "$RES" ] || die "no resource directory $RES"
+[ -z "$ASSETS" ] || [ -d "$ASSETS" ] || die "no assets directory $ASSETS"
 for t in aapt2 zipalign apksigner; do [ -x "$BT/$t" ] || die "no $t in $BT"; done
 JAVAC=${JAVA_HOME:+$JAVA_HOME/bin/}javac
 "$JAVAC" -version >/dev/null 2>&1 || die "no working javac (set JAVA_HOME to a JDK 17 or later)"
@@ -31,7 +44,8 @@ if [ $GPU = vkn ]; then
     if [ -n "${VALIDATION_LAYER:-}" ]; then [ -f "$VALIDATION_LAYER" ] || die "missing $VALIDATION_LAYER"; EXTRA+=("$VALIDATION_LAYER"); fi
 fi
 "$HERE/../cmake/build.sh" "$GAME" --gpu $GPU ${BARGS[@]+"${BARGS[@]}"}
-OUT=$HERE/build; mkdir -p "$OUT"; W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+if [ -n "$OUTAPK" ]; then OUT=$(dirname "$OUTAPK"); APKN=$(basename "$OUTAPK"); else OUT=$HERE/build; fi
+mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd); W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/apk/lib/arm64-v8a"
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do cp "$e" "$W/apk/lib/arm64-v8a/"; done
 # Debug info stays in dm/android/cmake/build/libdmhost.so (symbolize crash offsets there); the APK's copy keeps its dynamic symbols, which dladdr names in crash dumps
@@ -47,9 +61,11 @@ mkdir -p "$W/classes" "$W/apk/dex"
 find "$HERE/java" -name '*.java' -exec "$JAVAC" -source 8 -target 8 -nowarn -Xlint:-options -encoding UTF-8 -bootclasspath "$ANDROID_JAR" -d "$W/classes" {} +
 find "$W/classes" -name '*.class' -exec "$BT/d8" --release --min-api 35 --lib "$ANDROID_JAR" --output "$W/apk/dex" {} +
 mv "$W/apk/dex/classes.dex" "$W/apk/classes.dex"; rmdir "$W/apk/dex"
-"$BT/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR"
-(cd "$W/apk" && zip -q -r "$W/base.apk" classes.dex lib)
+RZ=(); if [ -n "$RES" ]; then "$BT/aapt2" compile --dir "$RES" -o "$W/res.zip"; RZ=("$W/res.zip"); fi
+"$BT/aapt2" link -o "$W/base.apk" --manifest "$MANIFEST" -I "$ANDROID_JAR" ${VARGS[@]+--replace-version "${VARGS[@]}"} ${RZ[@]+"${RZ[@]}"}
+ZE=(classes.dex lib); if [ -n "$ASSETS" ]; then ln -s "$(cd "$ASSETS" && pwd)" "$W/apk/assets"; ZE+=(assets); fi   # zip follows the link: the files go in as assets/..., read where they are
+(cd "$W/apk" && zip -q -r "$W/base.apk" "${ZE[@]}")
 "$BT/zipalign" -f -P 16 4 "$W/base.apk" "$W/aligned.apk"   # 16 KB page alignment for uncompressed libraries, as the probes
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$OUT/$APKN" "$W/aligned.apk"
 rm -f "$OUT/$APKN.idsig"
-echo "built $OUT/$APKN (org.nxnative.host, game $GAME, GPU backend $GPU, $(du -h "$OUT/$APKN" | cut -f1)); lib/arm64-v8a: $(cd "$W/apk/lib/arm64-v8a" && ls | tr '\n' ' ')"
+echo "built $OUT/$APKN ($("$BT/aapt2" dump packagename "$OUT/$APKN" 2>/dev/null), game $GAME, GPU backend $GPU, $(du -h "$OUT/$APKN" | cut -f1)); lib/arm64-v8a: $(cd "$W/apk/lib/arm64-v8a" && ls | tr '\n' ' ')"
