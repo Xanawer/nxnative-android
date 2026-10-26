@@ -4,13 +4,13 @@
 #   --tests: also the unit tests that run on the phone (t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_sig_guard t_tex t_sha256)
 #   --gpu: the GPU backend (CMakeLists.txt GPU_BACKEND): null (the default) or vkn, the Vulkan backend, built in build-vkn/ so neither build reconfigures the other
 #   --clean: start from an empty build directory
-# Output: dm/android/cmake/build/dmhost and libdmhost.so (build-vkn/ with --gpu vkn) (arm64-v8a, android-35), the tests beside them. ANDROID_HOME / ANDROID_NDK_HOME override the SDK / NDK locations;
+# Output: dm/android/cmake/build/dmhost and libdmhost.so (build-vkn/ with --gpu vkn) (arm64-v8a, android-$DM_ANDROID_API, default 35), the tests beside them. ANDROID_HOME / ANDROID_NDK_HOME override the SDK / NDK locations;
 # cmake comes from PATH (Homebrew) or the SDK, ninja from PATH or the SDK's cmake; python3 from PATH runs the generators (game.py, gen_protos.py)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 NDK=${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/27.1.12297006}
-API=35
+API=${DM_ANDROID_API:-35}   # minSdk and the clang target (build_app.sh passes the manifest's minSdk)
 die() { echo "error: $*" >&2; exit 1; }
 GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build.sh <GAME> [--gpu null|vkn] [--tests] [--clean]"; shift
 TESTS=0 CLEAN=0 GPU=null
