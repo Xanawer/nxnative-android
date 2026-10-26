@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The Phase 1 app (docs/android/PLAN.md): libdmhost.so as a NativeActivity, no Java code (hasCode false). It carries no game files: run_app.sh pushes the modules, the RomFS and env.txt.
+<!-- The app (docs/android/PLAN.md): libdmhost.so in HostActivity, a NativeActivity whose one addition is the software keyboard's input box (java/, built into classes.dex by build_app.sh).
+     It carries no game files: run_app.sh pushes the modules, the RomFS and env.txt.
      allowNativeHeapPointerTagging false: host pointers handed to the guest keep a zero top byte (docs/android/probes-cpu.md P0.4). debuggable: run-as pushes the modules into the app's files.
      singleTask and every configuration change kept in the activity: the host runs once per process, and onDestroy ends the process (front_android.c) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.nxnative.host" android:versionCode="1" android:versionName="0.1">
     <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36"/>
-    <application android:label="nxnative" android:hasCode="false" android:debuggable="true" android:extractNativeLibs="true"
+    <application android:label="nxnative" android:hasCode="true" android:debuggable="true" android:extractNativeLibs="true"
                  android:allowNativeHeapPointerTagging="false" android:isGame="true" android:appCategory="game"
                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
-        <activity android:name="android.app.NativeActivity" android:exported="true" android:launchMode="singleTask" android:screenOrientation="sensorLandscape"
+        <activity android:name="org.nxnative.host.HostActivity" android:exported="true" android:launchMode="singleTask" android:screenOrientation="sensorLandscape"
                   android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|layoutDirection|colorMode|fontScale|fontWeightAdjustment">
             <meta-data android:name="android.app.lib_name" android:value="dmhost"/>
             <intent-filter>

@@ -20,7 +20,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 ADB=${ADB:-$ANDROID_HOME/platform-tools/adb}
-PKG=org.nxnative.host; ACT=$PKG/android.app.NativeActivity
+PKG=org.nxnative.host; ACT=$PKG/.HostActivity
 APK=${APP_APK:-}
 STAGE=/data/local/tmp/nxhost-app
 die() { echo "error: $*" >&2; exit 1; }

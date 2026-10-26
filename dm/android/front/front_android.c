@@ -1,7 +1,8 @@
-// Android app front end (front.h; docs/android/PLAN.md 1.6, 1.7): libdmhost.so as a NativeActivity with no Java code (dm/android/app). It does what the iOS app's main.m and front_ios.m do:
+// Android app front end (front.h; docs/android/PLAN.md 1.6, 1.7): libdmhost.so in a NativeActivity (dm/android/app; its one Java class, HostActivity, adds the software keyboard's input box).
+// It does what the iOS app's main.m and front_ios.m do:
 // the environment, the directories and the log are set before the host starts, dm_main runs on a big-stack thread, the activity's lifecycle drives focus, audio, the guest clock and graphics,
 // and the activity's input queue feeds player 1's controller path (dm_pad_set) and the keyboard path (dm_input_set). Every callback here runs on the activity's main (UI) thread; the host calls
-// it makes are lock-free (hle_hid.c) or take short host locks (hle_oe.c, hle_audio.c, hle_os.c), and no Java is called (JNI stays on host-owned threads, PLAN.md 1.6).
+// it makes are lock-free (hle_hid.c) or take short host locks (hle_oe.c, hle_audio.c, hle_os.c, the input box's), and no Java is called from them (JNI calls stay on host-owned threads, PLAN.md 1.6).
 // The window is recorded for the Vulkan backend (front_native_window, Phase 2), whose swapchain draws it; the null backend's build paints it black, as nothing else draws to it
 #include "dm.h"
 #include "hle.h"
@@ -15,7 +16,9 @@
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <android/window.h>
+#include <jni.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -34,10 +37,75 @@ void *front_metal_layer(void) { return NULL; }
 void *front_native_window(void) { return atomic_load(&g_win); }   // the activity's window, NULL while it has none (the Vulkan backend's surface, Phase 2)
 int front_screen_max_fps(void) { return 0; }        // not known yet (Phase 2: the display modes)
 void front_screen_match(int fps) { (void)fps; }
-// No text box yet (the system keyboard needs the Java IME, Phase 2): -1, which the software keyboard takes as a cancel, as with no window (front.h)
+// ---------- Text input box (front.h): HostActivity.showTextInput (dm/android/app/java), an AlertDialog the system keyboard types into ----------
+// The calling (guest) thread starts a host-owned thread for the JNI call (PLAN.md 1.6: ART cannot run on guest stacks), which attaches, asks for the box and detaches; then it waits for
+// nativeTextDone (tx_done), which the UI thread calls once the box is answered. One box at a time. Without HostActivity (an APK with no classes.dex) no box is shown: -1, taken as a cancel
+extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length (the applet keeps OK disabled until the text is long enough), -1 for none
+static void input_release(void);
+static jmethodID g_tx_show;    // HostActivity.showTextInput, set in onCreate (text_box_init)
+static pthread_mutex_t g_tx_one = PTHREAD_MUTEX_INITIALIZER, g_tx_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tx_cv = PTHREAD_COND_INITIALIZER;
+static int64_t g_tx_token; static int g_tx_state;   // the box asked for, and its answer under g_tx_mu: 0 none yet, 1 OK, 2 cancel
+static char *g_tx_out; static int g_tx_cap;
+typedef struct { const char *s[4]; int max, min; int64_t token; int ok; } tx_req;
+static void *tx_call(void *p) {
+    tx_req *q = p; JNIEnv *env; JavaVM *vm = g_act->vm;
+    if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) return NULL;
+    jbyteArray b[4] = { 0 }; int nb = 0;
+    for (; nb < 4; nb++) {   // a failed allocation leaves an exception pending: no other JNI call until it is cleared below
+        jsize n = (jsize)strlen(q->s[nb]);
+        if (!(b[nb] = (*env)->NewByteArray(env, n))) break;
+        (*env)->SetByteArrayRegion(env, b[nb], 0, n, (const jbyte *)q->s[nb]);
+    }
+    if (nb == 4) (*env)->CallVoidMethod(env, g_act->clazz, g_tx_show, (jlong)q->token, b[0], b[1], b[2], b[3], (jint)q->max, (jint)q->min);
+    q->ok = nb == 4 && !(*env)->ExceptionCheck(env);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+    for (int i = 0; i < 4; i++) if (b[i]) (*env)->DeleteLocalRef(env, b[i]);
+    (*vm)->DetachCurrentThread(vm);
+    return NULL;
+}
+static void JNICALL tx_done(JNIEnv *env, jclass c, jlong token, jboolean ok, jbyteArray text) {   // the UI thread
+    (void)c;
+    pthread_mutex_lock(&g_tx_mu);
+    if (token == g_tx_token && !g_tx_state) {
+        int len = ok && text ? (int)(*env)->GetArrayLength(env, text) : 0, n = len < g_tx_cap - 1 ? len : g_tx_cap - 1;
+        if (n > 0) (*env)->GetByteArrayRegion(env, text, 0, n + (n < len), (jbyte *)g_tx_out);   // one byte past a cut, to see where the cut falls
+        while (n > 0 && n < len && ((unsigned char)g_tx_out[n] & 0xC0) == 0x80) n--;   // cut short: at a character's start
+        g_tx_out[n] = 0;
+        g_tx_state = ok ? 1 : 2; pthread_cond_signal(&g_tx_cv);
+    }
+    pthread_mutex_unlock(&g_tx_mu);
+    // As the Mac box: the box took the keys and touches, so the game never saw the release of the press that opened it; nothing may stay pressed when it closes (onWindowFocusChanged also
+    // releases them as the box takes focus)
+    input_release();
+}
+static void text_box_init(ANativeActivity *act) {   // onCreate, the UI thread
+    JNIEnv *env = act->env; jclass c = (*env)->GetObjectClass(env, act->clazz);
+    jmethodID show = c ? (*env)->GetMethodID(env, c, "showTextInput", "(J[B[B[B[BII)V") : NULL;
+    JNINativeMethod m = { "nativeTextDone", "(JZ[B)V", (void *)tx_done };
+    if (show && !(*env)->ExceptionCheck(env) && !(*env)->RegisterNatives(env, c, &m, 1)) g_tx_show = show;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (c) (*env)->DeleteLocalRef(env, c);
+    if (!g_tx_show) fprintf(stderr, "boot: [RED] the activity has no HostActivity.showTextInput (an APK built without classes.dex): software keyboards are cancelled, no box is shown\n");
+}
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
-    (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap;
-    return -1;
+    if (!g_tx_show || !out || out_cap < 1) return -1;
+    char msg[1024]; snprintf(msg, sizeof msg, "%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : "");
+    pthread_mutex_lock(&g_tx_one);
+    pthread_mutex_lock(&g_tx_mu);
+    tx_req q = { { title ? title : "", msg, guide ? guide : "", initial ? initial : "" }, max_chars > 0 ? max_chars : 0, g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0, ++g_tx_token, 0 };
+    g_tx_state = 0; g_tx_out = out; g_tx_cap = out_cap;
+    pthread_mutex_unlock(&g_tx_mu);
+    pthread_t t; int r = -1;
+    LOG("front end: input box %lld asked for (title '%s', at most %d and at least %d characters; 0: no limit)", (long long)q.token, q.s[0], q.max, q.min);
+    if (!pthread_create(&t, NULL, tx_call, &q)) { pthread_join(t, NULL); r = q.ok ? 0 : -1; }
+    pthread_mutex_lock(&g_tx_mu);
+    if (r == 0) { while (!g_tx_state) pthread_cond_wait(&g_tx_cv, &g_tx_mu); r = g_tx_state == 1; }
+    else LOG("front end: [RED] the input box could not be shown (the JNI call failed): taken as a cancel");
+    g_tx_out = NULL; g_tx_cap = 0; g_tx_state = 2;   // a late answer to this box is ignored (tx_done checks the state)
+    pthread_mutex_unlock(&g_tx_mu);
+    pthread_mutex_unlock(&g_tx_one);
+    return r;
 }
 
 // ---------- Log: <files>/log.txt (the previous run's kept as log.prev.txt, as on iOS) and logcat, tag "dmhost" ----------
@@ -351,6 +419,7 @@ void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_si
     snprintf(g_ext, sizeof g_ext, "%s", act->externalDataPath ? act->externalDataPath : "");
     if (!*g_files) { __android_log_write(ANDROID_LOG_ERROR, "dmhost", "boot: [RED] no internal data path: the host does not start"); log_nowhere(); return; }
     if (!boot_env()) return;
+    text_box_init(act);
     g_input_log = getenv("DM_INPUT_LOG") && atoi(getenv("DM_INPUT_LOG"));   // log each key press with what reached the controller (the done-test's evidence)
     { const char *e = getenv("DM_STICK_DEADZONE"); char *end; float v = e ? strtof(e, &end) : 0;
       if (e && end != e && v >= 0.f && v <= 0.9f) g_dz = v; else if (e) fprintf(stderr, "boot: DM_STICK_DEADZONE=%s is not a fraction from 0 to 0.9: the dead zone stays %.2f\n", e, g_dz); }

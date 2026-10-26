@@ -59,7 +59,7 @@ Mario Wonder (16,270 shaders) comes after those. **Stardew Valley is the game on
 
 | Location | Contents |
 |---|---|
-| `dm/android/app/` | The APK. Phase 1: a NativeActivity with no Java code, built with `aapt2` / `zipalign` / `apksigner` like the probes (input through its `AInputQueue`, the window through `ANativeWindow`). Later: a Gradle project with the Kotlin launcher (from `launcher.json`), GameActivity and the IME, swapped in behind the same `front_android.c` |
+| `dm/android/app/` | The APK. Phase 1: a NativeActivity with no Java code, built with `aapt2` / `zipalign` / `apksigner` like the probes (input through its `AInputQueue`, the window through `ANativeWindow`). Phase 2: `HostActivity`, a NativeActivity subclass that adds the software keyboard's input box (`javac` and `d8` in `build_app.sh`). Later: a Gradle project with the Kotlin launcher (from `launcher.json`), GameActivity and the IME, swapped in behind the same `front_android.c` |
 | `dm/android/front/` | `front_android.c` (the `front.h` interface), input, IME, haptics, thermal (all JNI on host threads) |
 | `dm/android/probe/` | Phase 0 probes: an NDK executable and a minimal NativeActivity APK |
 | `dm/android/cmake/` | NDK build of the host: `dmhost` executable (adb loop) and `libdmhost.so` (app) |
@@ -433,6 +433,13 @@ Open after slice 2c:
   - Under load, vkn runs fall outside the Metal spread at f900–f1400 and inside it at f300, f600 and f1700. A 648 ms cold pipeline did it too.
   - Checked in one such run (f1200): the picture sits 32 px further along the pan than Metal's. With that offset removed, the sky matches Metal's to 3 levels, with the same colour steps.
   - So at those frames the pixel count measures timing, not rendering. A check there should align the pan first, or the shots should wait for the hle_os.c detclock fix.
+
+**Gameplay (2026-10-26):** the full route of the GPU measurement (title, character creation, the new-game load, the farmhouse, walking on the farm; about 13,500 frames with the key list of `stardew-surface.md`), on the slice 2c build.
+- **Clean runs:** 0 `[RED]`, 0 validation messages and no skipped draw (1.08 million on the phone, 1.18 million on the Mac) on KosmicKrisp, the system driver and 842.6, on a Galaxy Z Fold 7. 3 pipelines; the farm frames match the Metal reference's by eye.
+- **Frame time on the phone, farm, validation off (system driver):** p50 16.66 ms, p95 17.3 ms, max 20.6 ms; NVN submit and present 2.5 ms a frame; 127 draws a frame. With validation on, p95 is about 22 ms.
+- **Strategy B on the farm:** 39.9 pages a frame (160 KiB), as measured beforehand (40), at 0.29–0.38 ms of commit time on the phone. The hot set of `stardew-surface.md` is not needed for this game: the projected saving is under 0.3 ms a frame, and 60 fps holds without it.
+- **Edge-page textures on the Mac:** with 16 KB host pages, packaged textures that share a page with a neighbouring pool are never protected and are uploaded at every use: on the farm 4 a frame, 9.3 MB (8 such textures logged; the log names only the first 8). The phone, with 4 KB pages, has none. Mac-only, a development target: left as it is.
+- **Software keyboard:** the Android front end had no input box, so every keyboard (character creation's three) was cancelled at once, and a player could not name a character; the route ran only with `DM_KBD`. `HostActivity` (`dm/android/app/java`), a NativeActivity subclass, now shows an `AlertDialog` whose field the system keyboard types into, with OK disabled below the game's minimum length. `front_text_input` asks for it from a host-owned thread (JNI never runs on a guest stack) and waits for the answer. Checked on the phone: the box comes up at character creation, text typed into it reaches the game.
 
 ### 2.6 Pipelines
 - **Key:** today's `pso_skey` stores Metal pixel formats (`nvn_pso_skey.h:7`; filled from `pixelFormat` in `nvn_mtl.m`). Switch it to NVN formats, so that `pso_manifest.tsv` and `pso_user.tsv` work for both backends. This change could go upstream.
