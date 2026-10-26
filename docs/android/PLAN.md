@@ -176,6 +176,88 @@ On the guest–host ABI: Apple's arm64 ABI passes variadic arguments on the stac
   - the weak hooks `dm_thermal_now` (`AThermal`), `dm_low_power_now` and `dm_brightness_now` (`hle_nvn.c:1336-1340`).
 - **Called into the host:** `dm_touch_set`, `dm_pad_set`, `dm_focus_set`, `dm_audio_suspend`, `dm_gfx_suspend`, `dm_host_shutdown` (`front.h`, `dm_input.h:14-24`, `hle.h:51-58`).
 - **The touch gamepad:** `dm/ios/Sources/DmGamepad.m`, 450 lines, is rewritten as an overlay view.
+  - **As built (first slice):** `dm/android/app/java/org/nxnative/host/TouchPad.java`, with `HostActivity` and `front_android.c`'s input section.
+    - **Scope:** DmGamepad.m's 2D layout with its constants, hit tests and colours: ZL above L and ZR above R as teardrops, − and + at the top centre, the left stick bottom left, the A/B/X/Y diamond bottom right. A finger sliding across the diamond switches keys.
+    - **Unchanged from iOS:** adjacent diamond keys' hit circles do not meet (centres 70.7 u apart, each reaching 33.75 u), so a slide between two keys crosses a sliver where no key is pressed.
+  - **The probe (Fold 7, cover display):**
+    - A view added to the activity's own window is never drawn, because NativeActivity takes the surface. It still receives the touches the native input queue leaves unhandled: NativeActivity passes those on to the view hierarchy.
+    - A `TYPE_APPLICATION_PANEL` window attached to the activity's window, translucent with `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL`, draws over the Vulkan picture and receives the touches on it. Those touches never reach the native queue. The built panel adds `FLAG_SPLIT_TOUCH`.
+    - The activity's window keeps focus, so gamepad keys still reach the native queue.
+    - With the panel covering the whole window, the input box's dialog and the system keyboard draw above it; the sampled keyboard background is untinted. They also receive the touches in their area, and while the modal box is up the panel receives none.
+  - **The touch path: Java owns the touches.**
+    - The panel covers the activity's window. TouchPad hit-tests every touch, draws the controls, and after each touch event passes the whole touch state to native code in one call, `HostActivity.nativeTouchSet`. The state is the buttons, the left stick, and the fingers on the game as `(slot, x, y)`, normalized on the centred 16:9 picture.
+    - Why not native hit-testing: on iOS too the view receives every touch, so layout, hit tests and drawing stay in one place. Hit-testing in native code would still need the pressed keys and the knob position sent back to Java for drawing.
+    - The natives run on the UI thread, which is also the thread of the input queue's callbacks. They take no lock (only `dm_touch_set`'s short host lock) and call no Java.
+  - **The merge.** The touch controls go on the keyboard/touch path, as on iOS, where `publish()` calls `dm_input_set` (`DmGamepad.m:33-38`):
+    - `kbd_push` sends `dm_input_set(g_kbd | g_touch_btn, …)`. The left stick is WASD's while any of W, A, S or D is held, otherwise the touch stick's.
+    - The controller stays on player 1's controller path, `pad_push` → `dm_pad_set`. `DM_KEYS` steps write that path too, and each step ends with `dm_pad_set(0, …)` (`hle_hid.c` `keys_main`).
+    - The host merges the two paths when the game reads them (`hle_hid.c` `fill`): buttons ORed, each stick axis taken from whichever source is deflected more. A `DM_KEYS` step's release therefore never lets go of a held touch control.
+    - A touch state that has not changed is not pushed again.
+    - Fingers on no control go to `dm_touch_set`, which the host reports only in handheld mode.
+    - **Known limitation, shared with iOS:** a scripted touchscreen step replaces the whole touch set through `dm_touch_set`. That is a `DM_KEYS` `T<x>x<y>` step (`hle_hid.c:72-74`) or a `DM_CTL` drag (`hle_hid.c:148-153`), and it ends with `dm_touch_set(NULL, 0)`. A real finger held on the game is lifted until it moves, because `touch_set` pushes the fingers only when they change. iOS does the same (`DmGamepad.m:290` `pushGame`). Only scripted test input can cause it.
+    - **Known limitations with several devices** (controller keys belong to no device):
+      - Letting go of a button on one controller clears it while another controller still holds it (`front_android.c` `key_event`, `g_pad_keys`). This predates the touch gamepad.
+      - When the last controller goes, the controller path's keys are let go (`pad_removed`). That includes a keyboard's held arrow, because DPAD keys go on the controller path (`pad_key_bit`).
+  - **Release.** `input_release` (focus lost, pause, an answered box) zeroes the touch state and advances an epoch. TouchPad reads the epoch before each touch event, and leaves any finger that was already down untracked until it lifts.
+  - **Controller removal.** A controller removed mid-tilt sends no last motion. Two things let go of its sticks, hat and triggers: a joystick `ACTION_CANCEL` in `motion_event`, and `HostActivity.nativeControllerRemoved(id, last)` (`TouchPad.onInputDeviceRemoved`).
+    - The release is per device. `motion_event` records the device of the last controller motion, and only that device's removal lets go of the axes. Unplugging a mouse, a keyboard or an idle second controller leaves a stick held steady on the controller in use, which sends no new motion.
+    - When the last controller goes (the controls were hidden and no controller is left), its keys are let go too, as `DmGamepad.m` `padsChanged` does. Other removals keep the keys, so a keyboard's held arrow (a DPAD key, on the controller path) stays held.
+  - **Size and position.** They come from the panel itself, which matches the activity's window, and from its insets. The display cutout and the system bars are kept apart, and the controls are laid out again whenever either changes. One `u` is 1/430 of the window's height, at most 1.3 dp, as on iOS.
+    - `u` is also bounded by the room the safe area leaves, so that no hit region meets another and no control's shape lies in another's hit region, with about 10% to spare. iOS scales by height alone and never needs this: full screen in landscape, an iPhone is at least 764.83 u wide, and an iPad at the 1.3 cap is wider still. Without the bounds:
+      - a narrow multi-window window (320 × 600 dp gives u = 1.3 dp, 246 u wide) put + inside ZR's hit circle, which is tested first, and Y within the stick's grab;
+      - a short window with tall bars (640 × 220 dp, 32 dp and 48 dp insets, u = 0.51 dp) put X inside R's hit circle.
+    - **The bounds come from an offline sweep** (`~/dm-work/android/touch/touch_sweep.py`, outside the repo; it needs no game data). It reproduces `layout()` exactly: the constants, the insets, the bounds, the teardrop circles (× 1.35), the pills inflated by 8 u, the diamond's and the stick's grab circles and `faceAt`'s key circles (× 1.25). It also reproduces `begin()`'s resolver: locked keys first, then the smaller distance over grab radius.
+      - The visible shapes are the hulls of the teardrops with their tips, the pills, the key circles, and the stick's ring with the knob at its edge, all with the 1.5 dp stroke.
+      - For every layout it checks that (a) no two controls' hit regions meet, (b) no control's visible shape meets another control's hit region (nor a diamond key another key's), and (c) each control's visible centre resolves to that control, and no point on a visible outline resolves to another control.
+      - The grid: window sizes 100–1500 × 100–1100 dp in both orientations (every 20 dp at density 2.625, every 40 dp at densities 1 and 4).
+      - The inset combinations (50): no cutout, or a 39 dp or 80 dp cutout on the left or right; no navigation bar, or a 48 dp bar on the left, right or bottom, or a 15 dp gesture bar at the bottom; a 30 dp status bar or none.
+    - **What each pair needs**, from the sweep's derive mode (`u` unbounded, bisected up to the largest `u` that passes, on the 40 dp grid):
+      - between the bottom corners, `crt − cl`: 363.4 u (the stick's grab circle and its knob at the ring's edge against the diamond's grab circle);
+      - from the window's centre to each side of the safe area, `min(sr − w/2, w/2 − sl)`: 164.1 u (ZR's hit circle against the inflated + pill, ZL's against −);
+      - the safe area's height, `sb − st`: 330.5 u (L's hit circle above the stick's grab circle and knob).
+    - Hence `u ≤ (crt − cl) / 400`, `u ≤ min(sr − w/2, w/2 − sl) / 180` and `u ≤ (sb − st) / 365` (`K_CORNERS_W`, `K_HALF_W`, `K_SAFE_H`). `u` is the smallest of these, `h/430` and 1.3 dp.
+      - `cl`, `crt` and the safe area depend on the insets alone, so the spans are computed before `u`.
+      - No other pair limited `u` anywhere in the grid.
+    - **Minimum `u`: 0.6 dp.** Below it the controls hide and every touch goes to the game, as while a controller is connected; `DM_INPUT_LOG` says so. At 0.6 dp the face keys are 32 dp across with 40 dp hit circles, L and R are 29 dp across, and the pills' hit height is 26 dp. Smaller keys are hard to hit with a thumb without looking. iOS's smallest `u` is 0.87 pt (an iPhone SE), where its face keys are 47 pt across.
+    - **The sweep's result** with these constants (verify mode): 274,650 layouts, 82,618 hidden (`u` under 0.6 dp) and 192,032 shown. Every shown layout passes all three checks, at its `u` and at 1.09 × `u`.
+    - Resulting `u`:
+      - The cover display (2520 × 1080 px, cutout 102 px on either side) is unchanged at `h/430` = 2.51 px. The other bounds are 6.17 px (corners), 6.43 px (top row) and 2.85 px (height; 2.64 px while the status bar shows).
+      - The inner display in landscape (2184 × 1968 px, no side inset) stays at the 1.3 dp cap, 3.41 px.
+      - A 320 × 600 dp window gets 0.8 dp, from the corners. Its face keys are 43 dp across.
+      - A 640 × 220 dp window with 32 dp and 48 dp insets would get 0.38 dp, from the height, so its controls hide.
+    - The top controls keep clear of both insets.
+    - The bottom corners reach halfway into a side's cutout inset, as iOS's corners reach halfway into the side safe area. They never go under a side navigation bar: in landscape with 3-button navigation the bar has a Back key, and Back ends the game.
+    - − and + are centred on the window, not the safe area. A cutout insets one side only, so centring on the safe area would shift the pair between rotations 90 and 270.
+  - **Controllers** (`InputManager`): a non-virtual device whose sources contain the whole `SOURCE_GAMEPAD` or `SOURCE_JOYSTICK` value. Testing a single bit would match keyboards, which share the button class. While one is connected the controls hide and every touch goes to the game.
+  - **Back gesture.** The system's back gesture is excluded over the stick and the diamond, which reach the side edges. The exclusion is cleared while the controls are hidden.
+  - **Focus in multi-window.** The panel cannot take focus, and the system gives focus only to a window that can take keys. So in split-screen a tap on a panel covering the game would never bring focus back from the other app.
+    - While the activity lacks window focus, the panel is `FLAG_NOT_TOUCHABLE` (`TouchPad.focus`). The first tap then reaches the activity's window and focuses it; the native queue leaves that touch unhandled.
+    - When focus returns, the panel takes touches again.
+    - Checked on the phone: with the notification shade open, the panel's input config is `NOT_FOCUSABLE | NOT_TOUCHABLE`. Once the shade is closed it is back to `NOT_FOCUSABLE`, and the next ZR touch registers. The input-box keyboard route and the touch route match the build before the flag.
+  - **Logging.** `DM_INPUT_LOG=1` logs:
+    - the layout: each control's centre, plus the cutout and bar insets;
+    - whether the controls are shown or hidden, and whether the panel takes touches;
+    - touch-control changes, with the buttons on each path;
+    - touch-screen changes;
+    - controller-motion state changes, cancels and removals;
+    - focus changes and releases.
+    The test scripts read tap positions from the layout line.
+  - **Testing note.** `adb shell input tap` presses for about 1 ms, which the game's read misses, as with plain keyevents. Routes use `input swipe x y x y 150`.
+  - **Open items:**
+    - the 3D layout (D-pad, right stick, L3 / R3; Stardew Valley's profile asks for `pad_layout full`)
+    - Tap mode
+    - the layout button and the saved layout choice
+    - shaking the phone (`DM_BTN_SHAKE`)
+    - haptics (touch feedback)
+    - the controls' drop shadows
+    - Untested:
+      - hiding when a real controller connects (adb's gamepad keys come from a virtual device);
+      - the Fold's inner display, folding and unfolding, and rotation;
+      - multi-touch (adb cannot inject it);
+      - a real controller's removal mid-tilt (adb injects only a virtual joystick's motion and cancel);
+      - split-screen focus (adb can drive only the notification shade without touching other apps);
+      - the side navigation bar (the phone uses gesture navigation; the corners were checked by arithmetic on the layout code);
+      - a window other than the cover display's (the bounds were checked by the sweep); removing a device other than the controller in use, and a second controller's cancel.
 - **JNI threads.** Every JNI call is marshalled to a host-owned thread. HLE code runs on guest stacks, some as small as 8 KB (`hle_bigstack.c`), and ART cannot run there.
 
 ### 1.7 Paths and settings

@@ -1,4 +1,5 @@
-// The app's activity (dm/android/app, docs/android/PLAN.md 1.6): NativeActivity, which runs libdmhost.so (dm/android/front/front_android.c), plus the software keyboard's input box.
+// The app's activity (dm/android/app, docs/android/PLAN.md 1.6): NativeActivity, which runs libdmhost.so (dm/android/front/front_android.c), plus the software keyboard's input box and the
+// touch gamepad (TouchPad, a window of its own over this one).
 // front_text_input (front.h) calls showTextInput on a host-owned thread; the box is an AlertDialog with an EditText, so the system keyboard types into it as into any text field (its committed
 // text, composition and suggestions included), and its answer goes back through nativeTextDone, which front_android.c registers in onCreate. The box keeps OK disabled until the text reaches
 // the game's minimum length, as the Switch applet does (front_mac.m brings its box back instead). Built by build_app.sh (javac, d8) into the APK's classes.dex
@@ -86,5 +87,29 @@ public class HostActivity extends NativeActivity {
             public void afterTextChanged(Editable s) { okb.setEnabled(s.length() >= minChars); }
         });
         f.requestFocus();
+    }
+
+    // ---- The touch gamepad (TouchPad): a panel window over this one, made once the window is attached (its token) ----
+    // The natives front_android.c registers in onCreate (touch_init): the release count, the whole touch state after each touch event, TouchPad's log lines (DM_INPUT_LOG), and a device
+    // removed (the controller's sticks, hat and triggers let go)
+    static native int nativeTouchEpoch();
+    static native void nativeTouchSet(int buttons, int lx, int ly, float[] game, int n);
+    static native void nativeTouchLog(byte[] utf8);
+    static native void nativeControllerRemoved(int id, boolean last);
+    private TouchPad pad;
+
+    @Override public void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        if (pad == null) pad = TouchPad.attach(this);
+    }
+    // Focus lost (the input box, the notification shade, another app in multi-window) or paused: the native side has let go of everything (input_release), and the controls show nothing
+    // held; the panel lets touches through while the window lacks focus (TouchPad.focus)
+    @Override public void onWindowFocusChanged(boolean has) {
+        super.onWindowFocusChanged(has);
+        if (pad != null) pad.focus(has);
+    }
+    @Override protected void onPause() {
+        super.onPause();
+        if (pad != null) pad.release();
     }
 }
