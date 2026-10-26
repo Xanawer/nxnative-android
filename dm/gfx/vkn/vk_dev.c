@@ -218,12 +218,14 @@ int vkn_dev_init(void) {
     if (g_pkg_open && strcmp(act, g_req)) VLOG("[RED] driver: requested %s, but the system driver answered (%s): libadrenotools fell back to it silently", g_req, why);
 
     // Device: Vulkan 1.3's dynamic rendering and synchronization2, 1.2's timeline semaphores; the swapchain when there is a surface; portability subset where the driver has it (required then)
-    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
     vk.vkGetPhysicalDeviceFeatures2(vd.pd, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("[RED] the device lacks dynamic rendering, synchronization2 or timeline semaphores: nothing is drawn"); return 0; }
-    VkPhysicalDeviceVulkan12Features w12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, NULL}; w12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceVulkan11Features w11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, NULL};
+    VkPhysicalDeviceVulkan12Features w12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &w11}; w12.timelineSemaphore = VK_TRUE;
     // Buffer device addresses for the shadow buffers (PLAN.md 2.2 B: the address table gives one per pool); required by 1.3, so a driver without it is said and the shadows have none
     if (f12.bufferDeviceAddress) { w12.bufferDeviceAddress = VK_TRUE; vd.bda = 1; } else VLOG("[RED] the device has no bufferDeviceAddress (Vulkan 1.3 requires it): shadow buffers have no device address");
     VkPhysicalDeviceVulkan13Features w13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &w12}; w13.dynamicRendering = VK_TRUE; w13.synchronization2 = VK_TRUE;
@@ -232,16 +234,39 @@ int vkn_dev_init(void) {
     if (f2.features.samplerAnisotropy) { w2.features.samplerAnisotropy = VK_TRUE; vd.aniso = 1; }
     if (f12.samplerMirrorClampToEdge) { w12.samplerMirrorClampToEdge = VK_TRUE; vd.mirror = 1; }
     if (f12.samplerFilterMinmax) { w12.samplerFilterMinmax = VK_TRUE; vd.minmax = 1; }
+    // Draws (nvn_vk.c, PLAN.md 2.5 "As built, slice 2c"): depth clamp, independent blend, dual-source blend, depth-bias clamp and non-solid fill where the device has them (a draw that needs a missing one is said there)
+    if (f2.features.depthClamp) { w2.features.depthClamp = VK_TRUE; vd.depth_clamp = 1; }
+    if (f2.features.independentBlend) { w2.features.independentBlend = VK_TRUE; vd.indep_blend = 1; }
+    if (f2.features.dualSrcBlend) { w2.features.dualSrcBlend = VK_TRUE; vd.dual_src = 1; }
+    if (f2.features.depthBiasClamp) { w2.features.depthBiasClamp = VK_TRUE; vd.bias_clamp = 1; }
+    if (f2.features.fillModeNonSolid) { w2.features.fillModeNonSolid = VK_TRUE; vd.fill_ns = 1; }
+    // The shader capabilities slice 0's modules declare beyond core (ImageGatherExtended, DrawParameters), and InterpolationFunction, where the device has them: vk_shader.c refuses a module whose
+    // feature is off
+    if (f2.features.shaderImageGatherExtended) { w2.features.shaderImageGatherExtended = VK_TRUE; vd.gather_ext = 1; }
+    if (f2.features.sampleRateShading) { w2.features.sampleRateShading = VK_TRUE; vd.sample_rate = 1; }
+    if (f11.shaderDrawParameters) { w11.shaderDrawParameters = VK_TRUE; vd.draw_params = 1; }
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, de);
-    const char *dx[4]; uint32_t ndx = 0;
+    const char *dx[6]; uint32_t ndx = 0;
+    // The draw's resources go in one push-descriptor set (nvn_vk.c draw_desc); near = -w clips as NVN's default does with depth clip control's negativeOneToOne (mtl_set_depth_zero). Without
+    // either nothing is drawn (said once at the first draw)
+    if (has_ext(de, nde, "VK_KHR_push_descriptor")) {
+        dx[ndx++] = "VK_KHR_push_descriptor"; vd.push = 1;
+        VkPhysicalDevicePushDescriptorPropertiesKHR pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pp}; vk.vkGetPhysicalDeviceProperties2(vd.pd, &q2); vd.max_push = pp.maxPushDescriptors;
+    }
+    VkPhysicalDeviceDepthClipControlFeaturesEXT dcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    if (has_ext(de, nde, "VK_EXT_depth_clip_control")) {
+        VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dcc}; vk.vkGetPhysicalDeviceFeatures2(vd.pd, &q2);
+        if (dcc.depthClipControl) { dx[ndx++] = "VK_EXT_depth_clip_control"; dcc.pNext = w12.pNext; w12.pNext = &dcc; vd.clip_ctl = 1; }
+    }
     if (vd.surface_ext) { if (has_ext(de, nde, "VK_KHR_swapchain")) dx[ndx++] = "VK_KHR_swapchain"; else { VLOG("[RED] the device has no VK_KHR_swapchain: nothing is shown"); vd.surface_ext = NULL; } }
     // Portability subset (MoltenVK): what it lacks is invalid to use, so every feature it offers is enabled; nvn_vk.c avoids the uses whose feature is absent (samp_make, img_sview)
     vkn_portability_features pf = {VKN_STYPE_PORTABILITY_SUBSET_FEATURES, NULL};
     if (has_ext(de, nde, "VK_KHR_portability_subset")) {
         dx[ndx++] = "VK_KHR_portability_subset";
         VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pf}; vk.vkGetPhysicalDeviceFeatures2(vd.pd, &q2);
-        pf.pNext = NULL; w12.pNext = &pf;
+        pf.pNext = w12.pNext; w12.pNext = &pf;
         vd.port = 1; vd.port_bias = pf.samplerMipLodBias != 0; vd.port_swz = pf.imageViewFormatSwizzle != 0;
         VLOG("portability subset: on; samplerMipLodBias %d, imageViewFormatSwizzle %d, imageViewFormatReinterpretation %d, mutableComparisonSamplers %d, triangleFans %d, pointPolygons %d",
              vd.port_bias, vd.port_swz, (int)pf.imageViewFormatReinterpretation, (int)pf.mutableComparisonSamplers, (int)pf.triangleFans, (int)pf.pointPolygons);
@@ -255,5 +280,8 @@ int vkn_dev_init(void) {
     VKN_DEVICE(VKN_D)
 #undef VKN_D
     vk.vkGetDeviceQueue(vd.dev, vd.qfam, 0, &vd.q);
+    VLOG("draw features: push descriptors %d (max %u), depth clip control %d, depthClamp %d, independentBlend %d, dualSrcBlend %d, depthBiasClamp %d, fillModeNonSolid %d, shaderImageGatherExtended %d, "
+         "shaderDrawParameters %d, sampleRateShading %d; minUniformBufferOffsetAlignment %llu, maxUniformBufferRange %u", vd.push, vd.max_push, vd.clip_ctl, vd.depth_clamp, vd.indep_blend, vd.dual_src, vd.bias_clamp,
+         vd.fill_ns, vd.gather_ext, vd.draw_params, vd.sample_rate, (unsigned long long)vd.props.limits.minUniformBufferOffsetAlignment, vd.props.limits.maxUniformBufferRange);
     return 1;
 }

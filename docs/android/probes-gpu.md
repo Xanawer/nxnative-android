@@ -39,7 +39,9 @@ Probe P0.7 of [PLAN.md](PLAN.md), run on 2026-10-25. It decides the GPU memory s
 libadrenotools comes from github.com/bylaws/libadrenotools at commit 8fae8ce. It is cloned and built outside the repo:
 - clone: `~/dm-work/android/src/libadrenotools`
 - build: `~/dm-work/android/src/libadrenotools-build`
-- toolchain: SDK cmake 3.22.1 and Ninja, android-35, arm64-v8a, `c++_static`, `BUILD_SHARED_LIBS=ON`
+- toolchain: SDK cmake 3.22.1 and Ninja, android-35, arm64-v8a, `c++_static`, `BUILD_SHARED_LIBS=ON`, and `ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON`
+  - The last option makes the libraries 16 KB-aligned. Without it they are 4 KB-aligned: a phone with 16 KB pages cannot load them, and Android 17 shows a compatibility warning over a debuggable app that has them (found on a Galaxy Z Fold 7, 2026-10-26).
+  - `build_app.sh` refuses any library that is not 16 KB-aligned.
 
 `build.sh` puts `libadrenotools.so`, `libhook_impl.so`, `libmain_hook.so`, `libfile_redirect_hook.so` and `libgsl_alloc_hook.so` into the APK's `lib/arm64-v8a`. For the executable, it copies them beside it.
 

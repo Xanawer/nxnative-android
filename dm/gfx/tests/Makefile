@@ -112,8 +112,8 @@ t_stencil_view: t_stencil_view.m $(MTL_T_DEP)
 # The Vulkan backend (dm/gfx/vkn, #included) on a real device: KosmicKrisp with the validation layer, as Homebrew installs them (mesa, vulkan-loader, vulkan-validationlayers).
 # check_t_vkn is strict (T_VKN_STRICT=1: no device or validation off fails); make run's run_t_vkn is not: a machine with no Vulkan at all is said SKIPPED and passes
 VKN_ENV=DM_VK_VALIDATION=1 VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
-t_vkn: t_vkn.c $(wildcard ../vkn/*.c ../vkn/*.h) ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h ../../host/crash.c $(GFX_H)
-	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -o $@ t_vkn.c ../vkn/vk_dev.c ../vkn/vk_present.c ../vkn/nvn_fmt_vk.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../../host/crash.c
+t_vkn: t_vkn.c t_vkn_spv.h $(wildcard ../vkn/*.c ../vkn/*.h) ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h ../../host/crash.c $(GFX_H)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -o $@ t_vkn.c ../vkn/vk_dev.c ../vkn/vk_present.c ../vkn/vk_shader.c ../vkn/nvn_fmt_vk.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle.c ../nvn/nvn_dirty.c ../../host/crash.c
 .PHONY: check_t_vkn run_t_vkn
 check_t_vkn: t_vkn
 	T_VKN_STRICT=1 $(VKN_ENV) ./t_vkn

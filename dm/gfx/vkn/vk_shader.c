@@ -1,0 +1,378 @@
+// Shader modules of the draws (docs/android/PLAN.md 2.4, slice 2c): a program's NVN stages → slice 0's SPIR-V modules, as nvn_mtl.m maps them to metallibs (shmap_load, prog_get, shader_get).
+// The shader map (DM_NVN_SHMAP, else <DM_VK_SHADERS>/shader_map.tsv) names each key's stage; the module is <DM_VK_SHADERS>/<key>_b.json (dmsh_build_vk.py's reflection) beside <key>_b.spv (the
+// .spv.zst decompressed: a development-time directory, packaging is Phase 3's). Each module's resources are moved into the draws' one push-descriptor set (set 0): vertex bindings keep their
+// numbers, pixel bindings get 32 more (the DescriptorSet / Binding decorations are patched; nothing else of the module changes). A module that cannot be used as built (its status, chain, stage,
+// a binding kind or image type this slice does not bind, a descriptor array, a slot out of its range, decoration groups, a capability the device does not take, a size, SHA-256 or magic that does not
+// match, an entry point not of its stage) is refused, said once in red with why, and its draws are skipped. Only the decompressed <key>_b.spv is read.
+// Submit thread only (the replay), and the tests' main thread; modules are kept for the run
+#include "vkn.h"
+#include "../nvn/nvn_hmap.h"
+#include "../../host/dm.h"
+#include "../../host/plat/sha256.h"   // the vendored portable SHA-256 (header only; plat.h's stand-in for CommonCrypto on Linux): the module's spv_sha256
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// ---------- JSON: a small reader for the reflection files ----------
+enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ };
+typedef struct jv { int t, n; double num; char *s; struct jv *c; char **k; } jv;   // arrays and objects: n children c (objects: keys k)
+static const char *j_ws(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++; return p; }
+static const char *j_str(const char *p, char **out) {   // p after the opening quote; escapes kept to ASCII (\uXXXX outside it becomes '?')
+    size_t cap = 16, n = 0; char *s = malloc(cap);
+    if (!s) return NULL;
+    for (; *p && *p != '"'; p++) {
+        char c = *p;
+        if (c == '\\') {
+            c = *++p;
+            switch (c) { case 'n': c = '\n'; break; case 't': c = '\t'; break; case 'r': c = '\r'; break; case 'b': c = '\b'; break; case 'f': c = '\f'; break;
+                case 'u': { unsigned u = 0; for (int i = 0; i < 4; i++) { char h = *++p; if (!h) { free(s); return NULL; } u = u * 16 + (unsigned)(h <= '9' ? h - '0' : (h | 32) - 'a' + 10); } c = u < 128 ? (char)u : '?'; break; }
+                case 0: free(s); return NULL;
+                default: break; }
+        }
+        if (n + 2 > cap) { char *t = realloc(s, cap *= 2); if (!t) { free(s); return NULL; } s = t; }
+        s[n++] = c;
+    }
+    if (*p != '"') { free(s); return NULL; }
+    s[n] = 0; *out = s; return p + 1;
+}
+static void j_free(jv *v) {
+    if (v->t == J_STR) free(v->s);
+    if (v->t == J_ARR || v->t == J_OBJ) { for (int i = 0; i < v->n; i++) { j_free(&v->c[i]); if (v->k) free(v->k[i]); } free(v->c); free(v->k); }
+    memset(v, 0, sizeof *v);
+}
+static const char *j_val(const char *p, jv *o, int depth) {
+    memset(o, 0, sizeof *o); p = j_ws(p);
+    if (depth > 32) return NULL;
+    if (*p == '"') { o->t = J_STR; return j_str(p + 1, &o->s); }
+    if (*p == '{' || *p == '[') {
+        int obj = *p == '{'; char end = obj ? '}' : ']'; int cap = 0;
+        o->t = obj ? J_OBJ : J_ARR; p = j_ws(p + 1);
+        if (*p == end) return p + 1;
+        for (;;) {
+            if (o->n == cap) { cap = cap ? cap * 2 : 8; jv *c = realloc(o->c, (size_t)cap * sizeof *c); char **k = obj ? realloc(o->k, (size_t)cap * sizeof *k) : NULL;
+                               if (!c || (obj && !k)) { free(c ? c : o->c); o->c = NULL; free(k ? k : o->k); o->k = NULL; o->n = 0; return NULL; } o->c = c; if (obj) o->k = k; }
+            char *key = NULL;
+            if (obj) { p = j_ws(p); if (*p != '"' || !(p = j_str(p + 1, &key))) return NULL; p = j_ws(p); if (*p != ':') { free(key); return NULL; } p++; }
+            if (obj) o->k[o->n] = key;
+            p = j_val(p, &o->c[o->n], depth + 1); o->n++;
+            if (!p) return NULL;
+            p = j_ws(p);
+            if (*p == ',') { p++; continue; }
+            if (*p == end) return p + 1;
+            return NULL;
+        }
+    }
+    if (!strncmp(p, "true", 4)) { o->t = J_BOOL; o->num = 1; return p + 4; }
+    if (!strncmp(p, "false", 5)) { o->t = J_BOOL; return p + 5; }
+    if (!strncmp(p, "null", 4)) return p + 4;
+    char *e; o->num = strtod(p, &e); if (e == p) return NULL;
+    o->t = J_NUM; return e;
+}
+static const jv *j_get(const jv *o, const char *k) { if (o && o->t == J_OBJ) for (int i = 0; i < o->n; i++) if (!strcmp(o->k[i], k)) return &o->c[i]; return NULL; }
+static const char *j_s(const jv *o, const char *k) { const jv *v = j_get(o, k); return v && v->t == J_STR ? v->s : ""; }
+// A number as an integer: dflt where the key is absent or not a number (null); J_BAD where it is no integer within int's range (NaN, 1e300, 1.5: the reader takes strtod's forms), which every
+// caller's range check refuses (a field is never filled with a cut-down value)
+#define J_BAD LONG_MIN
+static long j_i(const jv *o, const char *k, long dflt) {
+    const jv *v = j_get(o, k);
+    if (!v || (v->t != J_NUM && v->t != J_BOOL)) return dflt;
+    return v->num >= INT_MIN && v->num <= INT_MAX && v->num == (double)(long)v->num ? (long)v->num : J_BAD;
+}
+
+// ---------- The shader map and the module directory ----------
+static nvn_hmap g_map = {.klen = 8};      // key → NVN stage + 1
+static nvn_hmap g_mods = {.klen = 8};     // key → vkn_shader, or REFUSED
+#define REFUSED ((void *)1)
+static const char *g_dir; static int g_init, g_dir_ok;
+static _Atomic uint64_t g_nload, g_nrefuse;   // modules loaded and refused: counted here (the submit thread), read by the statistics line of the present (draw_report) and mtl_create_stats
+static int hex8(const char *s, uint8_t k[8]) {
+    for (int i = 0; i < 16; i++) { char c = s[i]; int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; if (v < 0) return 0; if (i & 1) k[i >> 1] |= (uint8_t)v; else k[i >> 1] = (uint8_t)(v << 4); }
+    return s[16] == 0 || s[16] == '\t' || s[16] == '\n' || s[16] == '\r' || s[16] == '_';
+}
+static int stage_of(const char *s) {   // the map's stage names (nvn_mtl.m stage_of): NVN stage numbers
+    return !strcmp(s, "vertex") ? 0 : !strcmp(s, "pixel") ? 1 : !strcmp(s, "geometry") ? 2 : !strcmp(s, "hull") ? 3 : !strcmp(s, "domain") ? 4 : !strcmp(s, "compute") ? 5 : -1;
+}
+static char *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long z = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = z >= 0 ? malloc((size_t)z + 1) : NULL;
+    if (b && fread(b, 1, (size_t)z, f) != (size_t)z) { free(b); b = NULL; }
+    fclose(f); if (b) { b[z] = 0; if (n) *n = (size_t)z; }
+    return b;
+}
+static void map_text(const char *txt, const char *path) {
+    int n = 0;
+    for (const char *l = txt; l && *l; ) {
+        const char *e = strchr(l, '\n'); size_t len = e ? (size_t)(e - l) : strlen(l);
+        if (len && *l != '#' && strncmp(l, "package", 7)) {
+            char ln[512]; if (len >= sizeof ln) len = sizeof ln - 1;
+            memcpy(ln, l, len); ln[len] = 0;
+            char *c[5] = {0}; int nc = 0; for (char *q = ln, *t; nc < 5 && (t = strsep(&q, "\t")); ) c[nc++] = t;
+            uint8_t k[8];
+            if (nc > 3 && strlen(c[3]) >= 16 && hex8(c[3], k) && stage_of(c[2]) >= 0) { nvn_hm_put(&g_map, k, (void *)(uintptr_t)(stage_of(c[2]) + 1)); n++; }
+        }
+        l = e ? e + 1 : NULL;
+    }
+    VLOG("shader map %s: %d keys", path, n);
+}
+static void shaders_init(void) {
+    if (g_init) return;
+    g_init = 1;
+    g_dir = getenv("DM_VK_SHADERS");
+    const char *mp = getenv("DM_NVN_SHMAP"); char path[1024];
+    if (!mp && g_dir) { snprintf(path, sizeof path, "%s/shader_map.tsv", g_dir); mp = path; }
+    char *t = mp ? slurp(mp, NULL) : NULL;
+    if (!t) VLOG("[RED] no shader map (%s; DM_NVN_SHMAP or <DM_VK_SHADERS>/shader_map.tsv names it): nothing is drawn", mp ? mp : "none given");
+    else { map_text(t, mp); free(t); }
+    if (!g_dir) { VLOG("[RED] no shader module directory (DM_VK_SHADERS, slice 0's modules decompressed): nothing is drawn"); return; }
+    // The directory's stamp (inputs.tsv, as nvn_mtl.m's shmap_load reads it): the game it was built for
+    snprintf(path, sizeof path, "%s/inputs.tsv", g_dir);
+    char *st = slurp(path, NULL), game[64] = "", inputs[64] = "";
+    for (char *l = st, *e; l && *l; l = e ? e + 1 : NULL) { e = strchr(l, '\n'); if (e) *e = 0;
+        if (!strncmp(l, "game\t", 5)) snprintf(game, sizeof game, "%s", l + 5); else if (!strncmp(l, "inputs\t", 7)) snprintf(inputs, sizeof inputs, "%s", l + 7); }
+    free(st);
+    if (!*game) VLOG("[RED] shader modules %s: no stamp (inputs.tsv): the game they were built for is not known; used regardless", g_dir);
+    else if (strcmp(game, DM_GAME_ID)) { VLOG("[RED] shader modules %s were built for game %s, not " DM_GAME_ID ": nothing is drawn", g_dir, game); return; }
+    g_dir_ok = 1;
+    VLOG("shader modules: %s, chain %s, game %s, inputs %s (loaded at their first draw)", g_dir, VKN_CHAIN, *game ? game : "?", *inputs ? inputs : "?");
+}
+int vkn_shmap_stage(const uint8_t key[8]) { shaders_init(); uintptr_t v = (uintptr_t)nvn_hm_get(&g_map, key); return v ? (int)v - 1 : -1; }
+void vkn_shader_stats(uint64_t *loaded, uint64_t *refused) { *loaded = atomic_load_explicit(&g_nload, memory_order_relaxed); *refused = atomic_load_explicit(&g_nrefuse, memory_order_relaxed); }
+
+// ---------- A module: its reflection checked and kept, its SPIR-V's resources moved into the one set ----------
+// A component type as the reflection names it (dmsh_build_vk.py scalar(): float, uint or sint, with the bit width after it where that is not 32): 0 float, 1 uint, 2 sint. Every other name is
+// -1, the 16- and 64-bit ones (float16, uint16, sint64...) included: the formats, dummies and pair matching here are 32-bit, those types a later slice (the builder refuses them on interface
+// variables already); ct_no says so in the refusal
+static int ct_of(const char *t) { return !strcmp(t, "float") ? 0 : !strcmp(t, "uint") ? 1 : !strcmp(t, "sint") ? 2 : -1; }
+static const char *ct_no(int ct) { return ct < 0 ? ": not a 32-bit float, uint or sint (16- and 64-bit types are a later slice)" : ""; }
+static int img_kind(const jv *im, uint8_t *vt, uint8_t *comp, char *why, size_t wn) {
+    const char *dim = j_s(im, "dim"), *cp = j_s(im, "comp"); long arr = j_i(im, "arrayed", 0), ms = j_i(im, "ms", 0), dep = j_i(im, "depth", 0);
+    if (arr < 0 || arr > 1 || ms < 0 || ms > 1 || dep < 0 || dep > 2) { snprintf(why, wn, "image flags arrayed %ld ms %ld depth %ld", arr, ms, dep); return 0; }
+    if (ms) { snprintf(why, wn, "a multisampled image"); return 0; }
+    if (dep == 1) { snprintf(why, wn, "a depth-compare image"); return 0; }
+    if (!strcmp(dim, "2D")) *vt = arr ? VKN_VT_2D_ARRAY : VKN_VT_2D;
+    else if (!strcmp(dim, "Cube") && !arr) *vt = VKN_VT_CUBE;
+    else { snprintf(why, wn, "image dim %s%s", dim, arr ? " arrayed" : ""); return 0; }
+    int ct = ct_of(cp);
+    if (ct < 0) { snprintf(why, wn, "image component type %s%s", cp, ct_no(ct)); return 0; }
+    *comp = (uint8_t)ct;
+    return 1;
+}
+// The reflection's bindings and interface into sh; why: the first thing this slice does not handle
+static int refl_take(vkn_shader *sh, const jv *j, char *why, size_t wn) {
+    const jv *bs = j_get(j, "bindings"), *vi = j_get(j, "vertex_inputs"), *outs = j_get(j, "outputs"), *dr = j_get(j, "drv_reads"), *io = j_get(j, sh->stage == 0 ? "outputs" : "inputs");
+    if (bs && bs->t != J_ARR) { snprintf(why, wn, "bindings is not a list"); return 0; }
+    for (int i = 0; bs && i < bs->n; i++) {
+        const jv *b = &bs->c[i]; const char *kind = j_s(b, "kind"), *tn = j_s(b, "type_name"); long bi = j_i(b, "binding", -1), set = j_i(b, "set", -1), reg = j_i(b, "reg", -1);
+        long cnt = j_get(b, "count") ? j_i(b, "count", J_BAD) : 1;   // null (a runtime or specialization-sized array) is no count of 1
+        const jv *sm = j_get(b, "sampler"); long sreg = j_i(sm, "reg", -1);
+        if (bi == J_BAD || set == J_BAD || reg == J_BAD || sreg == J_BAD) { snprintf(why, wn, "binding %s: its binding, set or a slot is a number that is no integer of int's range", j_s(b, "name")); return 0; }
+        if (sh->nb == VKN_MAXB) { snprintf(why, wn, "more than %d bindings", VKN_MAXB); return 0; }
+        vkn_sbind *o = &sh->b[sh->nb];
+        memset(o, 0, sizeof *o);
+        if (bi < 0 || bi >= 32) { snprintf(why, wn, "binding %ld (%s) outside 0-31", bi, j_s(b, "name")); return 0; }
+        if (set != (sh->stage == 1 ? 1 : 0)) { snprintf(why, wn, "binding %ld in set %ld", bi, set); return 0; }
+        if (cnt != 1) { if (cnt == J_BAD) snprintf(why, wn, "binding %ld (%s) is an array (count null or not an integer)", bi, j_s(b, "name")); else snprintf(why, wn, "binding %ld (%s) is an array of %ld", bi, j_s(b, "name"), cnt); return 0; }
+        o->set = (uint8_t)set; o->orig = (uint16_t)bi; o->binding = (uint16_t)(bi + (sh->stage == 1 ? 32 : 0));
+        // Slots (reg) are range-checked as read, never cut to their field: a uniform slot 0-15, a texture or sampler slot 0-127, a sampler ID 0-65535; c1 and driver banks have none
+        if (!strcmp(kind, "cbuf") && !strcmp(tn, "UNIFORM_BUFFER")) { o->kind = VKN_B_UBO; if (reg < 0 || reg >= 16) { snprintf(why, wn, "uniform slot %ld", reg); return 0; } o->reg = (uint16_t)reg; }
+        else if (!strcmp(kind, "c1") && !strcmp(tn, "UNIFORM_BUFFER")) o->kind = VKN_B_C1;
+        else if (!strcmp(kind, "drvcb") && !strcmp(tn, "UNIFORM_BUFFER")) {   // a driver bank the shader reads nothing of (drv_reads empty): the zero buffer
+            if (dr && dr->t == J_OBJ && dr->n) { snprintf(why, wn, "driver bank reads (drv_reads) are a later slice"); return 0; }
+            o->kind = VKN_B_ZERO;
+        } else if (!strcmp(kind, "tex") && !strcmp(tn, "COMBINED_IMAGE_SAMPLER")) {
+            const char *sk = j_s(sm, "kind");
+            o->kind = VKN_B_TEX;
+            if (reg < 0 || reg >= 128) { snprintf(why, wn, "texture slot %ld (separate textures and images are a later slice)", reg); return 0; }
+            if (!strcmp(sk, "samp_tex")) { o->skind = VKN_S_TEX; if (sreg < 0 || sreg >= 128) { snprintf(why, wn, "sampler of texture slot %ld", sreg); return 0; } }
+            else if (!strcmp(sk, "samp")) { o->skind = VKN_S_SAMP; if (sreg < 0 || sreg >= 128) { snprintf(why, wn, "sampler slot %ld", sreg); return 0; } }
+            else if (!strcmp(sk, "samp_id")) { o->skind = VKN_S_ID; if (sreg < 0 || sreg > 0xffff) { snprintf(why, wn, "sampler ID %ld", sreg); return 0; } }
+            else { snprintf(why, wn, "sampler kind %s", *sk ? sk : "(none)"); return 0; }
+            o->reg = (uint16_t)reg; o->sreg = (uint16_t)sreg;
+            if (!img_kind(j_get(b, "image"), &o->vt, &o->comp, why, wn)) return 0;
+        } else { snprintf(why, wn, "binding kind %s (%s)", *kind ? kind : "?", tn); return 0; }
+        for (int k = 0; k < sh->nb; k++) if (sh->b[k].binding == o->binding) { snprintf(why, wn, "binding %ld twice", bi); return 0; }
+        sh->nb++;
+    }
+    if (sh->stage == 0) for (int i = 0; vi && vi->t == J_ARR && i < vi->n; i++) {
+        long loc = j_i(&vi->c[i], "location", -1), nc = j_i(&vi->c[i], "components", 4); int ct = ct_of(j_s(&vi->c[i], "type"));
+        if (loc < 0 || loc >= 16 || ct < 0 || nc < 1 || nc > 4 || sh->nin == 16) { snprintf(why, wn, "vertex input %ld (%s x%ld)%s", loc, j_s(&vi->c[i], "type"), nc, ct_no(ct)); return 0; }
+        sh->in[sh->nin].loc = (uint8_t)loc; sh->in[sh->nin].ct = (uint8_t)ct; sh->in[sh->nin++].n = (uint8_t)nc;
+    }
+    if (sh->stage == 1) for (int i = 0; outs && outs->t == J_ARR && i < outs->n; i++) {
+        long loc = j_i(&outs->c[i], "location", -1), nc = j_i(&outs->c[i], "components", 4); int ct = ct_of(j_s(&outs->c[i], "type"));
+        if (loc < 0 || loc >= 8 || ct < 0 || nc < 1 || nc > 4) { snprintf(why, wn, "pixel output %ld (%s x%ld)%s", loc, j_s(&outs->c[i], "type"), nc, ct_no(ct)); return 0; }
+        sh->out_mask |= 1u << loc; sh->out_ct[loc] = (uint8_t)ct; sh->out_n[loc] = (uint8_t)nc;
+    }
+    // The interface between the stages (nvn_vk.c lay_get matches a pair on it): a vertex shader's outputs, a pixel shader's inputs, each listed (an empty list is a list), one entry per location.
+    // An array variable's entries carry its first location and its lengths (array: {location, dims}, dmsh_build_vk.py io()): Vulkan matches variables, so a vec4[2] is not two vec4s
+    if (!io || io->t != J_ARR) { snprintf(why, wn, "its reflection lists no %s", sh->stage == 0 ? "vertex outputs" : "pixel inputs"); return 0; }
+    for (int i = 0; i < io->n; i++) {
+        const jv *e = &io->c[i], *ar = j_get(e, "array"), *dm = j_get(ar, "dims"); const char *side = sh->stage == 0 ? "vertex output" : "pixel input";
+        long loc = j_i(e, "location", -1), nc = j_i(e, "components", -1), first = ar ? j_i(ar, "location", -1) : loc, span = 1; int ct = ct_of(j_s(e, "type"));
+        if (loc < 0 || loc >= 32 || ct < 0 || nc < 1 || nc > 4 || (sh->io_mask >> loc & 1)) { snprintf(why, wn, "%s %ld (%s x%ld)%s", side, loc, j_s(e, "type"), nc, ct_no(ct)); return 0; }
+        if (ar) {   // an object; its first location 0 up to this one; 1-4 lengths, each an integer 1-32; this location within them
+            int ok = ar->t == J_OBJ && dm && dm->t == J_ARR && dm->n >= 1 && dm->n <= 4 && first >= 0 && first <= loc;
+            for (int d = 0; ok && d < dm->n; d++) { const jv *x = &dm->c[d]; ok = x->t == J_NUM && x->num >= 1 && x->num <= 32 && x->num == (double)(long)x->num; if (ok) { sh->io_dims[loc][d] = (uint8_t)x->num; span *= (long)x->num; } }
+            if (!ok || loc - first >= span) { snprintf(why, wn, "%s %ld: an array the reflection does not describe (its first location, 1-4 lengths of 1-32)", side, loc); return 0; }
+            sh->io_nd[loc] = (uint8_t)dm->n;
+        }
+        sh->io_mask |= 1u << loc; sh->io_ct[loc] = (uint8_t)ct; sh->io_n[loc] = (uint8_t)nc; sh->io_first[loc] = (uint8_t)first;
+    }
+    return 1;
+}
+// A SPIR-V capability the device takes: core Vulkan with no feature (the spec's SPIR-V capability table), or one vk_dev.c enabled (slice 0's modules declare ImageGatherExtended, and the vertex
+// ones DrawParameters, beyond core); others are a later slice
+static int cap_ok(uint32_t c) {
+    switch (c) {
+        case 0: case 1: case 43: case 44: case 46: case 47: case 50: case 51: return 1;   // Matrix, Shader, Sampled1D, Image1D, SampledBuffer, ImageBuffer, ImageQuery, DerivativeControl
+        case 52: return vd.sample_rate;     // InterpolationFunction: sampleRateShading
+        case 25: return vd.gather_ext;      // ImageGatherExtended: shaderImageGatherExtended
+        case 4427: return vd.draw_params;   // DrawParameters: shaderDrawParameters
+        default: return 0;
+    }
+}
+// A decorated resource (ids[0..n)) declared as an array (a pointer to OpTypeArray / OpTypeRuntimeArray): its id, 0 = none. The layout binds one descriptor a binding, whatever the
+// reflection's count says. The words up to OpFunction are well formed (spv_patch has walked them)
+static uint32_t spv_res_array(const uint32_t *w, size_t nw, const uint32_t *ids, int n) {
+    uint32_t bound = w[3], hit = 0; uint8_t *t = calloc(bound ? bound : 1, 1);   // 1: an array type, 2: a pointer to one
+    if (!t) die("vkn backend: SPIR-V scan allocation failed");
+    for (size_t i = 5; i < nw && !hit; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 54) break;
+        if ((op == 28 || op == 29) && wc >= 3 && w[i + 1] < bound) t[w[i + 1]] = 1;   // OpTypeArray / OpTypeRuntimeArray
+        if (op == 32 && wc >= 4 && w[i + 1] < bound && w[i + 3] < bound && t[w[i + 3]] == 1) t[w[i + 1]] = 2;   // OpTypePointer
+        if (op == 59 && wc >= 4 && w[i + 1] < bound && t[w[i + 1]] == 2) for (int k = 0; k < n; k++) if (ids[k] == w[i + 2]) hit = w[i + 2];   // OpVariable
+    }
+    free(t);
+    return hit;
+}
+// The resources' DescriptorSet decorations → 0 and pixel Binding decorations + 32. Every decorated resource must be one the reflection lists (else the layout would lack it), and no array; every
+// capability one the device takes; one entry point, main, of the reflection's stage (its execution model). The module's size and SHA-256, and the reflection's key, chain and stage, are mod_make's.
+// An Output variable decorated Index other than 0 (dual-source blending's second colour; the reflection does not tell its outputs' Index) sets sh->dual (nvn_vk.c: alpha to coverage off),
+// and a location only such outputs cover is not written (out_mask: its target keeps its content, where Vulkan would leave it undefined)
+static int spv_patch(uint32_t *w, size_t nw, vkn_shader *sh, char *why, size_t wn) {
+    enum { MAXID = 64 }; struct { uint32_t id; size_t set, bind; } d[MAXID]; uint32_t ids[MAXID], xi[8], lc[MAXID][2], pri = 0, sec = 0; int nd = 0, ne = 0, main_ = 0, nx = 0, nl = 0; uint32_t em = ~0u;
+    if (nw < 5 || w[0] != 0x07230203u) { snprintf(why, wn, "not SPIR-V (magic %#x)", nw ? w[0] : 0); return 0; }
+    if (w[3] > (1u << 22)) { snprintf(why, wn, "an id bound of %u", w[3]); return 0; }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) { snprintf(why, wn, "a malformed instruction at word %zu", i); return 0; }
+        if (op == 73 || op == 74 || op == 75) { snprintf(why, wn, "decoration groups"); return 0; }   // OpDecorationGroup / OpGroupDecorate / OpGroupMemberDecorate
+        if (op == 15 && wc >= 4) { const char *nm = (const char *)(const void *)&w[i + 3]; ne++; em = w[i + 1]; main_ = memchr(nm, 0, (wc - 3) * 4) && !strcmp(nm, "main"); }   // OpEntryPoint
+        if (op == 17 && wc >= 2 && !cap_ok(w[i + 1])) { snprintf(why, wn, "SPIR-V capability %u (its device feature is off, or a later slice)", w[i + 1]); return 0; }   // OpCapability
+        if (op == 71 && wc >= 4 && (w[i + 2] == 34 || w[i + 2] == 33)) {   // OpDecorate DescriptorSet / Binding
+            int k = 0; while (k < nd && d[k].id != w[i + 1]) k++;
+            if (k == nd) { if (nd == MAXID) { snprintf(why, wn, "more than %d resources", MAXID); return 0; } d[nd].id = w[i + 1]; d[nd].set = d[nd].bind = 0; nd++; }
+            if (w[i + 2] == 34) d[k].set = i + 3; else d[k].bind = i + 3;
+        }
+        if (op == 71 && wc >= 4 && w[i + 2] == 32 && w[i + 3]) { if (nx < 8) xi[nx++] = w[i + 1]; else sh->dual = 1; }   // OpDecorate Index, not 0 (past 8 of them: taken as dual-source)
+        if (op == 71 && wc >= 4 && w[i + 2] == 30 && nl < MAXID) { lc[nl][0] = w[i + 1]; lc[nl][1] = w[i + 3]; nl++; }   // OpDecorate Location
+        if (op == 59 && wc >= 4 && w[i + 3] == 3) {   // OpVariable, storage class Output (the decorations come first): Index 0 (or none) or not, at its location (a built-in has none)
+            int x = 0; for (int k = 0; k < nx; k++) x |= xi[k] == w[i + 2];
+            sh->dual |= x;
+            for (int k = 0; k < nl; k++) if (lc[k][0] == w[i + 2] && lc[k][1] < 8) { if (x) sec |= 1u << lc[k][1]; else pri |= 1u << lc[k][1]; }
+        }
+        if (op == 54) break;   // OpFunction: the decorations come before it
+        i += wc;
+    }
+    if (sh->stage == 1) sh->out_mask &= ~(sec & ~pri);
+    if (ne != 1 || !main_) { snprintf(why, wn, "%d entry points%s", ne, ne == 1 ? ", not main" : ""); return 0; }
+    if (em != (sh->stage == 0 ? 0u : 4u)) { snprintf(why, wn, "its entry point's execution model is %u, not the reflection's stage (%s)", em, sh->stage == 0 ? "vertex, 0" : "fragment, 4"); return 0; }
+    for (int k = 0; k < nd; k++) {
+        if (!d[k].set || !d[k].bind) { snprintf(why, wn, "resource %%%u lacks a set or binding", d[k].id); return 0; }
+        ids[k] = d[k].id;
+        uint32_t set = w[d[k].set], bi = w[d[k].bind]; int f = -1;
+        for (int b = 0; b < sh->nb; b++) if (sh->b[b].set == set && sh->b[b].orig == bi) f = b;
+        if (f < 0) { snprintf(why, wn, "resource %%%u (set %u binding %u) is not in the reflection", d[k].id, set, bi); return 0; }
+        w[d[k].set] = 0; w[d[k].bind] = sh->b[f].binding;
+    }
+    for (int b = 0; b < sh->nb; b++) { int f = 0; for (int k = 0; k < nd; k++) f |= w[d[k].bind] == sh->b[b].binding; if (!f) { snprintf(why, wn, "binding %u of the reflection is not in the module", sh->b[b].orig); return 0; } }
+    uint32_t a = spv_res_array(w, nw, ids, nd);
+    if (a) { snprintf(why, wn, "resource %%%u is an array (one descriptor a binding: arrays are a later slice)", a); return 0; }
+    return 1;
+}
+// c1 (bank 1, the shader's own constants): a host-visible buffer of the bytes the reflection carries
+static int c1_make(vkn_shader *sh, const char *hex, char *why, size_t wn) {
+    size_t n = strlen(hex) / 2; if (!n) { snprintf(why, wn, "a c1 binding without c1 bytes"); return 0; }
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (n + 15) & ~(size_t)15, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkMemoryRequirements mr; int mt; void *m;
+    if (vk.vkCreateBuffer(vd.dev, &bi, NULL, &sh->c1_buf)) { sh->c1_buf = VK_NULL_HANDLE; snprintf(why, wn, "its c1 buffer cannot be made"); return 0; }
+    vk.vkGetBufferMemoryRequirements(vd.dev, sh->c1_buf, &mr);
+    mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &sh->c1_mem) || vk.vkBindBufferMemory(vd.dev, sh->c1_buf, sh->c1_mem, 0) || vk.vkMapMemory(vd.dev, sh->c1_mem, 0, VK_WHOLE_SIZE, 0, &m)) {
+        snprintf(why, wn, "its c1 buffer's memory cannot be had"); return 0; }   // leaked with the refused module: once per module at most
+    memset(m, 0, (size_t)bi.size);
+    for (size_t i = 0; i < n; i++) { unsigned v = 0; sscanf(hex + 2 * i, "%2x", &v); ((uint8_t *)m)[i] = (uint8_t)v; }
+    vk.vkUnmapMemory(vd.dev, sh->c1_mem);
+    sh->c1_n = (uint32_t)bi.size;
+    return 1;
+}
+static uint32_t g_shid;
+// The SPIR-V's SHA-256 against the reflection's spv_sha256: its first 8 bytes, 16 lowercase hex digits (dmsh_build_vk.py: of the decompressed module)
+static int sha_ok(const void *spv, size_t n, const char *want) {
+    uint8_t d[32]; char hx[17];
+    if (strlen(want) != 16) return 0;
+    dm_sha256(spv, n, d); for (int i = 0; i < 8; i++) snprintf(hx + 2 * i, 3, "%02x", d[i]);
+    return !strcmp(hx, want);
+}
+// A module from its reflection text and SPIR-V (words, patched in place). NULL = refused (said once, with why)
+static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, uint32_t *spv, size_t nbytes, int zst) {
+    char hk[17], why[256] = ""; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]);
+    vkn_shader *sh = calloc(1, sizeof *sh); jv j; memset(&j, 0, sizeof j);
+    if (!sh) die("vkn backend: shader entry allocation failed");
+    memcpy(sh->key, hk, 17); sh->stage = stage;
+    char want[24]; snprintf(want, sizeof want, "%s_b", hk);
+    const char *e = json ? j_val(json, &j, 0) : NULL;
+    if (!e || j.t != J_OBJ) snprintf(why, sizeof why, "its reflection cannot be read");
+    else if (strcmp(j_s(&j, "status"), "ok")) snprintf(why, sizeof why, "status %s (%s)", j_s(&j, "status"), j_get(&j, "unsupported") && j_get(&j, "unsupported")->n ? "unsupported features" : "see the build");
+    else if (strcmp(j_s(&j, "chain"), VKN_CHAIN)) snprintf(why, sizeof why, "chain %s, this host takes %s", j_s(&j, "chain"), VKN_CHAIN);
+    else if (strcmp(j_s(&j, "key"), want) || strcmp(j_s(&j, "dm_ctl"), hk)) snprintf(why, sizeof why, "its reflection is of %s", j_s(&j, "key"));
+    else if (strcmp(j_s(&j, "stage"), stage == 0 ? "vs" : stage == 1 ? "ps" : "?")) snprintf(why, sizeof why, "stage %s, the map says %d", j_s(&j, "stage"), stage);
+    else if (strcmp(j_s(&j, "entry"), "main")) snprintf(why, sizeof why, "entry point %s", j_s(&j, "entry"));
+    else if (!spv) snprintf(why, sizeof why, "no SPIR-V (%s_b.spv%s)", hk, zst ? ": only its .spv.zst is there, and the directory takes the modules decompressed" : "");
+    else if ((long)nbytes != j_i(&j, "spv_bytes", -1) || nbytes % 4) snprintf(why, sizeof why, "SPIR-V of %zu bytes, the reflection says %ld", nbytes, j_i(&j, "spv_bytes", -1));
+    else if (!sha_ok(spv, nbytes, j_s(&j, "spv_sha256"))) snprintf(why, sizeof why, "its SPIR-V's SHA-256 is not the reflection's spv_sha256 (%.20s)", *j_s(&j, "spv_sha256") ? j_s(&j, "spv_sha256") : "none");   // before the patch rewrites it
+    else if (refl_take(sh, &j, why, sizeof why) && spv_patch(spv, nbytes / 4, sh, why, sizeof why)) {
+        for (int b = 0; b < sh->nb && !*why; b++) if (sh->b[b].kind == VKN_B_C1 && !sh->c1_buf) c1_make(sh, j_s(&j, "c1"), why, sizeof why);
+        if (!*why) {
+            VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nbytes, spv};
+            VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->mod);
+            if (r) snprintf(why, sizeof why, "vkCreateShaderModule: %d", r);
+        }
+    }
+    j_free(&j);
+    if (*why) { VLOG("[RED] shader %s (%s) refused: %s: its draws are skipped", hk, stage == 0 ? "vertex" : stage == 1 ? "pixel" : "other", why); atomic_fetch_add_explicit(&g_nrefuse, 1, memory_order_relaxed); free(sh); return NULL; }
+    sh->id = ++g_shid; atomic_fetch_add_explicit(&g_nload, 1, memory_order_relaxed);
+    return sh;
+}
+vkn_shader *vkn_shader_get(const uint8_t key[8], int stage) {
+    shaders_init();
+    void *v = nvn_hm_get(&g_mods, key);
+    if (v) return v == REFUSED ? NULL : v;
+    vkn_shader *sh = NULL;
+    if (stage != 0 && stage != 1) { char hk[17]; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]); VLOG("[RED] shader %s: NVN stage %d (geometry, tessellation and compute are a later slice): its draws are skipped", hk, stage); }
+    else if (g_dir_ok) {
+        char hk[17], p[1024]; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]);
+        snprintf(p, sizeof p, "%s/%s_b.json", g_dir, hk); char *json = slurp(p, NULL); size_t n = 0;
+        snprintf(p, sizeof p, "%s/%s_b.spv", g_dir, hk); char *spv = slurp(p, &n);
+        if (!json) VLOG("[RED] shader %s: %s/%s_b.json cannot be read: its draws are skipped", hk, g_dir, hk);
+        else { int zst = 0; if (!spv) { snprintf(p, sizeof p, "%s/%s_b.spv.zst", g_dir, hk); zst = !access(p, R_OK); }
+               sh = mod_make(key, stage, json, (uint32_t *)(void *)spv, spv ? n : 0, zst); }
+        free(json); free(spv);
+    }
+    nvn_hm_put(&g_mods, key, sh ? (void *)sh : REFUSED);
+    return sh;
+}
+// The tests' modules (t_vkn.c): a map entry and a module from memory, as if read from the directory
+vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes) {
+    shaders_init();
+    nvn_hm_put(&g_map, key, (void *)(uintptr_t)(stage + 1));
+    uint32_t *w = malloc(nbytes ? nbytes : 4); if (!w) die("vkn backend: SPIR-V copy allocation failed");
+    memcpy(w, spv, nbytes);
+    vkn_shader *sh = mod_make(key, stage, json, w, nbytes, 0); free(w);
+    nvn_hm_put(&g_mods, key, sh ? (void *)sh : REFUSED);
+    return sh;
+}

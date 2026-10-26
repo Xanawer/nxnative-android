@@ -34,6 +34,11 @@ mkdir -p "$W/apk/lib/arm64-v8a"
 for e in ${EXTRA[@]+"${EXTRA[@]}"}; do cp "$e" "$W/apk/lib/arm64-v8a/"; done
 # Debug info stays in dm/android/cmake/build/libdmhost.so (symbolize crash offsets there); the APK's copy keeps its dynamic symbols, which dladdr names in crash dumps
 "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" --strip-debug -o "$W/apk/lib/arm64-v8a/libdmhost.so" "$LIB"
+# Every library 16 KB-aligned: a phone with 16 KB pages cannot load one that is not, and Android 17 shows a warning over a debuggable app with one (libadrenotools: docs/android/probes-gpu.md)
+for so in "$W"/apk/lib/arm64-v8a/*.so; do
+    al=$("$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf" -lW "$so" | awk '$1 == "LOAD" { print $NF }' | while read -r h; do echo $((h)); done | sort -n | head -1)
+    [ "${al:-0}" -ge 16384 ] || die "$(basename "$so") has a LOAD segment aligned to $al bytes, not 16 KB (build it with -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON or -Wl,-z,max-page-size=16384)"
+done
 "$BT/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR"
 (cd "$W/apk" && zip -q -r "$W/base.apk" lib)
 "$BT/zipalign" -f -P 16 4 "$W/base.apk" "$W/aligned.apk"   # 16 KB page alignment for uncompressed libraries, as the probes

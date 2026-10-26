@@ -4,8 +4,9 @@
 // value per submit and a completion thread that performs NVN's completion effects (event values, counter reports, then the done fence: nvn_mtl.m's completion handlers), and the present of the
 // window texture (vk_present.c), and memory strategy B (PLAN.md 2.2 "As built, slice 2a"): the pool pages the GPU reads as buffers are copied into shadow VkBuffers at each submission, kept current
 // by nvn_dirty.c's write protection, and sampled textures and samplers (PLAN.md 2.3 "As built, slice 2b"): the textures the replay's binds name get host images, uploaded from guest memory (CPU
-// deswizzle into the same staging, copied by the same upload command buffer) and uploaded again when the guest writes them, and the samplers they name get VkSamplers. As the null backend: draws
-// are counted no-ops, buffer copies / fills / uniform updates run on the CPU at replay, texture reads come from guest memory. The ordering convention of nvn_mtl.h holds: a submission's event
+// deswizzle into the same staging, copied by the same upload command buffer) and uploaded again when the guest writes them, and the samplers they name get VkSamplers, and draws (PLAN.md 2.5
+// "As built, slice 2c"): indexed draws with slice 0's SPIR-V modules, one push-descriptor set and monolithic pipelines; other draw kinds are said in red and skipped. As the null backend: buffer
+// copies / fills / uniform updates run on the CPU at replay, texture reads come from guest memory. The ordering convention of nvn_mtl.h holds: a submission's event
 // values and counter records are written before its fence counts as done, and waits look only at that.
 // No Vulkan device (no library, no 1.3 driver): everything runs as the null backend does, said in red
 #include "vkn.h"
@@ -75,7 +76,9 @@ static uintptr_t g_pgsz, g_sh;              // the host page (4 KB on Android, 1
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // kind 1 event, 2 counter report
 #define NSUB 4
 // up: B's uploads into the shadows, submitted ahead of cb (b_commit); stg: the slot's staging buffer for them, host-visible and mapped, reused once the slot's last submission has completed
-typedef struct { VkCommandPool pool; VkCommandBuffer cb, up; uint64_t value; int failed; post_op *post; int npost, postcap; VkBuffer stg; VkDeviceMemory stg_mem; void *stg_map; uint64_t stg_cap; int stg_coh; } sub_slot;
+// ring: the uniform bytes of bindings at an address the device cannot bind (an offset not a multiple of minUniformBufferOffsetAlignment), copied at the draw (draw_ubo), host-visible and coherent
+typedef struct { VkCommandPool pool; VkCommandBuffer cb, up; uint64_t value; int failed; post_op *post; int npost, postcap; VkBuffer stg; VkDeviceMemory stg_mem; void *stg_map; uint64_t stg_cap; int stg_coh;
+                 VkBuffer ring; VkDeviceMemory ring_mem; uint8_t *ring_map; uint64_t ring_used; int ring_no; } sub_slot;
 static sub_slot g_sub[NSUB];
 static sub_slot *g_cur;                    // the submission being replayed (submit thread: hle_nvn.c serializes submissions, g_sub_mu)
 static uint64_t g_nbegun, g_ncommit, g_ncomp;   // submissions begun (submit thread), handed to the completion thread and completed (both under g_mu)
@@ -88,8 +91,10 @@ static _Atomic uint64_t g_stat_pass, g_stat_fold, g_stat_clr_mid, g_stat_bar, g_
 // and no command pool is reset (mtl_sub_begin: every later submission is failed). A leak after a broken GPU, never a use after free
 static _Atomic int g_leak;
 
+static void state_reset(void); static void draw_init(void);
 static void vkn_hello(void) {
-    NLOG("Vulkan GPU backend (dm/gfx/vkn): render targets, clears, barriers, submission and present are real, buffer memory the GPU reads is kept in shadow buffers (strategy B), and bound textures and samplers get host images (uploaded from guest memory) and VkSamplers; draws are counted only; buffer copies, fills and uniform updates run on the CPU; texture reads come from guest memory");
+    NLOG("Vulkan GPU backend (dm/gfx/vkn): render targets, clears, barriers, submission and present are real, buffer memory the GPU reads is kept in shadow buffers (strategy B), bound textures and samplers get host images (uploaded from guest memory) and VkSamplers, and draws are drawn with slice 0's SPIR-V shaders (DM_VK_SHADERS); buffer copies, fills and uniform updates run on the CPU; texture reads come from guest memory");
+    state_reset();
     const char *e = getenv("DM_NVN_NULL_EVERY"); g_every = e ? strtoull(e, NULL, 10) : 0;   // the null backend's surface lines, every <n> presents too
     shot_parse();
     g_pgsz = (uintptr_t)getpagesize(); g_sh = (uintptr_t)__builtin_ctzl(g_pgsz);
@@ -106,6 +111,7 @@ static void vkn_hello(void) {
     }
     pthread_t t; if (pthread_create(&t, NULL, comp_main, NULL)) { NLOG("[RED] the completion thread cannot start: running as the null backend does"); return; }
     pthread_detach(t);
+    draw_init();   // the draws' dummies (none: nothing is drawn, said)
     g_vk = 1;
 }
 void mtl_init(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, vkn_hello); }
@@ -302,6 +308,16 @@ static int stg_ensure(sub_slot *s, uint64_t n) {   // the slot's staging buffer 
     return 1;
 }
 static int b_protectable(uint8_t f) { return (f & PF_BUF) && !(f & (PF_CMD | PF_ALW)); }   // a tracked page the commit protects (b_commit's drain), due or not
+// A pool's nvn_dirty range, found before any protect (mtl_pool_del keys on it): every place that takes it comes here (under g_pmu). NULL: none yet (hle_nvn.c adds it just after mtl_pool_add, so a
+// commit can come between) or the tracker's table is full; the pool is copied every time meanwhile. Found now: its buffer pages were copied with no protection and the fresh range's generations
+// say nothing of the writes since (0 <= g_bstamp), so every one is taken as read for the first time (NEW): picked, protected by the drain, then copied at the next commit's scan (slice 2c's fix
+// of a write lost in that gap). Whichever finds it first marks them: b_commit's buffer pass, or a texture's upload in the same commit (tex_prep_all), which finds it first when the range is
+// added on another thread between the two
+static const void *pool_span(pool_ent *e) {
+    if (e->span || !(e->span = nvn_dirty_span((const void *)e->lo, e->hi - e->lo)) || !e->pf) return e->span;
+    for (uintptr_t i = 0, np = (e->hi - e->lo) >> g_sh; i < np; i++) if (e->pf[i] & PF_BUF) e->pf[i] |= PF_NEW;
+    return e->span;
+}
 // Texture jobs (the replay's tex_ready, at an image's first use in the submission): what the upload command buffer does to it ahead of the submission, which starts from its layout then. Kinds:
 // an upload from guest memory (the first, again after a guest write, again because it is never protected), a zero fill (never written, nvn_mtl.m tex_zero_fill), the one-time fill from its
 // storage's initial content (TJ_INIT: nvn_mtl.m tex_init_fill, no write tracking), or only the layout change to shader-read. An upload that cannot be made (no pool, no staging, no deswizzle:
@@ -344,8 +360,8 @@ static int b_commit(sub_slot *s, uint64_t v) {
     g_nup = 0;
     for (int k = 0; k < g_npool; k++) {
         pool_ent *e = &g_pools[k]; if (!e->sh || !e->pf) continue;
-        if (!e->span) e->span = nvn_dirty_span((const void *)e->lo, e->hi - e->lo);   // before any protect (mtl_pool_del); NULL: untracked (the tracker's table is full), copied every time
         uintptr_t np = (e->hi - e->lo) >> g_sh;
+        pool_span(e);   // the range, found before any protect; found now: every buffer page NEW (pool_span)
         for (uintptr_t i = 0; i < np; i++) {
             uint8_t f = e->pf[i]; if (!(f & PF_BUF)) continue;
             int fixed = (f & (PF_CMD | PF_ALW)) || !e->span; trk++; alw += fixed;
@@ -619,6 +635,7 @@ static struct {
     int clear_c[8], clear_d, clear_s; VkClearColorValue cc[8]; float cd; uint32_t cs;
     int has_sc; p_scissor sc;
     int on; VkExtent2D area; int att_c[8], att_ds;   // a pass is open (vkCmdBeginRendering), its area and what it attached (vkCmdClearAttachments names those only)
+    uint32_t nc; int hd, hs; VkFormat cf[8], dsf;   // the open pass's colour attachment count and formats (UNDEFINED where none), its depth / stencil (a pipeline must name the same: draw_pso)
 } R;
 static uint64_t g_sub_id;                          // this submission (vkn_img.rec_sub)
 static vkn_img **g_touch; static int g_ntouch, g_touchcap;   // images whose layout this submission tracks (published at commit)
@@ -688,8 +705,8 @@ static int rp_begin(int clear_only) {
     if (!R.has_rt) { NRED_ONCE("a draw or clear with no render target set: skipped"); clears_reset(); return 0; }
     VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkExtent2D ex[9]; VkImageMemoryBarrier2 b[9]; uint32_t nb = 0, nc = 0, w = UINT32_MAX, h = UINT32_MAX; int any = 0, has_d = 0, has_s = 0;
-    for (int i = 0; i < 8; i++) { ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; R.att_c[i] = 0; }
-    R.att_ds = 0;
+    for (int i = 0; i < 8; i++) { ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; R.att_c[i] = 0; R.cf[i] = VK_FORMAT_UNDEFINED; }
+    R.att_ds = 0; R.dsf = VK_FORMAT_UNDEFINED;
     pthread_mutex_lock(&vkn_tmu);   // views are made under it (the present thread makes its own on the same images)
     for (int i = 0; i < R.n; i++) {
         vkn_img *e = R.ce[i]; VkImageView v;
@@ -697,7 +714,7 @@ static int rp_begin(int clear_only) {
         ca[i].imageView = v; ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca[i].loadOp = R.clear_c[i] ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE; ca[i].clearValue.color = R.cc[i];
         ex[i] = lv_ext(e, R.clv[i]); if (ex[i].width < w) w = ex[i].width; if (ex[i].height < h) h = ex[i].height;
-        att_barrier(&b[nb++], e); nc = (uint32_t)i + 1; any = 1; R.att_c[i] = 1;
+        att_barrier(&b[nb++], e); nc = (uint32_t)i + 1; any = 1; R.att_c[i] = 1; R.cf[i] = e->fmt;
         if (R.clear_c[i]) { memcpy(e->clear, R.cc[i].float32, sizeof e->clear); e->cleared = 1; g_stat_fold++; }
     }
     vkn_img *de = R.de; VkImageView dv = VK_NULL_HANDLE;
@@ -708,7 +725,7 @@ static int rp_begin(int clear_only) {
         if (de->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { has_s = 1; sa.imageView = dv; sa.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; sa.loadOp = R.clear_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
                                                         sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE; sa.clearValue = cv; g_stat_fold += R.clear_s; }
         ex[8] = lv_ext(de, R.dlv); if (ex[8].width < w) w = ex[8].width; if (ex[8].height < h) h = ex[8].height;
-        att_barrier(&b[nb++], de); any = 1; R.att_ds = 1;
+        att_barrier(&b[nb++], de); any = 1; R.att_ds = 1; R.dsf = de->fmt;
     }
     pthread_mutex_unlock(&vkn_tmu);
     clears_reset();
@@ -732,7 +749,7 @@ static int rp_begin(int clear_only) {
     if (own) mem_barrier(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                          VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-    R.area = (VkExtent2D){w, h};
+    R.area = (VkExtent2D){w, h}; R.nc = nc; R.hd = has_d; R.hs = has_s;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, R.area}, 1, 0, nc, ca, has_d ? &da : NULL, has_s ? &sa : NULL};
     vk.vkCmdBeginRendering(cb, &ri);
     R.on = 1; g_stat_pass++;
@@ -808,9 +825,9 @@ static void op_barrier(int32_t bits) {
 
 // ---------- Sampled textures and samplers (PLAN.md 2.3 "As built, slice 2b"): the registrations, the replay's bound slots, the host images they name and their uploads ----------
 // The tables mirror nvn_mtl.m's (mtl_reg_tex / mtl_reg_samp, tex_by_id / samp_by_id): texture ID → the registered texture object and view, sampler ID → its parameters and VkSampler (deduplicated
-// by parameters, never destroyed: Stardew Valley makes four). Every bound slot is resolved at a draw (a dispatch: the compute stage's), only the slots bound or changed since the last resolve unless
-// something says all (a new submission, SET_RT, a registration): slice 2c pushes the views and samplers resolved here (T.tv, T.ts, T.ss). No shader tells which slots it reads yet, so every bound
-// slot is resolved: an ID not registered, or a texture already finalized, is only counted (a stale binding the shader may not read; 2c, which knows the slots, says them in red).
+// by parameters, never destroyed: Stardew Valley makes four). A draw with a program resolves only the slots its shaders sample (slice 2c: draw_view, draw_samp) and pushes them; a dispatch (the
+// compute stage's) and a draw with no program resolve every bound slot (tex_bound). Either way only the slots bound or changed since the last resolve, unless something says all (a new submission,
+// SET_RT, a registration). An ID not registered, or a texture already finalized, is only counted; a shader that samples one gets the dummy (the draws' line counts dummies).
 // A texture's host image is the render target's when the GPU drew it (same serial: one image, its layout tracked from rendered to sampled), else made at its first lookup. A CPU-written texture
 // (packaged layout, WriteTexels, a flush: mtl_tex_cpu_written) is uploaded from guest memory: deswizzled on the CPU (nvn_deswizzle.c) into the slot's staging buffer at the commit and copied by the
 // upload command buffer ahead of the submission (b_commit, after strategy B's copies). A LINEAR texture in a pool the CPU can write counts as CPU-written from the start: nvn_mtl.m makes it a
@@ -821,11 +838,11 @@ static void op_barrier(int32_t bits) {
 // nothing wrote is filled once from its storage when nvn_mtl.m's tex_init_fill would (a CPU_NO_ACCESS pool's initial content, or storage the CPU flushed before the texture's first use: tex_init_ok),
 // else cleared to zero (nvn_mtl.m tex_zero_fill). Jobs (tjob, above b_commit) carry all of it to the commit; the image's layout is SHADER_READ_ONLY_OPTIMAL in the submission from its first lookup
 typedef struct { tex_t t; view_t v; uint8_t ok, has_v; } treg_t;
-typedef struct { samp_par p; VkSampler s; uint8_t ok; } sreg_t;
+typedef struct { samp_par p; VkSampler s, si; uint8_t ok; } sreg_t;   // si: its integer twin (samp_lookup_as)
 static treg_t *g_treg; static sreg_t *g_sreg; static int g_ntreg, g_nsreg, g_tpool_n;   // under g_rmu (a leaf: VkSamplers are made under it, nothing else is taken)
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_reg_gen;                 // moves at each change of a registration, the pool capacity, or a texture becoming CPU-written: every bound slot is resolved again
-static nvn_hmap g_samps = {.klen = sizeof(samp_par)};   // parameters → VkSampler (under g_rmu)
+static nvn_hmap g_samps = {.klen = sizeof(samp_par)}, g_isamps = {.klen = sizeof(samp_par)};   // parameters → VkSampler, and → integer twin (under g_rmu)
 enum { TS_UP1, TS_RE, TS_REALW, TS_UP1_B, TS_RE_B, TS_REALW_B, TS_EDGE, TS_ZERO, TS_LAY_UP, TS_LAY_CB, TS_TLOOK, TS_SLOOK, TS_MADE, TS_CPUW, TS_FAIL, TS_FEED, TS_UNREG, TS_STALE, TS_OOB, TS_SMADE,
        TS_INIT, TS_INIT_B, TS_CHK, TS_CHK_NS, TS_N };   // INIT: initial-content fills (tex_init_ok); CHK: the dirty checks of uploaded textures (tex_ready) and their time
 static _Atomic uint64_t g_ts[TS_N];
@@ -834,22 +851,26 @@ static _Atomic uint64_t g_ts[TS_N];
 #define SR_STAGES (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
 
 // A view's component mapping from the NVN swizzle. Under the portability subset without imageViewFormatSwizzle (VUID-VkImageViewCreateInfo-imageViewFormatSwizzle-04465) a view must map
-// each component to itself: the identity, said once (the RGBX formats' alpha of one and a view's own swizzle are then the shader's to apply: slice 2c)
+// each component to itself: the identity, said once (the RGBX formats' alpha of one and a view's own swizzle are then the shader's to apply, which no slice does yet)
 static void sview_comp(const uint8_t sw[4], VkComponentSwizzle c[4]) {
     int id = 1; for (int k = 0; k < 4; k++) { c[k] = sw[k] == 2 + k ? VK_COMPONENT_SWIZZLE_IDENTITY : (VkComponentSwizzle)(sw[k] + 1); id &= c[k] == VK_COMPONENT_SWIZZLE_IDENTITY; }
     if (id || !vd.port || vd.port_swz) return;
-    NRED_ONCE("a sampled view swizzles its components (%u %u %u %u), and the portability subset has no imageViewFormatSwizzle: viewed unswizzled (the shader is to apply it, slice 2c)", sw[0], sw[1], sw[2], sw[3]);
+    NRED_ONCE("a sampled view swizzles its components (%u %u %u %u), and the portability subset has no imageViewFormatSwizzle: viewed unswizzled (applying it in the shader is not done yet)", sw[0], sw[1], sw[2], sw[3]);
     for (int k = 0; k < 4; k++) c[k] = VK_COMPONENT_SWIZZLE_IDENTITY;
 }
+// The aspect a sampled view of e has: colour, else the stencil one where asked and the image has it, else depth, else (a stencil-only image) stencil
+static VkImageAspectFlags sview_aspect(const vkn_img *e, int stencil) {
+    return e->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : stencil && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT
+         : e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
+}
 // A sampled view of e (under vkn_tmu), kept with the image and destroyed with it: vf one of its formats (image or present), levels l0 + nl, layers s0 + ns, sw the NVN channel swizzle
-// (0 zero, 1 one, 2-5 R G B A: Vulkan's ZERO .. A are one more), stencil: the stencil aspect of a depth-stencil image
+// (0 zero, 1 one, 2-5 R G B A: Vulkan's ZERO .. A are one more), stencil: the stencil aspect of a depth-stencil image (sview_aspect)
 static VkImageView img_sview(vkn_img *e, VkFormat vf, VkImageViewType vt, uint32_t l0, uint32_t nl, uint32_t s0, uint32_t ns, const uint8_t sw[4], int stencil) {
     uint64_t key = (uint64_t)(vf & 0xffff) << 48 | (uint64_t)(l0 & 15) << 44 | (uint64_t)(nl & 31) << 39 | (uint64_t)(s0 & 2047) << 28 | (uint64_t)(ns & 2047) << 17
                  | (uint64_t)(sw[0] | sw[1] << 3 | sw[2] << 6 | sw[3] << 9) << 5 | (uint64_t)(stencil != 0) << 1 | (vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY);
     for (int i = 0; i < e->nsviews; i++) if (e->sviews[i].key == key) return e->sviews[i].v;
     if (e->nsviews == (int)(sizeof e->sviews / sizeof *e->sviews)) { NRED_ONCE("a host image has more than %d sampled views: the rest are sampled as nothing", e->nsviews); return VK_NULL_HANDLE; }
-    VkImageAspectFlags a = e->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : stencil && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT
-                         : e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
+    VkImageAspectFlags a = sview_aspect(e, stencil);
     VkComponentSwizzle c[4]; sview_comp(sw, c);
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, e->img, vt, vf, {c[0], c[1], c[2], c[3]}, {a, l0, nl, s0, ns}};
     VkImageView v; VkResult r = vk.vkCreateImageView(vd.dev, &vi, NULL, &v);
@@ -859,7 +880,10 @@ static VkImageView img_sview(vkn_img *e, VkFormat vf, VkImageViewType vt, uint32
 }
 // The view a registration samples (under vkn_tmu), as tex_by_id builds it: the view's levels, layers, target and format (the image's own or its present format only: another is a later slice),
 // the channel swizzle from the view or else from the texture builder (no alpha for the NVK_NOA formats: a reads as 1, nvn_fmt_to_mtl's), the stencil aspect for a stencil-mode view or texture
-static VkImageView tex_view(vkn_img *e, const treg_t *r, int tid) {
+// want: the view type a shader declares (VKN_VT_2D / 2D_ARRAY: a 2D view is of the view's first layer), -1 = the view's own (a draw with no program: slice 2b's).
+// comp: the numeric class a shader reads the view as (fmt_comp's), from the view's own aspect and format: a stencil aspect is unsigned integers whatever the image's depth half is
+static int fmt_comp(VkFormat f);
+static VkImageView tex_view(vkn_img *e, const treg_t *r, int tid, int want, int *comp) {
     const view_t *v = r->has_v ? &r->v : NULL; VkFormat vf = e->fmt; int nf = (int)e->nvn_fmt;
     if (!(e->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) { NRED_ONCE("texture ID %d: its host image (format %d) cannot be sampled on this device: sampled as nothing", tid, e->fmt); return VK_NULL_HANDLE; }
     if (v && v->set_format && v->format != r->t.d.format) {
@@ -875,7 +899,7 @@ static VkImageView tex_view(vkn_img *e, const treg_t *r, int tid) {
     int tg = v && v->set_target ? v->target : r->t.d.target;
     if (tg != NVN_TEXTURE_TARGET_2D && tg != NVN_TEXTURE_TARGET_2D_ARRAY && tg != NVN_TEXTURE_TARGET_RECTANGLE)
         NRED_ONCE("texture ID %d viewed with target %d: sampled as 2D (other view targets are a later slice)", tid, tg);
-    VkImageViewType vt = tg == NVN_TEXTURE_TARGET_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    VkImageViewType vt = want == VKN_VT_2D_ARRAY || (want < 0 && tg == NVN_TEXTURE_TARGET_2D_ARRAY) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     if (vt == VK_IMAGE_VIEW_TYPE_2D) ns = 1;
     uint8_t sw[4] = {2, 3, 4, 5};
     if (v && v->set_swizzle) memcpy(sw, v->swz, 4);
@@ -884,6 +908,7 @@ static VkImageView tex_view(vkn_img *e, const treg_t *r, int tid) {
     for (int c = 0; c < 4; c++) { if (sw[c] > 5) sw[c] = (uint8_t)(2 + c); if (noa && sw[c] == 5) sw[c] = 1; }
     int st = v && v->set_dsmode ? v->dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL : r->t.stencil;
     if (st && !(e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) NRED_ONCE("texture ID %d: a stencil-mode view of format %d, which has no stencil: depth is read", tid, e->fmt);
+    *comp = sview_aspect(e, st) == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : fmt_comp(vf);
     return img_sview(e, vf, vt, l0, nl, s0, ns, sw, st);
 }
 
@@ -893,6 +918,9 @@ static struct {
     uint64_t tex[6][256], samp[6][128], tb[6][4], td[6][4], sb[6][2], sd[6][2];
     VkImageView tv[6][256]; VkSampler ts[6][128], ss[6][128];
     uint64_t gen; unsigned all;
+    // A draw with a program (slice 2c: draw_tex_prep, draw_view, draw_samp) resolves only the slots its shaders sample: tsd the combined slots whose sampler half is still to resolve (td for their views); tvt: the view type
+    // and component type + 1 that tv was resolved for (0: slice 2b's own, tex_bound)
+    uint64_t tsd[6][2]; uint8_t tvt[6][256];
 } T;
 static void tex_bind(uint32_t op, const uint8_t *a) {
     p_bind_handles t1; const p_bind_handles *b = op == OP_BIND_SAMP ? (const p_bind_handles *)a : bind_rec(op, a, &t1);
@@ -906,9 +934,11 @@ static void tex_bind(uint32_t op, const uint8_t *a) {
         int s = b->first + k; uint64_t bit = 1ull << (s & 63);
         if (dst[s] == h[k]) continue;
         dst[s] = h[k];
-        if (h[k]) { bm[s >> 6] |= bit; dm[s >> 6] |= bit; continue; }
-        bm[s >> 6] &= ~bit; dm[s >> 6] &= ~bit;   // unbound: nothing to resolve
-        if (op == OP_BIND_SAMP) T.ss[st][s] = VK_NULL_HANDLE; else { T.tv[st][s] = VK_NULL_HANDLE; if (s < NVN_SEPTEX_SLOT0) T.ts[st][s] = VK_NULL_HANDLE; }
+        int comb = op != OP_BIND_SAMP && s < NVN_SEPTEX_SLOT0;
+        if (op != OP_BIND_SAMP) T.tvt[st][s] = 0;
+        if (h[k]) { bm[s >> 6] |= bit; dm[s >> 6] |= bit; if (comb) T.tsd[st][s >> 6] |= bit; continue; }
+        bm[s >> 6] &= ~bit; dm[s >> 6] &= ~bit; if (comb) T.tsd[st][s >> 6] &= ~bit;   // unbound: nothing to resolve
+        if (op == OP_BIND_SAMP) T.ss[st][s] = VK_NULL_HANDLE; else { T.tv[st][s] = VK_NULL_HANDLE; if (comb) T.ts[st][s] = VK_NULL_HANDLE; }
     }
 }
 
@@ -931,24 +961,24 @@ static void tj_fallback(tjob *q) {
 }
 // The replay's part (submit thread, at a draw or dispatch that has it bound): its layout becomes shader-read in this submission. At its first use in the submission, a job for the upload
 // command buffer (an upload, a zero fill, the layout change; e->rec is SR from then on); later in the submission after it was a target, a barrier in the submission's command buffer (a pass
-// ends first). cpu: its content comes from guest memory. A texture that is a target of the pass being drawn (a feedback loop) is left alone, counted (2c tells whether the shader reads it).
+// ends first). cpu: its content comes from guest memory. A texture that is a target of the pass being drawn (a feedback loop) is left alone, counted (a draw whose shader samples it says so in red: draw_view).
 // t: its registration's texture object (tex_init_ok reads its pool and storage)
 static int tex_init_ok(const vkn_img *e, const tex_t *t);
-static void tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t) {
+static int tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t, int prog) {   // 0 = a target of the pass: not sampled (prog: a draw with a program samples it, which says it)
     int tgt = R.de == e; for (int i = 0; i < R.n; i++) tgt |= R.ce[i] == e;
     if (tgt) {
-        if (!TSA(TS_FEED, 1)) NLOG("texture ser=%llu is bound while it is a target of the pass (first case): left as the target (slice 2c tells whether the shader reads it)", (unsigned long long)e->serial);
-        return;
+        if (!TSA(TS_FEED, 1) && !prog) NLOG("texture ser=%llu is bound while it is a target of the pass (first case): left as the target (a draw whose shader samples it is said in red)", (unsigned long long)e->serial);
+        return 0;
     }
     if (e->rec_sub == g_sub_id) {
-        if (e->rec == SR_LAYOUT) return;
+        if (e->rec == SR_LAYOUT) return 1;
         rp_end();
         VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, SR_STAGES, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             e->rec, SR_LAYOUT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, e->img, {e->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
         VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
         vk.vkCmdPipelineBarrier2(cb_now(), &di);
         e->rec = SR_LAYOUT; TSA(TS_LAY_CB, 1);
-        return;
+        return 1;
     }
     VkImageLayout old = rec_layout(e); int kind = TJ_NONE;
     if (cpu) {
@@ -973,6 +1003,7 @@ static void tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t) {
     if (!kind) kind = old == VK_IMAGE_LAYOUT_UNDEFINED ? (e->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT ? TJ_ZERO : TJ_LAYOUT) : old != SR_LAYOUT ? TJ_LAYOUT : TJ_NONE;
     if (kind) tj_add(e, old, kind);
     e->rec = SR_LAYOUT;
+    return 1;
 }
 // The one-time fill from initial content (nvn_mtl.m tex_init_fill, the same tests): a texture nothing wrote, in a pool the CPU cannot access (what the storage held at
 // nvnMemoryPoolInitialize is its content: the game cannot write it again), or in one it can whose storage the CPU flushed (nvnMemoryPoolFlushMappedRange, hle_nvn.c nvn_flushed) before the
@@ -1000,8 +1031,12 @@ static int tex_init_ok(const vkn_img *e, const tex_t *t) {
                                                     no_cpu ? "a CPU_NO_ACCESS pool's" : "flushed by the CPU before its first use");
     return 1;
 }
-// Texture ID → its sampled view (submit thread), the image made at the first lookup (one image per serial, the render target's if the GPU drew it), its job given (tex_ready)
-static VkImageView tex_lookup(int tid) {
+// Texture ID → its sampled view (submit thread), the image made at the first lookup (one image per serial, the render target's if the GPU drew it), its job given (tex_ready).
+// want / comp: the view type and component type the shader declares (-1: a draw with no program, the view's own type); why: what an empty answer means when the texture exists
+// (1 a target of the pass, 2 a cube the shader wants and no host image is one, 3 a component type the image's format has not)
+enum { TL_FEED = 1, TL_CUBE, TL_COMP };
+static VkImageView tex_lookup(int tid, int want, int comp, int *why) {
+    if (why) *why = 0;
     if (!tid) return VK_NULL_HANDLE;
     TSA(TS_TLOOK, 1);
     pthread_mutex_lock(&g_rmu);
@@ -1022,10 +1057,13 @@ static VkImageView tex_lookup(int tid) {
     pthread_mutex_lock(&vkn_tmu);
     vkn_img *e = vkn_img_get(r.t.serial);
     if (!e && ts && (e = img_make(&r.t, "a sampled texture", cpu ? NVK_UP : NVK_UP | NVK_RT))) TSA(TS_MADE, 1);
-    if (e) { use_mark(e); v = tex_view(e, &r, tid); }
+    if (e && want == VKN_VT_CUBE) { if (why) *why = TL_CUBE; e = NULL; }   // cube textures have no host image yet (img_make): every one is another kind
+    int vc = 0;
+    if (e) { use_mark(e); v = tex_view(e, &r, tid, want, &vc); }
+    if (v && want >= 0 && vc != comp) { if (why) *why = TL_COMP; v = VK_NULL_HANDLE; }   // the view's class (a stencil view reads unsigned integers), not the image format's
     pthread_mutex_unlock(&vkn_tmu);
     if (!e && !ts && !TSA(TS_STALE, 1)) NLOG("texture ID %d holds texture ser=%llu, already finalized (first case): an empty slot", tid, (unsigned long long)r.t.serial);
-    if (v) tex_ready(e, cpu, ts, &r.t);
+    if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0)) { if (why) *why = TL_FEED; v = VK_NULL_HANDLE; }
     return v;
 }
 // Sampler parameters → a VkSampler (under g_rmu), as samp_by_id maps them: GL's filters (a min filter without mips: the base level, minLod 0 maxLod 0.25 so a minified sample stays minified),
@@ -1037,7 +1075,7 @@ static float samp_bias(float b) {
     if (r != 0 && vd.port && !vd.port_bias) { NRED_ONCE("a sampler with a LOD bias of %g, and the portability subset has no samplerMipLodBias: no bias", b); r = 0; }
     return r;
 }
-static VkSampler samp_make(const samp_par *p) {
+static VkSampler samp_make(const samp_par *p, int integer) {   // integer: an integer twin's (samp_lookup_as): its border colour is the integer one of the same three
     static const VkSamplerAddressMode wm[8] = {VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
         VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
@@ -1080,27 +1118,39 @@ static VkSampler samp_make(const samp_par *p) {
         else if (b[0] == 1 && b[1] == 1 && b[2] == 1 && b[3] == 1) ci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         else { NRED_ONCE("sampler border colour %g %g %g %g is none of Vulkan's three: the nearest (nvn_mtl.m's choice)", b[0], b[1], b[2], b[3]);
                ci.borderColor = b[3] > 0.5f ? (b[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK) : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; }
+        if (integer) ci.borderColor = (VkBorderColor)(ci.borderColor + 1);   // FLOAT_x → INT_x (Vulkan's order: each float colour, then its integer one)
     }
     VkSampler s; VkResult r = vk.vkCreateSampler(vd.dev, &ci, NULL, &s);
     if (r) { NRED_ONCE("vkCreateSampler failed (VkResult %d): textures sampled with these parameters get no sampler", r); return VK_NULL_HANDLE; }
     uint64_t n = TSA(TS_SMADE, 1);
-    if (n < 16) NLOG("sampler %llu: min filter %u mag %u, wrap %u %u %u, LOD %g..%g bias %g, anisotropy %g, compare %u/%u, reduction %u, border %g %g %g %g", (unsigned long long)n + 1, p->minf, p->magf,
-                     p->ws, p->wt, p->wr, p->lod_min, p->lod_max, p->lod_bias, p->aniso, p->cmp_mode, p->cmp_func, p->reduction, p->border[0], p->border[1], p->border[2], p->border[3]);
+    if (n < 16) NLOG("sampler %llu: min filter %u mag %u, wrap %u %u %u, LOD %g..%g bias %g, anisotropy %g, compare %u/%u, reduction %u, border %g %g %g %g%s", (unsigned long long)n + 1, p->minf, p->magf,
+                     p->ws, p->wt, p->wr, p->lod_min, p->lod_max, p->lod_bias, p->aniso, p->cmp_mode, p->cmp_func, p->reduction, p->border[0], p->border[1], p->border[2], p->border[3],
+                     integer ? " (an integer twin)" : "");
     return s;
 }
-static VkSampler samp_lookup(int sid) {   // sampler ID → its VkSampler (submit thread), made at the first lookup of its parameters
+// Sampler ID → its VkSampler (submit thread), made at the first lookup of its parameters. integer: for a binding the shader reads as integers (a stencil view, an integer format, their dummies):
+// the sampler's nearest twin, made beside it. Integer formats never have linear filtering or min / max reduction (VUID-vkCmdDraw-magFilter-04553, -None-06479 and the like), and a usampler
+// has no depth compare, so the twin has nearest filters and mips, no anisotropy, reduction or compare, and the integer border colour; wraps, LOD clamp and bias stay. nvn_mtl.m has no twin:
+// Metal samples an integer texture unfiltered whatever the sampler says
+static VkSampler samp_lookup_as(int sid, int integer) {
     if (!sid) return VK_NULL_HANDLE;
     TSA(TS_SLOOK, 1);
     pthread_mutex_lock(&g_rmu);
     VkSampler s = VK_NULL_HANDLE;
     if (sid < 0 || sid >= g_nsreg || !g_sreg[sid].ok) { pthread_mutex_unlock(&g_rmu); if (!TSA(TS_UNREG, 1)) NLOG("sampler ID %d bound but not registered (first case): no sampler", sid); return s; }
-    if (!(s = g_sreg[sid].s)) {
-        if (!(s = (VkSampler)(uintptr_t)nvn_hm_get(&g_samps, &g_sreg[sid].p)) && (s = samp_make(&g_sreg[sid].p))) nvn_hm_put(&g_samps, &g_sreg[sid].p, (void *)(uintptr_t)s);
-        g_sreg[sid].s = s;
+    sreg_t *r = &g_sreg[sid];
+    if (!integer && !(s = r->s)) {
+        if (!(s = (VkSampler)(uintptr_t)nvn_hm_get(&g_samps, &r->p)) && (s = samp_make(&r->p, 0))) nvn_hm_put(&g_samps, &r->p, (void *)(uintptr_t)s);
+        r->s = s;
+    } else if (integer && !(s = r->si)) {
+        samp_par q = r->p; q.magf = NVN_MAG_FILTER_NEAREST; q.minf = q.minf <= 1 ? NVN_MIN_FILTER_NEAREST : NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST; q.aniso = 1; q.reduction = 0; q.cmp_mode = 0; q.cmp_func = 0;
+        if (!(s = (VkSampler)(uintptr_t)nvn_hm_get(&g_isamps, &q)) && (s = samp_make(&q, 1))) nvn_hm_put(&g_isamps, &q, (void *)(uintptr_t)s);
+        r->si = s;
     }
     pthread_mutex_unlock(&g_rmu);
     return s;
 }
+static VkSampler samp_lookup(int sid) { return samp_lookup_as(sid, 0); }
 // A draw (compute 0: stages 0-4) or dispatch (compute 1: stage 5): the slots bound or changed since the last resolve, every bound one where something said all
 static void tex_bound(int compute) {
     uint64_t g = atomic_load_explicit(&g_reg_gen, memory_order_acquire);
@@ -1109,8 +1159,9 @@ static void tex_bound(int compute) {
         int all = T.all >> st & 1; T.all &= ~(1u << st);
         for (int w = 0; w < 4; w++) {
             uint64_t m = T.tb[st][w] & (all ? ~0ull : T.td[st][w]); T.td[st][w] = 0;
+            if (w < 2) T.tsd[st][w] &= ~m;
             while (m) { int s = w * 64 + __builtin_ctzll(m); m &= m - 1; uint64_t h = T.tex[st][s];
-                T.tv[st][s] = tex_lookup((int)(h & 0xfffff));
+                T.tv[st][s] = tex_lookup((int)(h & 0xfffff), -1, 0, NULL); T.tvt[st][s] = 0;
                 if (s < NVN_SEPTEX_SLOT0) T.ts[st][s] = samp_lookup((int)(h >> 20)); }
         }
         for (int w = 0; w < 2; w++) {
@@ -1163,7 +1214,7 @@ static uint64_t tex_prep_all(uint64_t off, uint64_t stamp) {
             NRED_ONCE("texture ser=%llu: its storage %#llx + %llu is in %s: not uploaded", (unsigned long long)e->serial, (unsigned long long)a, (unsigned long long)e->size, k < 0 ? "no memory pool" : "a CPU-no-access pool");
             tj_fallback(q); continue; }
         pool_ent *p = &g_pools[k];
-        if (!p->span) p->span = nvn_dirty_span((const void *)p->lo, p->hi - p->lo);   // before any protect (mtl_pool_del keys on it)
+        pool_span(p);   // before any protect (mtl_pool_del keys on it); found here first: the pool's buffer pages NEW as in b_commit
         uintptr_t i0 = (a - p->lo) >> g_sh, i1 = (a + e->size - 1 - p->lo) >> g_sh;
         // Never protected: an edge page of two pools (mtl_pool_add), a page of commands, a pool the tracker does not cover or a range it finds elsewhere (b_commit's rules); uploaded at every use
         uint8_t ef = p->pf[i0] | p->pf[i1];
@@ -1328,6 +1379,644 @@ static void *comp_main(void *arg) {
     return NULL;
 }
 
+// ---------- Draws (PLAN.md 2.5 "As built, slice 2c"; Y and winding: 2.4): the draw state, programs, the one push-descriptor set, pipelines, dynamic state, vertex / index buffers, the draw ----------
+// The replay keeps NVN's draw state as nvn_mtl.m's S does (state_reset, state_op). A draw resolves its program's vertex and pixel shaders to slice 0's modules (vk_shader.c), their bindings to
+// descriptors (draw_desc: NVN uniform slots → the pools' shadow buffers, combined texture slots → the views and samplers slice 2b resolves, here for the slots the shaders sample only), its state
+// and the open pass's formats to a monolithic pipeline (draw_pso, cached in memory by vkn's own key), and records it: vkCmdDrawIndexed with the base vertex as the vertex offset, or vkCmdDraw.
+// Y and winding (PLAN.md 2.4): NVN decides facing by the winding in normalized device coordinates, after the viewport swizzle. Its memory row 0 is window y 0 in both origin modes; upper left
+// maps NDC y +1 to row 0 (a flipped Vulkan viewport), lower left NDC y -1 (Vulkan's own); NEGATIVE_Y toggles the flip. Vulkan's facing, in framebuffer rows, then agrees with NVN's for upper left
+// and is reversed for lower left, swizzle or not: the front face depends on the origin only. Scissors and viewports are rows as NVN gives them (never flipped).
+// Clip z: [-w, w] as NVN's default (depth clip control's negativeOneToOne), [0, w] after mtl_set_depth_zero. What a draw needs that this slice does not do is said in red once and the draw skipped
+static _Atomic int g_depth_zero;   // NVN_DEPTH_MODE_NEAR_IS_ZERO (mtl_set_depth_zero, the game thread)
+static struct {
+    const prog_t *bst[5];          // the program bound per stage (bit st of BindProgram's stages; nvn_mtl.m bind_stages)
+    blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
+    va_st attr[16]; int nattr; vs_st stream[16]; int nstream;
+    NVNbufferRange vbuf[16];
+    p_bind_buf ubo[6][16];
+    uint32_t st_vmask[2], st_wmask[2], st_ref[2];
+    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4];   // vp_sw: XOR the identity (p_vp_swizzle)
+    float blend_color[4]; p_prim_restart restart; int rast_discard;
+} S;
+static void state_reset(void) {   // nvn_mtl.m's, once (vkn_hello): NVN's initial state
+    memset(&S, 0, sizeof S);
+    for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
+    S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
+    S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
+    S.ds = (ds_st){0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS, 1, 1, 1, 1, 1, 1};
+    S.st_vmask[0] = S.st_vmask[1] = S.st_wmask[0] = S.st_wmask[1] = 0xff; S.dr[1] = 1;
+}
+static void state_op(uint32_t op, const uint8_t *a) {   // nvn_mtl.m's state_op (the scissor is R's, the texture and sampler binds T's); a count past the table: an overwritten record, skipped
+    switch (op) {
+        case OP_BIND_PROGRAM: { const p_bind_program *b = (const void *)a; for (int st = 0; st < 5; st++) if (b->stages >> st & 1) S.bst[st] = b->prog; break; }   // compute (bit 5): a later slice
+        case OP_BIND_STATE: { const p_bind_state *b = (const void *)a; blend_st bs;
+            switch (b->kind) {
+                case 0: memcpy(&bs, b->bytes, sizeof bs); S.blend[bs.target] = bs; break;
+                case 1: memcpy(&S.color, b->bytes, sizeof S.color); break;
+                case 2: memcpy(&S.chmask, b->bytes, sizeof S.chmask); break;
+                case 3: memcpy(&S.ms, b->bytes, sizeof S.ms); break;
+                case 4: memcpy(&S.poly, b->bytes, sizeof S.poly); break;
+                case 5: memcpy(&S.ds, b->bytes, sizeof S.ds); break;
+                default: break;
+            } break; }
+        case OP_BIND_VATTR: { const p_bind_vattr *b = (const void *)a; if (b->n < 0 || b->n > 16) break; memcpy(S.attr, b->st, 4 * (size_t)b->n); S.nattr = b->n; break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *b = (const void *)a; if (b->n < 0 || b->n > 16) break; memcpy(S.stream, b->st, 8 * (size_t)b->n); S.nstream = b->n; break; }
+        case OP_BIND_VBUF: { const p_bind_vbuf *b = (const void *)a; if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break; memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
+        case OP_BIND_UBO: { const p_bind_buf *b = (const void *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) S.ubo[b->stage][b->index] = *b; break; }
+        case OP_STENCIL: { const p_stencil *b = (const void *)a;
+            for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) S.st_vmask[f] = (uint32_t)b->value_mask; else if (b->which == 1) S.st_wmask[f] = (uint32_t)b->mask; else S.st_ref[f] = (uint32_t)b->ref; }
+            break; }
+        case OP_POLY_OFFSET: memcpy(&S.po, a, sizeof S.po); break;
+        case OP_VIEWPORTS: { const p_viewports *b = (const void *)a; if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break; for (int i = 0; i < b->n; i++) memcpy(S.vp[b->first + i], b->v[i], 16); S.has_vp = 1; break; }
+        case OP_DEPTH_RANGE: { const p_depth_range *b = (const void *)a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
+        case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)(const void *)a)->on; break;
+        case OP_VP_SWIZZLE: { const p_vp_swizzle *b = (const void *)a; if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break; memcpy(S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
+        case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)(const void *)a)->rgba, 16); break;
+        case OP_PRIM_RESTART: memcpy(&S.restart, a, sizeof S.restart); break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)(const void *)a)->on; break;
+        default: break;
+    }
+}
+
+// Statistics (draw_report): draws recorded (indexed among them), skipped by why; pipelines made, their creation time, cache hits; descriptor pushes, writes, dummies; uniform bindings, those at
+// an address the device cannot bind (copied), those cut short (to the pool's end or the device's range); record time (mtl_exec, outermost)
+enum { DK_NOPROG, DK_SHADER, DK_KIND, DK_STATE, DK_EMPTY, DK_RES, DK_PSO, DK_N };
+static const char *const g_dk_name[DK_N] = {"no program", "shader refused or missing", "draw kind", "state", "nothing to draw (culled, empty viewport or scissor)", "resources", "pipeline"};
+static _Atomic uint64_t g_dr_n, g_dr_idx, g_dr_skip[DK_N], g_pso_made, g_pso_hit, g_pso_ns, g_pso_max, g_pso_fail, g_push, g_dwr, g_ddum, g_ubo_n, g_ubo_unal, g_ubo_short, g_rec_ns, g_lay_made;
+#define DS(i, n) atomic_fetch_add_explicit(&(i), (uint64_t)(n), memory_order_relaxed)
+
+// The dummies (made once, draw_init): an image per component type (1x1, 6 layers, cube-compatible, zeros, shader-read) with a view of each kind, a sampler, and a 64 KiB zero buffer for
+// uniform slots with nothing bound and vertex inputs nothing feeds. g_draw_ok: they exist, so draws are recorded
+#define ZBUF_B 65536u
+static VkImage g_dimg[3]; static VkDeviceMemory g_dmem[3], g_zmem; static VkImageView g_dview[3][3]; static VkSampler g_dsamp; static VkBuffer g_zbuf; static int g_draw_ok;
+static VkPipelineCache g_pcache;
+static int buf_host(VkDeviceSize n, VkBufferUsageFlags u, VkBuffer *b, VkDeviceMemory *m, void **map) {   // a host-visible coherent buffer, mapped
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL}; VkMemoryRequirements mr; int mt;
+    *b = VK_NULL_HANDLE; *m = VK_NULL_HANDLE;
+    if (vk.vkCreateBuffer(vd.dev, &bi, NULL, b)) { *b = VK_NULL_HANDLE; return 0; }
+    vk.vkGetBufferMemoryRequirements(vd.dev, *b, &mr);
+    mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, m)) { *m = VK_NULL_HANDLE; vk.vkDestroyBuffer(vd.dev, *b, NULL); *b = VK_NULL_HANDLE; return 0; }
+    if (vk.vkBindBufferMemory(vd.dev, *b, *m, 0) || vk.vkMapMemory(vd.dev, *m, 0, VK_WHOLE_SIZE, 0, map)) { vk.vkDestroyBuffer(vd.dev, *b, NULL); vk.vkFreeMemory(vd.dev, *m, NULL); *b = VK_NULL_HANDLE; *m = VK_NULL_HANDLE; return 0; }
+    return 1;
+}
+static void draw_init(void) {   // vkn_hello, before any submission: the dummies' clear and layout go through a one-off command buffer, waited for
+    if (!vd.push) { NLOG("[RED] the device has no VK_KHR_push_descriptor: nothing is drawn"); return; }
+    void *zm; if (!buf_host(ZBUF_B, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g_zbuf, &g_zmem, &zm)) { NLOG("[RED] the draws' zero buffer cannot be made: nothing is drawn"); return; }
+    memset(zm, 0, ZBUF_B);
+    static const VkFormat df[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT};
+    for (int c = 0; c < 3; c++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, VK_IMAGE_TYPE_2D, df[c], {1, 1, 1}, 1, 6, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkMemoryRequirements mr; int mt;
+        if (vk.vkCreateImage(vd.dev, &ii, NULL, &g_dimg[c])) { NLOG("[RED] the draws' dummy images cannot be made: nothing is drawn"); return; }
+        vk.vkGetImageMemoryRequirements(vd.dev, g_dimg[c], &mr);
+        if ((mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) < 0) mt = vkn_mem_type(mr.memoryTypeBits, 0);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+        if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &g_dmem[c]) || vk.vkBindImageMemory(vd.dev, g_dimg[c], g_dmem[c], 0)) { NLOG("[RED] the draws' dummy images have no memory: nothing is drawn"); return; }
+        static const VkImageViewType vt[3] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE};
+        for (int t = 0; t < 3; t++) {
+            VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_dimg[c], vt[t], df[c], {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, t == 0 ? 1 : 6}};
+            if (vk.vkCreateImageView(vd.dev, &vi, NULL, &g_dview[c][t])) { NLOG("[RED] the draws' dummy views cannot be made: nothing is drawn"); return; }
+        }
+    }
+    VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; si.maxLod = 0.25f;
+    if (vk.vkCreateSampler(vd.dev, &si, NULL, &g_dsamp)) { NLOG("[RED] the draws' dummy sampler cannot be made: nothing is drawn"); return; }
+    VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) g_pcache = VK_NULL_HANDLE;   // none: pipelines are made without one
+    VkCommandPool pool; VkCommandBuffer cb;
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, vd.qfam};
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    if (vk.vkCreateCommandPool(vd.dev, &pi, NULL, &pool)) { NLOG("[RED] the draws' dummies cannot be cleared: nothing is drawn"); return; }
+    cai.commandPool = pool;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    VkResult r = vk.vkAllocateCommandBuffers(vd.dev, &cai, &cb);
+    if (!r) r = vk.vkBeginCommandBuffer(cb, &bi);
+    if (!r) {
+        VkImageMemoryBarrier2 b[3]; VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 3, b};
+        for (int c = 0; c < 3; c++) b[c] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_dimg[c], all};
+        vk.vkCmdPipelineBarrier2(cb, &di);
+        VkClearColorValue z = {{0}};
+        for (int c = 0; c < 3; c++) vk.vkCmdClearColorImage(cb, g_dimg[c], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &all);
+        for (int c = 0; c < 3; c++) b[c] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, SR_STAGES,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, SR_LAYOUT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_dimg[c], all};
+        vk.vkCmdPipelineBarrier2(cb, &di);
+        r = vk.vkEndCommandBuffer(cb);
+    }
+    if (!r) {
+        VkCommandBufferSubmitInfo c = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, cb, 0};
+        VkSubmitInfo2 s2 = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, 1, &c, 0, NULL};
+        pthread_mutex_lock(&vkn_qmu); r = vk.vkQueueSubmit2(vd.q, 1, &s2, VK_NULL_HANDLE); if (!r) r = vk.vkQueueWaitIdle(vd.q); pthread_mutex_unlock(&vkn_qmu);
+    }
+    vk.vkDestroyCommandPool(vd.dev, pool, NULL);
+    if (r) { NLOG("[RED] the draws' dummies cannot be cleared (VkResult %d): nothing is drawn", r); return; }
+    g_draw_ok = 1;
+}
+
+// ---- Programs: a program object's shaders by NVN stage, by its serial (new at each SetShaders), as nvn_mtl.m's prog_get ----
+typedef struct { vkn_shader *sh[6]; uint8_t has, bad; } prog_ent;   // has: the stages its shaders map to; bad: those refused (bit 7: a key the map lacks)
+static nvn_hmap g_progs = {.klen = 8};
+static const prog_ent *prog_ent_get(const prog_t *p) {
+    static const prog_t *lp; static uint64_t ls; static prog_ent *le, none;
+    if (!p || !p->serial) return &none;
+    if (p == lp && p->serial == ls) return le;
+    uint64_t ser = p->serial; prog_ent *e = nvn_hm_get(&g_progs, &ser);
+    if (!e) {
+        if (!(e = calloc(1, sizeof *e))) die("vkn backend: program entry allocation failed");
+        for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+            uint8_t k[8]; if (!prog_key(p, i, k)) continue;
+            int st = vkn_shmap_stage(k);
+            if (st < 0) { static int n; e->bad |= 0x80; if (n++ < 16) NLOG("[RED] shader %02x%02x%02x%02x%02x%02x%02x%02x is not in the shader map: the draws of its program are skipped", k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]); continue; }
+            e->has |= (uint8_t)(1u << st); if (!(e->sh[st] = vkn_shader_get(k, st))) e->bad |= (uint8_t)(1u << st);
+        }
+        nvn_hm_put(&g_progs, &ser, e);
+    }
+    lp = p; ls = p->serial; le = e;
+    return e;
+}
+
+// ---- Layouts: one push-descriptor set per (vertex, pixel) pair, vertex bindings 0-31 and pixel bindings 32-63 (vk_shader.c), kept for the run. A pair whose interface does not match is refused
+// with it (the same red line, its draws skipped): every pixel input variable written by the vertex shader as the same variable, at each of its locations the same first location, component
+// type, components and array lengths (Vulkan's interface matching, as dmsh_build_vk.py pair_inputs: a vec4[2] is not two vec4s; more components out than in needs maintenance4, which is not
+// enabled, and slice 0's chain pads without widening). Component decorations (two variables sharing a location) cannot reach here: the builder marks them unsupported (structure()), a module
+// whose status is not ok is refused, and spv_sha256 ties a reflection to its SPIR-V, so each location is one whole variable's ----
+typedef struct { VkDescriptorSetLayout dsl; VkPipelineLayout pl; int n; } lay_ent;
+static void io_desc(const vkn_shader *s, uint32_t l, char *o, size_t n) {   // location l's variable: "sint x4", "float x4[2] from 0"
+    static const char *const tn[3] = {"float", "uint", "sint"};
+    int k = snprintf(o, n, "%s x%u", tn[s->io_ct[l] % 3], s->io_n[l]);
+    for (int d = 0; d < s->io_nd[l] && k > 0 && (size_t)k < n; d++) k += snprintf(o + k, n - (size_t)k, "[%u]", s->io_dims[l][d]);
+    if (s->io_nd[l] && k > 0 && (size_t)k < n) snprintf(o + k, n - (size_t)k, " from %u", s->io_first[l]);
+}
+static nvn_hmap g_lays = {.klen = 8};
+static lay_ent g_lay_bad;
+static const lay_ent *lay_get(const vkn_shader *vs, const vkn_shader *ps) {
+    static const vkn_shader *lv, *lps; static const lay_ent *ll;
+    if (vs == lv && ps == lps && ll) return ll;
+    uint64_t k = (uint64_t)vs->id << 32 | (ps ? ps->id : 0); lay_ent *e = nvn_hm_get(&g_lays, &k);
+    if (!e) {
+        VkDescriptorSetLayoutBinding b[2 * VKN_MAXB]; uint32_t n = 0;
+        for (int s = 0; s < 2; s++) { const vkn_shader *sh = s ? ps : vs; if (!sh) continue;
+            for (int i = 0; i < sh->nb; i++) b[n++] = (VkDescriptorSetLayoutBinding){sh->b[i].binding, sh->b[i].kind == VKN_B_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                                                                    s ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT, NULL}; }
+        e = &g_lay_bad; char why[128] = "";
+        for (uint32_t l = 0; ps && l < 32 && !*why; l++) if (ps->io_mask >> l & 1) {
+            if (!(vs->io_mask >> l & 1)) snprintf(why, sizeof why, "the pixel shader reads location %u, the vertex shader does not write it", l);
+            else if (vs->io_ct[l] != ps->io_ct[l] || vs->io_n[l] != ps->io_n[l] || vs->io_first[l] != ps->io_first[l] || vs->io_nd[l] != ps->io_nd[l] || memcmp(vs->io_dims[l], ps->io_dims[l], 4)) {
+                char wv[40], rv[40]; io_desc(vs, l, wv, sizeof wv); io_desc(ps, l, rv, sizeof rv);
+                snprintf(why, sizeof why, "location %u: written as %s, read as %s", l, wv, rv); }
+        }
+        if (*why) NLOG("[RED] shaders %s and %s do not match (%s): their draws are skipped", vs->key, ps->key, why);
+        else if (n > vd.max_push) NLOG("[RED] shaders %s and %s have %u bindings, past the device's %u push descriptors: their draws are skipped (more sets are a later slice)", vs->key, ps ? ps->key : "-", n, vd.max_push);
+        else {
+            lay_ent *m = calloc(1, sizeof *m); if (!m) die("vkn backend: layout entry allocation failed");
+            VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, n, b};
+            VkResult r = vk.vkCreateDescriptorSetLayout(vd.dev, &di, NULL, &m->dsl);
+            VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &m->dsl, 0, NULL};
+            if (!r && (r = vk.vkCreatePipelineLayout(vd.dev, &pi, NULL, &m->pl))) vk.vkDestroyDescriptorSetLayout(vd.dev, m->dsl, NULL);
+            if (r) { NLOG("[RED] the layout of shaders %s and %s cannot be made (VkResult %d): their draws are skipped", vs->key, ps ? ps->key : "-", r); free(m); }
+            else { m->n = (int)n; e = m; DS(g_lay_made, 1); }
+        }
+        nvn_hm_put(&g_lays, &k, e);
+    }
+    lv = vs; lps = ps; ll = e;
+    return e;
+}
+
+// ---- Formats ----
+static int fmt_comp(VkFormat f) {   // a format's numeric class as a shader reads it: 0 float (and normalized), 1 unsigned integer, 2 signed integer
+    switch (f) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_B8G8R8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+        case VK_FORMAT_A2R10G10B10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_S8_UINT: return 1;
+        case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_B8G8R8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+        case VK_FORMAT_A2R10G10B10_SINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT: return 2;
+        default: return 0;
+    }
+}
+static VkFormatFeatureFlags fmt_opt(VkFormat f, int buffer) {   // optimal-tiling (attachment blend) or buffer (vertex) features, cached
+    static struct { VkFormat f; VkFormatFeatureFlags o, b; } c[32]; static int n;
+    for (int i = 0; i < n; i++) if (c[i].f == f) return buffer ? c[i].b : c[i].o;
+    VkFormatProperties p; vk.vkGetPhysicalDeviceFormatProperties(vd.pd, f, &p);
+    if (n < 32) { c[n].f = f; c[n].o = p.optimalTilingFeatures; c[n++].b = p.bufferFeatures; }
+    return buffer ? p.bufferFeatures : p.optimalTilingFeatures;
+}
+// NVN vertex formats as (components, bits, kind); kinds in VkFormat's order within a size (UNORM SNORM USCALED SSCALED UINT SINT, then SFLOAT), so a VkFormat is computed from them
+enum { VK_UN, VK_SN, VK_US, VK_SS, VK_UI, VK_SI, VK_F };
+static VkFormat vkf(int n, int bits, int kind) {
+    static const int b8[4] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}, b16[4] = {VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16A16_UNORM},
+                     b32[4] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32A32_UINT};
+    if (n < 1 || n > 4) return VK_FORMAT_UNDEFINED;
+    if (bits == 8) return kind < VK_F ? (VkFormat)(b8[n - 1] + kind) : VK_FORMAT_UNDEFINED;
+    if (bits == 16) return (VkFormat)(b16[n - 1] + kind);
+    if (bits == 32) return kind == VK_UI ? (VkFormat)b32[n - 1] : kind == VK_SI ? (VkFormat)(b32[n - 1] + 1) : kind == VK_F ? (VkFormat)(b32[n - 1] + 2) : VK_FORMAT_UNDEFINED;
+    return VK_FORMAT_UNDEFINED;
+}
+// The VkFormat of NVN vertex format f for an input of component type ct (as nvn_mtl.m's vfmt + vfmt_for_ct): integers keep their bits (a sign change, 32-bit floats as integers and the reverse);
+// an integer input fed a normalized, half or packed format reads its raw bytes as the integer format of the same layout (red: Maxwell gives the converted float's bits, nvn_mtl.m converts
+// them on the CPU, a later slice here); a float input fed 8- or 16-bit integers reads them scaled (red: Maxwell gives the raw bits). UNDEFINED = none
+static VkFormat vtx_fmt(unsigned f, int ct) {
+    int n = 0, bits = 0, kind = -1;
+    static const struct { uint8_t bits, kind; } t12[12] = {{8, VK_UN}, {8, VK_SN}, {8, VK_UI}, {8, VK_SI}, {16, VK_F}, {16, VK_UN}, {16, VK_SN}, {16, VK_UI}, {16, VK_SI}, {32, VK_F}, {32, VK_UI}, {32, VK_SI}};
+    if (f >= 0x01 && f <= 0x30) { n = (int)(f - 1) / 12 + 1; bits = t12[(f - 1) % 12].bits; kind = t12[(f - 1) % 12].kind; }
+    else if (f >= 0x51 && f <= 0x68) { int i = (int)(f - 0x51) >> 1; n = i / 3 + 1; bits = 8 << (i % 3); kind = (f - 0x51) & 1 ? VK_SS : VK_US; if (bits == 32) return VK_FORMAT_UNDEFINED; }   // integers read as floats: scaled
+    else {
+        VkFormat pf = f == 0x3D ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : f == 0x69 ? VK_FORMAT_A2B10G10R10_SNORM_PACK32 : f == 0x3F ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : f == 0x9A ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED;
+        if (!pf || !ct) return pf;
+        NRED_ONCE("vertex format %#x feeds an integer input: its raw bytes are read as integers (Maxwell gives the converted float's bits; a CPU conversion is a later slice)", f);
+        return f == 0x3D || f == 0x69 ? (ct == 1 ? VK_FORMAT_A2B10G10R10_UINT_PACK32 : VK_FORMAT_A2B10G10R10_SINT_PACK32) : f == 0x9A ? vkf(4, 8, ct == 1 ? VK_UI : VK_SI) : vkf(1, 32, ct == 1 ? VK_UI : VK_SI);
+    }
+    if (ct == 1 || ct == 2) {
+        int want = ct == 1 ? VK_UI : VK_SI;
+        if (kind != VK_UI && kind != VK_SI && !(kind == VK_F && bits == 32))
+            NRED_ONCE("vertex format %#x feeds an integer input: its raw bytes are read as integers (Maxwell gives the converted float's bits; a CPU conversion is a later slice)", f);
+        return vkf(n, bits, want);
+    }
+    if (kind == VK_UI || kind == VK_SI) {
+        if (bits == 32) return vkf(n, 32, VK_F);   // the same bits as floats (nvn_mtl.m)
+        NRED_ONCE("vertex format %#x (integers) feeds a float input: read scaled to float (Maxwell gives the raw bits)", f);
+        return vkf(n, bits, kind == VK_UI ? VK_US : VK_SS);
+    }
+    return vkf(n, bits, kind);
+}
+// The bytes a vertex fetch of NVN vertex format f reads (vtx_fmt's decoding; the integer reinterpretations it makes keep the size). 0 = a format vtx_fmt has none for (the draw is skipped there)
+static uint32_t vtx_bytes(unsigned f) {
+    static const uint8_t b12[12] = {8, 8, 8, 8, 16, 16, 16, 16, 16, 32, 32, 32};
+    if (f >= 0x01 && f <= 0x30) return ((f - 1) / 12 + 1) * b12[(f - 1) % 12] / 8;
+    if (f >= 0x51 && f <= 0x68) { unsigned i = (f - 0x51) >> 1; return (i / 3 + 1) * (8u << (i % 3)) / 8; }
+    return f == 0x3D || f == 0x69 || f == 0x3F || f == 0x9A ? 4 : 0;
+}
+static VkBlendFactor bfac(unsigned f) {   // nvn_mtl.m's bfac; the dual-source ones are refused before (draw_key)
+    switch (f) { case 1: return VK_BLEND_FACTOR_ZERO; case 2: return VK_BLEND_FACTOR_ONE; case 3: return VK_BLEND_FACTOR_SRC_COLOR; case 4: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case 5: return VK_BLEND_FACTOR_SRC_ALPHA; case 6: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; case 7: return VK_BLEND_FACTOR_DST_ALPHA; case 8: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case 9: return VK_BLEND_FACTOR_DST_COLOR; case 10: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR; case 11: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+        case 0x10: return VK_BLEND_FACTOR_SRC1_COLOR; case 0x11: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR; case 0x12: return VK_BLEND_FACTOR_SRC1_ALPHA; case 0x13: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+        case 0x61: return VK_BLEND_FACTOR_CONSTANT_COLOR; case 0x62: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR; case 0x63: return VK_BLEND_FACTOR_CONSTANT_ALPHA; case 0x64: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA; }
+    return VK_BLEND_FACTOR_ONE;
+}
+static VkBlendOp bop(unsigned e) { switch (e) { case 2: return VK_BLEND_OP_SUBTRACT; case 3: return VK_BLEND_OP_REVERSE_SUBTRACT; case 4: return VK_BLEND_OP_MIN; case 5: return VK_BLEND_OP_MAX; } return VK_BLEND_OP_ADD; }
+static blend_st adv_blend(blend_st b) {   // nvn_mtl.m's: the Porter-Duff advanced modes as fixed-function factors; others keep the state's functions, said
+    if (!b.adv) return b;
+    enum { Z = NVN_BLEND_FUNC_ZERO, O = NVN_BLEND_FUNC_ONE, SA = NVN_BLEND_FUNC_SRC_ALPHA, ISA = NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA, DA = NVN_BLEND_FUNC_DST_ALPHA, IDA = NVN_BLEND_FUNC_ONE_MINUS_DST_ALPHA };
+    static const uint8_t pd[][4] = {
+        [NVN_BLEND_ADVANCED_MODE_ZERO] = {Z, Z, Z, Z},        [NVN_BLEND_ADVANCED_MODE_SRC] = {O, Z, O, Z},           [NVN_BLEND_ADVANCED_MODE_DST] = {Z, O, Z, O},
+        [NVN_BLEND_ADVANCED_MODE_SRC_OVER] = {O, ISA, O, ISA}, [NVN_BLEND_ADVANCED_MODE_DST_OVER] = {IDA, O, IDA, O},
+        [NVN_BLEND_ADVANCED_MODE_SRC_IN] = {DA, Z, DA, Z},     [NVN_BLEND_ADVANCED_MODE_DST_IN] = {Z, SA, Z, SA},
+        [NVN_BLEND_ADVANCED_MODE_SRC_OUT] = {IDA, Z, IDA, Z},  [NVN_BLEND_ADVANCED_MODE_DST_OUT] = {Z, ISA, Z, ISA},
+        [NVN_BLEND_ADVANCED_MODE_SRC_ATOP] = {DA, ISA, Z, O},  [NVN_BLEND_ADVANCED_MODE_DST_ATOP] = {IDA, SA, O, Z},
+        [NVN_BLEND_ADVANCED_MODE_XOR] = {IDA, ISA, IDA, ISA},  [NVN_BLEND_ADVANCED_MODE_PLUS] = {O, O, O, O},
+        [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED] = {O, O, O, O}, [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED_ALPHA] = {O, O, O, O},
+    };
+    const uint8_t *f = b.adv < sizeof pd / sizeof *pd && pd[b.adv][0] ? pd[b.adv] : NULL;
+    if (!f || b.adv_ovl || (b.adv_npm && f[0] != O && f[0] != Z)) {
+        static uint64_t seen; if (!(seen >> (b.adv & 63) & 1)) { seen |= 1ull << (b.adv & 63);
+            NLOG("[RED] advanced blend mode %#x (overlap %d, %spremultiplied source) has no fixed-function equivalent: the state's blend functions are used", (unsigned)b.adv, (int)b.adv_ovl, b.adv_npm ? "not " : ""); }
+        return b;
+    }
+    b.src_rgb = b.adv_npm && f[0] == O ? SA : f[0]; b.dst_rgb = f[1]; b.src_a = f[2]; b.dst_a = f[3];
+    b.eq_rgb = b.eq_a = NVN_BLEND_EQUATION_ADD;
+    return b;
+}
+
+// ---- Pipelines: vkn's key (every field the pipeline is made from; memset first, so padding is zero), cached for the run (never destroyed: an open item) ----
+typedef struct {
+    uint32_t vs, ps, nc, cf[8], df, sf;
+    uint8_t topo, restart, cull, front, pmode, bias, dclamp, clip11, a2c, nin, nbd, pad0;
+    uint8_t ben[8], wm[8], bsc[8], bdc[8], bec[8], bsa[8], bda[8], bea[8];
+    uint8_t dt, dw, dcmp, st, scmp[2], sfail[2], szfail[2], szpass[2], pad1[2];
+    struct { uint32_t fmt, off; uint8_t loc, bind, pad[2]; } in[16];
+    struct { uint32_t stride; uint8_t idx, rate, pad[2]; } bd[16];
+} pso_key;
+static nvn_hmap g_psos = {.klen = sizeof(pso_key)};
+static const char g_pso_bad;
+#define PSO_BAD ((void *)&g_pso_bad)
+static VkPipeline pso_make(const pso_key *k, const vkn_shader *vs, const vkn_shader *ps, VkPipelineLayout pl) {
+    VkPipelineShaderStageCreateInfo stg[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs->mod, "main", NULL},
+                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps ? ps->mod : VK_NULL_HANDLE, "main", NULL}};
+    VkVertexInputAttributeDescription ad[16]; VkVertexInputBindingDescription bd[16];
+    for (int i = 0; i < k->nin; i++) ad[i] = (VkVertexInputAttributeDescription){k->in[i].loc, k->in[i].bind, (VkFormat)k->in[i].fmt, k->in[i].off};
+    for (int i = 0; i < k->nbd; i++) bd[i] = (VkVertexInputBindingDescription){k->bd[i].idx, k->bd[i].stride, k->bd[i].rate ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, k->nbd, bd, k->nin, ad};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, k->restart};
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->clip11 ? &dcc : NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->dclamp, VK_FALSE, (VkPolygonMode)k->pmode, k->cull, (VkFrontFace)k->front, k->bias, 0, 0, 0, 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
+    VkStencilOpState sf = {(VkStencilOp)k->sfail[0], (VkStencilOp)k->szpass[0], (VkStencilOp)k->szfail[0], (VkCompareOp)k->scmp[0], 0, 0, 0},
+                     sb = {(VkStencilOp)k->sfail[1], (VkStencilOp)k->szpass[1], (VkStencilOp)k->szfail[1], (VkCompareOp)k->scmp[1], 0, 0, 0};
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->dt, k->dw, (VkCompareOp)k->dcmp, VK_FALSE, k->st, sf, sb, 0, 1};
+    VkPipelineColorBlendAttachmentState ba[8];
+    for (uint32_t i = 0; i < k->nc; i++) ba[i] = (VkPipelineColorBlendAttachmentState){k->ben[i], (VkBlendFactor)k->bsc[i], (VkBlendFactor)k->bdc[i], (VkBlendOp)k->bec[i], (VkBlendFactor)k->bsa[i], (VkBlendFactor)k->bda[i], (VkBlendOp)k->bea[i], k->wm[i]};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY, k->nc, ba, {0, 0, 0, 0}};
+    static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                         VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
+    VkFormat cf[8]; for (uint32_t i = 0; i < k->nc; i++) cf[i] = (VkFormat)k->cf[i];
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->nc, cf, (VkFormat)k->df, (VkFormat)k->sf};
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, ps ? 2 : 1, stg, &vi, &ia, NULL, &vps, &rs, &ms, &ds, &cb, &dy, pl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
+    VkPipeline p; uint64_t t0 = now_ns();
+    VkResult r = vk.vkCreateGraphicsPipelines(vd.dev, g_pcache, 1, &gi, NULL, &p);
+    uint64_t dt = now_ns() - t0;
+    if (r) { DS(g_pso_fail, 1); NLOG("[RED] vkCreateGraphicsPipelines failed (VkResult %d) for shaders %s and %s: their draws with this state are skipped", r, vs->key, ps ? ps->key : "-"); return VK_NULL_HANDLE; }
+    uint64_t n = DS(g_pso_made, 1); DS(g_pso_ns, dt);
+    for (uint64_t m = atomic_load(&g_pso_max); dt > m && !atomic_compare_exchange_weak(&g_pso_max, &m, dt); ) {}
+    if (n < 8 || dt > 20000000ull) NLOG("pipeline %llu: shaders %s and %s, %u colour targets, depth %d stencil %d, %.2f ms to make (frame %llu)", (unsigned long long)n + 1, vs->key, ps ? ps->key : "-", k->nc, k->df != 0, k->sf != 0,
+                                        (double)dt / 1e6, (unsigned long long)atomic_load(&g_present_n));
+    return p;
+}
+// The key of the draw about to be recorded (the pass open: its formats). 0 = a state this slice cannot draw (said once), the draw skipped
+static int draw_key(pso_key *k, const vkn_shader *vs, const vkn_shader *ps, int prim, int indexed, int itype, uint32_t *zbind) {
+    memset(k, 0, sizeof *k);
+    k->vs = vs->id; k->ps = ps ? ps->id : 0;
+    static const int8_t topo[16] = {-1, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+                                    -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    int tp = prim >= 0 && prim < 16 ? topo[prim] : -1;
+    if (tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && vd.port) tp = -1;   // the portability subset's triangleFans is not asked for
+    if (tp < 0) { NRED_ONCE("draws of primitive %d (points, loops, quads, polygons, adjacency and patches are a later slice): skipped", prim); return 0; }
+    k->topo = (uint8_t)tp;
+    if (S.restart.on && indexed && (tp == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || tp == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)) {
+        uint32_t all = itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 0xffffu : 0xffffffffu;
+        if (S.restart.index != all) NRED_ONCE("primitive restart index %#x (Vulkan restarts at all ones only): restarted at %#x", S.restart.index, all);
+        k->restart = 1;
+    }   // lists: no restart (as nvn_mtl.m)
+    k->cull = (uint8_t)S.poly.cull;
+    k->front = (uint8_t)(vkn_origin_ll() ? S.poly.front == NVN_FRONT_FACE_CCW : S.poly.front != NVN_FRONT_FACE_CCW);   // VK_FRONT_FACE_CLOCKWISE = 1 (see the section's head)
+    int pm = S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    unsigned ob = pm == VK_POLYGON_MODE_POINT ? NVN_POLYGON_OFFSET_ENABLE_POINT : pm == VK_POLYGON_MODE_LINE ? NVN_POLYGON_OFFSET_ENABLE_LINE : NVN_POLYGON_OFFSET_ENABLE_FILL;   // NVN's mode picks the enable, also where it is filled below
+    if (pm != VK_POLYGON_MODE_FILL && !vd.fill_ns) { NRED_ONCE("polygon mode %u, and the device has no fillModeNonSolid: filled", (unsigned)S.poly.mode); pm = VK_POLYGON_MODE_FILL; }
+    k->pmode = (uint8_t)pm;
+    k->bias = (S.poly.offset_en & ob) && tp >= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && R.hd;
+    if (S.depth_clamp && !vd.depth_clamp) NRED_ONCE("depth clamp on, and the device has no depthClamp: depth is clipped");
+    k->dclamp = S.depth_clamp && vd.depth_clamp;
+    if (!atomic_load_explicit(&g_depth_zero, memory_order_relaxed)) { if (vd.clip_ctl) k->clip11 = 1; else NRED_ONCE("NVN clips z at -w, and the device has no depth clip control: clipped at 0"); }
+    if (S.color.logic_op != NVN_LOGIC_OP_COPY) NRED_ONCE("logic op %u (Vulkan's needs logicOp, a later slice): not applied", (unsigned)S.color.logic_op);
+    if (S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) NRED_ONCE("alpha test function %u (a shader's to do in Vulkan, a later slice): not applied", (unsigned)S.color.alpha_func);
+    // Alpha to coverage takes colour 0's alpha: Vulkan wants an output at location 0, component 3, Index 0 (VUID-VkGraphicsPipelineCreateInfo-alphaToCoverageEnable-08891). On only where the
+    // pixel shader writes all four components at location 0 and has no output of Index other than 0 (sh->dual): the reflection's outputs do not tell an Index, so location 0's four components
+    // may be an Index 1 output's with no Index 0 one. Such a shader has it off rather than being refused: refusing it would skip its draws, which draw otherwise (dual-source blend factors are
+    // said in red below), and none of Stardew Valley's 65 modules has an Index decoration. A scalar alpha alone (location 0, component 3) needs a Component decoration, which the builder refuses
+    k->a2c = S.ms.a2c && ps && (ps->out_mask & 1) && ps->out_n[0] == 4 && !ps->dual;
+    if (S.ms.a2c && ps && ps->dual) NRED_ONCE("alpha to coverage on, and the pixel shader %s has an output of Index 1 (dual-source): off", ps->key);
+    else if (S.ms.a2c && !k->a2c) NRED_ONCE("alpha to coverage on, and the pixel shader %s writes no alpha at location 0: off", ps ? ps->key : "(none)");
+    // Colour: the pass's formats; blending where enabled, the format blends and the shader writes the target; the channel mask where the shader writes the target in its format's class
+    k->nc = R.nc;
+    for (uint32_t i = 0; i < R.nc; i++) {
+        VkFormat f = R.cf[i]; k->cf[i] = (uint32_t)f;
+        if (!f) continue;
+        int wr = ps && (ps->out_mask >> i & 1);
+        if (wr && ps->out_ct[i] != fmt_comp(f)) { NRED_ONCE("shader %s writes target %u as %s, its format %d is %s: not written", ps->key, i, ps->out_ct[i] ? "integers" : "floats", f, fmt_comp(f) ? "integer" : "float"); wr = 0; }
+        if (!wr) continue;
+        k->wm[i] = (uint8_t)(S.chmask.mask >> (4 * i) & 0xf);
+        if (!(S.color.blend_en >> i & 1) || fmt_comp(f) || !(fmt_opt(f, 0) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) continue;
+        blend_st b = adv_blend(S.blend[i]);
+        if ((b.src_rgb >= 0x10 && b.src_rgb <= 0x13) || (b.dst_rgb >= 0x10 && b.dst_rgb <= 0x13) || (b.src_a >= 0x10 && b.src_a <= 0x13) || (b.dst_a >= 0x10 && b.dst_a <= 0x13)) {
+            NRED_ONCE("dual-source blending (factors %u %u %u %u: the shaders write no second colour, a later slice): not blended", b.src_rgb, b.dst_rgb, b.src_a, b.dst_a); continue; }
+        k->ben[i] = 1; k->bsc[i] = (uint8_t)bfac(b.src_rgb); k->bdc[i] = (uint8_t)bfac(b.dst_rgb); k->bec[i] = (uint8_t)bop(b.eq_rgb);
+        k->bsa[i] = (uint8_t)bfac(b.src_a); k->bda[i] = (uint8_t)bfac(b.dst_a); k->bea[i] = (uint8_t)bop(b.eq_a);
+    }
+    if (!vd.indep_blend) for (uint32_t i = 1; i < k->nc; i++) if (k->ben[i] != k->ben[0] || k->wm[i] != k->wm[0] || k->bsc[i] != k->bsc[0] || k->bdc[i] != k->bdc[0] || k->bec[i] != k->bec[0] ||
+                                                                 k->bsa[i] != k->bsa[0] || k->bda[i] != k->bda[0] || k->bea[i] != k->bea[0]) {
+        NRED_ONCE("targets blend or mask differently, and the device has no independentBlend: all take target 0's");
+        k->ben[i] = k->ben[0]; k->wm[i] = k->wm[0]; k->bsc[i] = k->bsc[0]; k->bdc[i] = k->bdc[0]; k->bec[i] = k->bec[0]; k->bsa[i] = k->bsa[0]; k->bda[i] = k->bda[0]; k->bea[i] = k->bea[0]; }
+    // Depth and stencil (nvn_mtl.m dss_get: a depth write only with the test on); NVN's compare functions and stencil operations are Vulkan's plus one
+    if (R.hd) { k->df = (uint32_t)R.dsf; if (S.ds.dt) { k->dt = 1; k->dw = S.ds.dw; k->dcmp = (uint8_t)(S.ds.df >= 1 && S.ds.df <= 8 ? S.ds.df - 1 : VK_COMPARE_OP_ALWAYS); } }
+    if (R.hs) { k->sf = (uint32_t)R.dsf;
+        if (S.ds.st) { k->st = 1; const unsigned c[2] = {S.ds.sf_f, S.ds.sf_b}, fl[2] = {S.ds.fail_f, S.ds.fail_b}, zf[2] = {S.ds.zfail_f, S.ds.zfail_b}, zp[2] = {S.ds.zpass_f, S.ds.zpass_b};
+            for (int f = 0; f < 2; f++) { k->scmp[f] = (uint8_t)(c[f] >= 1 && c[f] <= 8 ? c[f] - 1 : VK_COMPARE_OP_ALWAYS); k->sfail[f] = (uint8_t)(fl[f] >= 1 && fl[f] <= 8 ? fl[f] - 1 : 0);
+                                          k->szfail[f] = (uint8_t)(zf[f] >= 1 && zf[f] <= 8 ? zf[f] - 1 : 0); k->szpass[f] = (uint8_t)(zp[f] >= 1 && zp[f] <= 8 ? zp[f] - 1 : 0); } } }
+    // Vertex inputs: each the shader reads, from its NVN attribute's stream; one nothing feeds (no attribute, or no buffer bound) reads zeros from the zero buffer at a stream index no fed input uses
+    uint32_t used = 0; *zbind = UINT32_MAX;
+    for (int i = 0; i < vs->nin; i++) { int l = vs->in[i].loc; va_st a = l < S.nattr ? S.attr[l] : (va_st){0}; if (a.fmt && a.stream < 16 && S.vbuf[a.stream].address) used |= 1u << a.stream; }
+    for (int i = 0; i < vs->nin; i++) {
+        int l = vs->in[i].loc, ct = vs->in[i].ct; va_st a = l < S.nattr ? S.attr[l] : (va_st){0};
+        k->in[i].loc = (uint8_t)l;
+        if (a.fmt && a.stream < 16 && S.vbuf[a.stream].address) {
+            VkFormat f = vtx_fmt(a.fmt, ct);
+            if (!f || !(fmt_opt(f, 1) & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) { NRED_ONCE("vertex format %#x (as %d) for a %s input: the device cannot fetch it, the draws are skipped", a.fmt, f, ct ? "integer" : "float"); return 0; }
+            if (a.offset > vd.props.limits.maxVertexInputAttributeOffset) { NRED_ONCE("vertex attribute offset %u past the device's %u: skipped", a.offset, vd.props.limits.maxVertexInputAttributeOffset); return 0; }
+            k->in[i].fmt = (uint32_t)f; k->in[i].off = a.offset; k->in[i].bind = (uint8_t)a.stream;
+        } else {
+            if (*zbind == UINT32_MAX) { for (int s = 15; s >= 0 && *zbind == UINT32_MAX; s--) if (!(used >> s & 1)) *zbind = (uint32_t)s; }
+            k->in[i].fmt = (uint32_t)(ct == 1 ? VK_FORMAT_R32G32B32A32_UINT : ct == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT); k->in[i].bind = (uint8_t)*zbind;
+        }
+    }
+    k->nin = (uint8_t)vs->nin;
+    for (int s = 0; s < 16; s++) if (used >> s & 1) {
+        vs_st t = S.stream[s];
+        if (t.divisor > 1) { NRED_ONCE("vertex stream divisor %u (VK_EXT_vertex_attribute_divisor is a later slice): skipped", t.divisor); return 0; }
+        if (t.stride > vd.props.limits.maxVertexInputBindingStride) { NRED_ONCE("vertex stride %u past the device's %u: skipped", t.stride, vd.props.limits.maxVertexInputBindingStride); return 0; }
+        k->bd[k->nbd].idx = (uint8_t)s; k->bd[k->nbd].stride = t.stride; k->bd[k->nbd++].rate = t.divisor != 0;
+    }
+    if (*zbind != UINT32_MAX) { k->bd[k->nbd].idx = (uint8_t)*zbind; k->bd[k->nbd++].stride = 0; }
+    return 1;
+}
+
+// ---- Descriptors: every binding of the pair gets one (a dummy where nothing usable is bound), pushed at each draw ----
+// [addr, ...) in a pool with a shadow (nvn_vk.c's own lookup, under g_pmu): the shadow, the offset in it, the pool's own bytes from addr on; the shadow's last use is this submission
+static int b_use(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail) {
+    int ok = 0;
+    pthread_mutex_lock(&g_pmu);
+    int i = g_plast >= 0 && g_plast < g_npool && g_pools[g_plast].sh && in_pool(g_plast, addr, 1) ? g_plast : -1;
+    for (int k = 0; i < 0 && k < g_npool; k++) if (g_pools[k].sh && in_pool(k, addr, 1)) i = g_plast = k;
+    if (i >= 0) { b_shadow *s = g_pools[i].sh; *buf = s->buf; *off = addr - g_pools[i].lo; *avail = g_pools[i].end - addr; s->use_nvn = atomic_load(&g_fence) + 1; ok = 1; }
+    pthread_mutex_unlock(&g_pmu);
+    return ok;
+}
+#define RING_B (1u << 20)
+static int ring_take(uint64_t n, VkBuffer *buf, uint64_t *off, uint8_t **p) {   // n bytes of this slot's ring at the device's uniform alignment (the slot's last submission has completed: mtl_sub_begin)
+    sub_slot *s = g_cur; uint64_t al = vd.props.limits.minUniformBufferOffsetAlignment ? vd.props.limits.minUniformBufferOffsetAlignment : 256;
+    if (!s->ring && !s->ring_no) { void *m; if (buf_host(RING_B, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &s->ring, &s->ring_mem, &m)) s->ring_map = m; else { s->ring_no = 1; NRED_ONCE("the uniform ring cannot be made: draws whose uniform buffer is at an unaligned address are skipped"); } }
+    if (!s->ring) return 0;
+    uint64_t o = (s->ring_used + al - 1) & ~(al - 1);
+    if (o + n > RING_B) { NRED_ONCE("more than %u KiB of unaligned uniform buffers in a submission: the draws past it are skipped", RING_B >> 10); return 0; }
+    s->ring_used = o + n; *buf = s->ring; *off = o; *p = s->ring_map + o;
+    return 1;
+}
+// A uniform binding: NVN slot reg of the stage, bound with its size, cut to the pool's own end and the device's range. At an offset the device cannot bind (minUniformBufferOffsetAlignment),
+// its bytes are copied now into the ring (as they are at the replay; the shadow has them as of the commit: the same moment of the submission). 0 = the draw is skipped
+static int draw_ubo(int st, const vkn_shader *sh, const vkn_sbind *b, VkDescriptorBufferInfo *o) {
+    uint64_t lim = vd.props.limits.maxUniformBufferRange < 65536 ? vd.props.limits.maxUniformBufferRange : 65536;
+    if (b->kind == VKN_B_C1) { *o = (VkDescriptorBufferInfo){sh->c1_buf, 0, sh->c1_n}; return 1; }
+    *o = (VkDescriptorBufferInfo){g_zbuf, 0, ZBUF_B < lim ? ZBUF_B : lim};
+    if (b->kind == VKN_B_ZERO) return 1;
+    const p_bind_buf *u = &S.ubo[st][b->reg]; VkBuffer buf; uint64_t off, avail;
+    if (!u->addr || !u->size) { NRED_ONCE("shader %s reads uniform slot %u of stage %d, which has no buffer bound: it reads zeros", sh->key, b->reg, st); DS(g_ddum, 1); return 1; }
+    if (!b_use(u->addr, &buf, &off, &avail)) { NRED_ONCE("uniform buffer %#llx (stage %d slot %u) is in no pool with a shadow: it reads zeros", (unsigned long long)u->addr, st, b->reg); DS(g_ddum, 1); return 1; }
+    uint64_t r = u->size;
+    if (r > lim || r > avail) { r = r > lim ? lim : r; r = r > avail ? avail : r; DS(g_ubo_short, 1); }
+    DS(g_ubo_n, 1);
+    uint64_t al = vd.props.limits.minUniformBufferOffsetAlignment;
+    if (al && off % al) {
+        uint8_t *p; DS(g_ubo_unal, 1);
+        if (!ring_take(r, &buf, &off, &p)) return 0;
+        memcpy(p, (const void *)(uintptr_t)u->addr, (size_t)r);
+    }
+    *o = (VkDescriptorBufferInfo){buf, off, r};
+    return 1;
+}
+static void draw_tex_prep(void) {   // a draw with a program: everything said to be resolved again becomes per-slot dirty bits (the slots its shaders sample are resolved, draw_view / draw_samp)
+    uint64_t g = atomic_load_explicit(&g_reg_gen, memory_order_acquire);
+    if (g != T.gen) { T.gen = g; T.all = 0x3f; }
+    for (int st = 0; st < 2; st++) if (T.all >> st & 1) {
+        T.all &= ~(1u << st);
+        for (int w = 0; w < 4; w++) T.td[st][w] |= T.tb[st][w];
+        for (int w = 0; w < 2; w++) { T.tsd[st][w] |= T.tb[st][w]; T.sd[st][w] |= T.sb[st][w]; }
+    }
+}
+static VkImageView draw_view(int st, const vkn_shader *sh, const vkn_sbind *b) {
+    int s = b->reg; uint64_t bit = 1ull << (s & 63); uint8_t want = (uint8_t)(1 + b->vt + 3 * b->comp);
+    if (!(T.td[st][s >> 6] & bit) && T.tvt[st][s] == want) return T.tv[st][s];
+    T.td[st][s >> 6] &= ~bit; T.tvt[st][s] = want;
+    int tid = (int)(T.tex[st][s] & 0xfffff), why = 0;
+    VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why) : VK_NULL_HANDLE;
+    if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s);
+    else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
+    else if (why == TL_CUBE) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a cube, and texture ID %d is not one this slice has (cube textures are a later slice): the slot reads zeros", sh->key, st, s, tid); }
+    T.tv[st][s] = v;
+    return v;
+}
+static VkSampler draw_samp(int st, const vkn_sbind *b) {   // a binding read as integers gets the sampler's nearest twin (samp_lookup_as), looked up at each draw (Stardew Valley has none)
+    int s = b->sreg; uint64_t bit = 1ull << (s & 63);
+    if (b->comp) return samp_lookup_as(b->skind == VKN_S_TEX ? (int)(T.tex[st][s] >> 20) : b->skind == VKN_S_SAMP ? (int)(T.samp[st][s] >> 20) : s, 1);
+    if (b->skind == VKN_S_TEX) { if (T.tsd[st][s >> 6] & bit) { T.tsd[st][s >> 6] &= ~bit; T.ts[st][s] = samp_lookup((int)(T.tex[st][s] >> 20)); } return T.ts[st][s]; }
+    if (b->skind == VKN_S_SAMP) { if (T.sd[st][s >> 6] & bit) { T.sd[st][s >> 6] &= ~bit; T.ss[st][s] = samp_lookup((int)(T.samp[st][s] >> 20)); } return T.ss[st][s]; }
+    return samp_lookup(s);
+}
+
+// ---- The draw ----
+static struct { int valid; VkViewport vp; VkRect2D sc; float bc[4]; uint32_t cm[2], wm[2], ref[2]; float bias[3]; VkPipeline pso; } D;   // what the command buffer has (reset at each submission)
+static int draw_skip(int why) { DS(g_dr_skip[why], 1); return 0; }
+static float clamp01(float v) { return v >= 0.0f ? (v <= 1.0f ? v : 1.0f) : 0.0f; }   // NaN → 0
+static int op_draw(const op_hdr *h, const uint8_t *a) {
+    int indexed = h->op == OP_DRAW_IDX, prim, itype = 0; int32_t count, first = 0, bvtx = 0, binst, inst; uint64_t ibuf = 0;
+    if (indexed) { p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, h->size, &t); prim = d->prim; itype = d->itype; count = d->count; bvtx = d->base_vertex; binst = d->base_instance; inst = d->instances; ibuf = d->ibuf;
+                   if (d->ind || d->mdi_cnt) { NRED_ONCE("indirect and multi-draw indexed draws are a later slice: skipped"); return draw_skip(DK_KIND); } }
+    else { p_draw t; const p_draw *d = draw_rec(a, h->size, &t); prim = d->prim; count = d->count; first = d->first; binst = d->base_instance; inst = d->instances;
+           if (d->ind || d->mdi_cnt) { NRED_ONCE("indirect and multi-draw draws are a later slice: skipped"); return draw_skip(DK_KIND); } }
+    if (!g_draw_ok) { NRED_ONCE("a draw: the device or the draws' dummies are missing (said at start): skipped"); return draw_skip(DK_KIND); }
+    if (binst) { NRED_ONCE("a draw with base instance %d (the shaders' instance index would include it): skipped", binst); return draw_skip(DK_KIND); }
+    if (indexed && itype != NVN_INDEX_TYPE_UNSIGNED_SHORT && itype != NVN_INDEX_TYPE_UNSIGNED_INT) { NRED_ONCE("indexed draws with index type %d (8-bit indices are a later slice): skipped", itype); return draw_skip(DK_KIND); }
+    if (count <= 0) return draw_skip(DK_EMPTY);
+    // The program: its vertex and pixel shaders (no pixel program bound: none, depth only)
+    const prog_ent *pv = prog_ent_get(S.bst[0]), *pp = S.bst[1] ? prog_ent_get(S.bst[1]) : NULL;
+    for (int st = 2; st < 5; st++) if (S.bst[st] && (prog_ent_get(S.bst[st])->has >> st & 1)) { NRED_ONCE("a draw with a geometry or tessellation shader bound (a later slice): skipped"); return draw_skip(DK_SHADER); }
+    if ((pv->bad & 0x81) || (pp && (pp->bad & 0x82))) return draw_skip(DK_SHADER);   // said when the program was resolved
+    vkn_shader *vs = pv->sh[0], *ps = pp ? pp->sh[1] : NULL;
+    if (!vs) { NRED_ONCE("a draw whose program has no vertex shader: skipped"); return draw_skip(DK_SHADER); }
+    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && prim >= NVN_DRAW_PRIMITIVE_TRIANGLES) return draw_skip(DK_EMPTY);   // nothing rasterized (nvn_mtl.m skips it before the pass)
+    if (S.rast_discard) { NRED_ONCE("a draw with rasterizer discard on (transform feedback is a later slice): skipped"); return draw_skip(DK_STATE); }
+    uint32_t sw; memcpy(&sw, S.vp_sw[0], 4);
+    if (sw && sw != 0x100) NRED_ONCE("viewport swizzle %02x %02x %02x %02x (XOR the identity; only NEGATIVE_Y is followed): drawn unswizzled", S.vp_sw[0][0], S.vp_sw[0][1], S.vp_sw[0][2], S.vp_sw[0][3]);
+    const lay_ent *L = lay_get(vs, ps);
+    if (L == &g_lay_bad) return draw_skip(DK_SHADER);
+    // Resources before the pass opens (a texture's layout change ends it)
+    draw_tex_prep();
+    VkDescriptorImageInfo ii[2 * VKN_MAXB]; VkDescriptorBufferInfo bi[2 * VKN_MAXB]; VkWriteDescriptorSet wr[2 * VKN_MAXB]; uint32_t nw = 0;
+    for (int s = 0; s < 2; s++) { const vkn_shader *sh = s ? ps : vs; if (!sh) continue;
+        for (int i = 0; i < sh->nb; i++) { const vkn_sbind *b = &sh->b[i];
+            wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, b->binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, NULL, NULL};
+            if (b->kind == VKN_B_TEX) {
+                VkImageView v = draw_view(s, sh, b); VkSampler sm = draw_samp(s, b);
+                if (!v) { v = g_dview[b->comp][b->vt]; DS(g_ddum, 1); }
+                ii[nw] = (VkDescriptorImageInfo){sm ? sm : g_dsamp, v, SR_LAYOUT};
+                wr[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[nw].pImageInfo = &ii[nw];
+            } else { if (!draw_ubo(s, sh, b, &bi[nw])) return draw_skip(DK_RES); wr[nw].pBufferInfo = &bi[nw]; }
+            nw++;
+        } }
+    // Vertex and index buffers (their pages were marked as the binds and the draw were replayed: b_rec)
+    pso_key k; uint32_t zb;
+    if (!rp_begin(0)) return draw_skip(DK_STATE);   // no target (said there)
+    if (!draw_key(&k, vs, ps, prim, indexed, itype, &zb)) return draw_skip(DK_STATE);
+    // Their extent: each stream's fetches end at the last element's start plus the furthest attribute's end. The last element is known for a stream read per instance (instances - 1) and, in a
+    // draw without indices, for one read per vertex (first + count - 1): those must end within the pool's own bytes from the bound address (the shadow ends there; Vulkan has no bound past it).
+    // A stream read per vertex by an indexed draw is not checked: its bound is the largest index (base vertex added), which only a scan of the guest's indices at each draw would give, and the
+    // indices the GPU reads are those the commit uploads after the replay, not necessarily the ones such a scan saw
+    uint32_t ni = inst > 1 ? (uint32_t)inst : 1, aend[16] = {0};
+    for (int i = 0; i < vs->nin; i++) { uint32_t s = k.in[i].bind, l = k.in[i].loc; if (s >= 16 || s == zb) continue;
+        uint32_t e = k.in[i].off + vtx_bytes(S.attr[l].fmt); if (e > aend[s]) aend[s] = e; }
+    VkBuffer vb[16]; VkDeviceSize vo[16]; uint32_t nvb = 0, vb0 = 0;
+    for (int i = 0; i < k.nbd; i++) {   // the bindings in index order (draw_key lists the fed streams ascending, then the zero one)
+        uint32_t s = k.bd[i].idx; VkBuffer buf; uint64_t off = 0, avail;
+        if (s == zb) buf = g_zbuf;
+        else if (!b_use(S.vbuf[s].address, &buf, &off, &avail)) { NRED_ONCE("vertex buffer %#llx (stream %u) is in no pool with a shadow: skipped", (unsigned long long)S.vbuf[s].address, s); return draw_skip(DK_RES); }
+        else if (k.bd[i].rate || !indexed) {
+            uint64_t last = k.bd[i].rate ? ni - 1 : (uint64_t)(uint32_t)first + (uint64_t)count - 1, need = last * k.bd[i].stride + aend[s];
+            if (need > avail) { NRED_ONCE("vertex buffer %#llx (stream %u): the draw reads %llu B from it, its pool has %llu B there: skipped", (unsigned long long)S.vbuf[s].address, s, (unsigned long long)need,
+                                          (unsigned long long)avail); return draw_skip(DK_RES); }
+        }
+        if (nvb && s != vb0 + nvb) { vk.vkCmdBindVertexBuffers(cb_now(), vb0, nvb, vb, vo); nvb = 0; }
+        if (!nvb) vb0 = s;
+        vb[nvb] = buf; vo[nvb++] = off;
+    }
+    VkBuffer ib = VK_NULL_HANDLE; uint64_t io = 0;
+    if (indexed) { uint64_t avail, isz = itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : 2;
+        if (!b_use(ibuf, &ib, &io, &avail)) { NRED_ONCE("index buffer %#llx is in no pool with a shadow: skipped", (unsigned long long)ibuf); return draw_skip(DK_RES); }
+        if (io % isz) { NRED_ONCE("index buffer %#llx not aligned to its index size: skipped", (unsigned long long)ibuf); return draw_skip(DK_RES); }
+        // The indices end within the pool's own bytes (NVN gives the indices' address, no first index: the draw's are [ibuf, ibuf + count * size)); past them the shadow has none (VUID-vkCmdDrawIndexed-robustBufferAccess2-08798)
+        if ((uint64_t)count * isz > avail) { NRED_ONCE("index buffer %#llx: %d indices of %llu B run past its pool's end (%llu B there): skipped", (unsigned long long)ibuf, count, (unsigned long long)isz,
+                                                       (unsigned long long)avail); return draw_skip(DK_RES); } }
+    // The viewport (rows as NVN gives them, flipped for upper left; NEGATIVE_Y toggles it) and scissor (cut to the pass); an empty one draws nothing
+    float vx = 0, vy = 0, vw = (float)R.area.width, vh = (float)R.area.height;
+    if (S.has_vp) { vx = S.vp[0][0]; vy = S.vp[0][1]; vw = S.vp[0][2]; vh = S.vp[0][3]; }
+    if (!(vw > 0) || !(vh > 0)) return draw_skip(DK_EMPTY);
+    const float *vb_ = vd.props.limits.viewportBoundsRange; const uint32_t *vm = vd.props.limits.maxViewportDimensions;
+    if (vw > (float)vm[0] || vh > (float)vm[1] || vx < vb_[0] || vy < vb_[0] || vx + vw > vb_[1] || vy + vh > vb_[1]) { NRED_ONCE("viewport %g %g %g %g outside the device's bounds: skipped", vx, vy, vw, vh); return draw_skip(DK_STATE); }
+    int flip = !vkn_origin_ll() ^ (sw == 0x100);
+    VkViewport vp = {vx, flip ? vy + vh : vy, vw, flip ? -vh : vh, clamp01(S.dr[0]), clamp01(S.dr[1])};
+    int64_t x0 = 0, y0 = 0, x1 = R.area.width, y1 = R.area.height;
+    if (R.has_sc) { if (R.sc.x > x0) x0 = R.sc.x; if (R.sc.y > y0) y0 = R.sc.y; if ((int64_t)R.sc.x + R.sc.w < x1) x1 = (int64_t)R.sc.x + R.sc.w; if ((int64_t)R.sc.y + R.sc.h < y1) y1 = (int64_t)R.sc.y + R.sc.h; }
+    if (x1 <= x0 || y1 <= y0) return draw_skip(DK_EMPTY);
+    VkRect2D sc = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+    // The pipeline
+    static pso_key lk; static VkPipeline lp;
+    VkPipeline p;
+    if (lp && !memcmp(&k, &lk, sizeof k)) { p = lp; DS(g_pso_hit, 1); }
+    else {
+        void *v = nvn_hm_get(&g_psos, &k);
+        if (v == PSO_BAD) return draw_skip(DK_PSO);
+        if (v) { p = (VkPipeline)v; DS(g_pso_hit, 1); }
+        else { p = pso_make(&k, vs, ps, L->pl); nvn_hm_put(&g_psos, &k, p ? (void *)p : PSO_BAD); if (!p) return draw_skip(DK_PSO); }
+        lk = k; lp = p;
+    }
+    VkCommandBuffer cb = cb_now();
+    if (!D.valid || D.pso != p) { vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); D.pso = p; }
+    if (nw) { vk.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, L->pl, 0, nw, wr); DS(g_push, 1); DS(g_dwr, nw); }
+    if (!D.valid || memcmp(&D.vp, &vp, sizeof vp)) { vk.vkCmdSetViewport(cb, 0, 1, &vp); D.vp = vp; }
+    if (!D.valid || memcmp(&D.sc, &sc, sizeof sc)) { vk.vkCmdSetScissor(cb, 0, 1, &sc); D.sc = sc; }
+    if (!D.valid || memcmp(D.bc, S.blend_color, sizeof D.bc)) { vk.vkCmdSetBlendConstants(cb, S.blend_color); memcpy(D.bc, S.blend_color, sizeof D.bc); }
+    for (int f = 0; f < 2; f++) {
+        VkStencilFaceFlags fl = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+        if (!D.valid || D.cm[f] != (S.st_vmask[f] & 0xff)) { vk.vkCmdSetStencilCompareMask(cb, fl, D.cm[f] = S.st_vmask[f] & 0xff); }
+        if (!D.valid || D.wm[f] != (S.st_wmask[f] & 0xff)) { vk.vkCmdSetStencilWriteMask(cb, fl, D.wm[f] = S.st_wmask[f] & 0xff); }
+        if (!D.valid || D.ref[f] != (S.st_ref[f] & 0xff)) { vk.vkCmdSetStencilReference(cb, fl, D.ref[f] = S.st_ref[f] & 0xff); }
+    }
+    float bias[3] = {S.po.units, S.po.clamp, S.po.factor};
+    if (bias[1] != 0 && !vd.bias_clamp) { NRED_ONCE("polygon offset clamp %g, and the device has no depthBiasClamp: unclamped", bias[1]); bias[1] = 0; }
+    if (!D.valid || memcmp(D.bias, bias, sizeof bias)) { vk.vkCmdSetDepthBias(cb, bias[0], bias[1], bias[2]); memcpy(D.bias, bias, sizeof bias); }
+    D.valid = 1;
+    if (nvb) vk.vkCmdBindVertexBuffers(cb, vb0, nvb, vb, vo);
+    if (indexed) { vk.vkCmdBindIndexBuffer(cb, ib, io, itype == NVN_INDEX_TYPE_UNSIGNED_INT ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16); vk.vkCmdDrawIndexed(cb, (uint32_t)count, ni, 0, bvtx, 0); DS(g_dr_idx, 1); }
+    else vk.vkCmdDraw(cb, (uint32_t)count, ni, (uint32_t)first, 0);
+    DS(g_dr_n, 1);
+    return 1;
+}
+static void draw_report(const char *why) {   // the draws' line, beside the GPU work one (cumulative)
+    uint64_t sl, sr; vkn_shader_stats(&sl, &sr);
+    char sk[400]; size_t o = 0; sk[0] = 0;
+    for (int i = 0; i < DK_N; i++) { uint64_t v = atomic_load(&g_dr_skip[i]); if (v && o < sizeof sk) o += (size_t)snprintf(sk + o, sizeof sk - o, "%s%s %llu", o ? ", " : "", g_dk_name[i], (unsigned long long)v); }
+    uint64_t n = atomic_load(&g_present_n), pm = atomic_load(&g_pso_made);
+    NLOG("draws up to frame %llu (%s): recorded %llu (indexed %llu), skipped: %s; shaders loaded %llu, refused %llu; layouts %llu; pipelines made %llu (%.1f ms in all, the longest %.2f ms), failed %llu, cache hits %llu; "
+         "descriptor pushes %llu, writes %llu, dummies %llu; uniform bindings %llu, at an unaligned address %llu (copied), cut short %llu; record time %.2f ms per frame (%.1f ms in all)",
+         (unsigned long long)n, why, (unsigned long long)atomic_load(&g_dr_n), (unsigned long long)atomic_load(&g_dr_idx), o ? sk : "none", (unsigned long long)sl, (unsigned long long)sr,
+         (unsigned long long)atomic_load(&g_lay_made), (unsigned long long)pm, (double)atomic_load(&g_pso_ns) / 1e6, (double)atomic_load(&g_pso_max) / 1e6, (unsigned long long)atomic_load(&g_pso_fail),
+         (unsigned long long)atomic_load(&g_pso_hit), (unsigned long long)atomic_load(&g_push), (unsigned long long)atomic_load(&g_dwr), (unsigned long long)atomic_load(&g_ddum),
+         (unsigned long long)atomic_load(&g_ubo_n), (unsigned long long)atomic_load(&g_ubo_unal), (unsigned long long)atomic_load(&g_ubo_short),
+         n ? (double)atomic_load(&g_rec_ns) / 1e6 / (double)n : 0.0, (double)atomic_load(&g_rec_ns) / 1e6);
+}
+
 void mtl_sub_begin(void) {
     mtl_init();
     if (!g_vk) { g_cur = &g_sub[0]; g_cur->npost = 0; return; }
@@ -1335,6 +2024,7 @@ void mtl_sub_begin(void) {
     pthread_mutex_lock(&g_mu); while (g_ncomp + NSUB <= i) pthread_cond_wait(&g_cv, &g_mu); pthread_mutex_unlock(&g_mu);   // the slot's last submission has completed
     g_cur = &g_sub[i % NSUB]; g_cur->npost = 0; g_cur->failed = atomic_load(&vkn_lost) || atomic_load(&g_leak);   // failed from the start: nothing is recorded (its pool may hold a buffer the lost GPU never finished)
     g_sub_id++; g_ntouch = 0; g_ntj = 0; T.all = 0x3f;   // every bound texture is looked at again in a new submission (its upload check, its layout here)
+    D.valid = 0; g_cur->ring_used = 0;   // a new command buffer: no pipeline, no dynamic state; the slot's ring is free again
     pthread_mutex_lock(&vkn_tmu); vkn_sweep(); pthread_mutex_unlock(&vkn_tmu);
     if (g_cur->failed) return;
     vk.vkResetCommandPool(vd.dev, g_cur->pool, 0);
@@ -1362,7 +2052,7 @@ static void sub_update(const void *data, uint64_t dst, uint64_t n) { if (n && cp
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 0, addr, type}); }
 
-void mtl_exec(const uint8_t *p) {
+static void exec_run(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const uint8_t *a = p + 8;
@@ -1371,7 +2061,7 @@ void mtl_exec(const uint8_t *p) {
         switch (h.op) {
             case OP_END: return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_run((const uint8_t *)(uintptr_t)t); break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = atomic_load(&g_fence) + 1; s->fenced = 1; break; }   // the fence this submission commits with
@@ -1384,7 +2074,12 @@ void mtl_exec(const uint8_t *p) {
             case OP_SET_RT: { const p_set_rt *r = (const p_set_rt *)a; rp_flush(); R.n = r->n < 0 ? 0 : r->n > 8 ? 8 : r->n; R.has_rt = 1; rt_resolve(r); T.all = 0x3f; break; }   // all: what was drawn is sampled after a barrier
             case OP_CLEAR_COLOR: op_clear_color((const p_clear_color *)a); break;
             case OP_CLEAR_DS: op_clear_ds((const p_clear_ds *)a); break;
-            case OP_DRAW: case OP_DRAW_IDX: tex_bound(0); rp_begin(0); break;   // its textures made ready (2c binds them), then the pass opens (its clears land); nothing is drawn yet
+            case OP_DRAW: case OP_DRAW_IDX:
+                if (S.bst[0]) { op_draw(&h, a); break; }
+                tex_bound(0); rp_begin(0);   // no program (slice 2b's: its textures made ready, the pass opens, its clears land)
+                NRED_ONCE("a draw with no program bound: skipped"); DS(g_dr_skip[DK_NOPROG], 1); break;
+            case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_STENCIL: case OP_POLY_OFFSET: case OP_VIEWPORTS:
+            case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_PRIM_RESTART: case OP_RAST_DISCARD: state_op(h.op, a); break;
             case OP_DISPATCH: tex_bound(1); break;
             case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: tex_bind(h.op, a); break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); op_barrier(bits); break; }
@@ -1393,6 +2088,9 @@ void mtl_exec(const uint8_t *p) {
         }
         p += h.size;
     }
+}
+void mtl_exec(const uint8_t *p) {   // the record time (outermost: the draws' line)
+    uint64_t t0 = now_ns(); exec_run(p); DS(g_rec_ns, now_ns() - t0);
 }
 uint64_t mtl_sub_commit(void) {
     sub_slot *s = g_cur;
@@ -1465,7 +2163,7 @@ void mtl_drain(void) {   // the last lines of a run (the graceful exit ends in _
         ok = ok && used < DRAIN_NS && mtl_wait(atomic_load(&g_fence), DRAIN_NS - used);
         if (!ok) NLOG("[RED] graphics suspend: the GPU work in flight has not finished in %llu s: suspended regardless (it completes behind it)", (unsigned long long)(DRAIN_NS / 1000000000ull));
     }
-    if (atomic_load(&g_present_n) >= STATS_FROM) { if (g_vk) { vkn_report("graphics suspended: exit, or the app in the background"); b_report("graphics suspended: exit, or the app in the background"); t_report("graphics suspended: exit, or the app in the background"); }
+    if (atomic_load(&g_present_n) >= STATS_FROM) { if (g_vk) { vkn_report("graphics suspended: exit, or the app in the background"); draw_report("graphics suspended: exit, or the app in the background"); b_report("graphics suspended: exit, or the app in the background"); t_report("graphics suspended: exit, or the app in the background"); }
         surf_report("graphics suspended: exit, or the app in the background"); }
 }
 
@@ -1554,7 +2252,7 @@ static uint64_t present_count(void) {
     uint64_t n = atomic_fetch_add(&g_present_n, 1) + 1;
     // Not worded "first present": lognorm.py --until-present ends the parity cut at that phrase, and this line comes before the host's own (DM_DETCLOCK, [nvn] frame 1) that end it on the Metal backend
     if (n == 1) { NLOG("%s", g_vk ? "presenting: frames go to the swapchain" : "presenting: frames are counted, nothing is shown"); if (g_nshot && !g_vk) NLOG("[RED] DM_NVN_SHOT: no Vulkan device, no screenshots"); }
-    if (n >= STATS_FROM && (n == 60 || n == 600 || n % 1800 == 0 || (g_every && n % g_every == 0))) { surf_report("periodic"); if (g_vk) { vkn_report("periodic"); b_report("periodic"); t_report("periodic"); } }   // the count before this present: labelled with the frame just ended
+    if (n >= STATS_FROM && (n == 60 || n == 600 || n % 1800 == 0 || (g_every && n % g_every == 0))) { surf_report("periodic"); if (g_vk) { vkn_report("periodic"); draw_report("periodic"); b_report("periodic"); t_report("periodic"); } }   // the count before this present: labelled with the frame just ended
     return n;
 }
 // DM_DETCLOCK (hle_os.c) stops the guest clock at the first present (hle_nvn.c dump_frame, after mtl_present) and from then on moves it one step per present. A frame loop that sleeps until a
@@ -1603,8 +2301,8 @@ void *mtl_device(void) { return NULL; }
 void *mtl_device_classic(void) { return NULL; }
 uint64_t mtl_ext_tex(void *tex) { (void)tex; return 0; }
 
-// ---------- Textures: host images for render targets and sampled textures, registrations and samplers (above); programs have no host objects yet ----------
-void mtl_set_depth_zero(int on) { (void)on; }
+// ---------- Textures: host images for render targets and sampled textures, registrations and samplers (above); a program's modules and pipelines are the draws' (prog_ent_get, by its serial) ----------
+void mtl_set_depth_zero(int on) { atomic_store(&g_depth_zero, on != 0); }   // NVN's depth mode: z clipped at 0 (on) or -w (draw_key)
 void mtl_set_origin_lower_left(int on) { if (atomic_exchange(&g_origin_ll, on) != on) NLOG("window origin: %s", on ? "lower left (the present flips the picture)" : "upper left"); }
 void mtl_set_tex_pool_n(int n) { pthread_mutex_lock(&g_rmu); g_tpool_n = n; pthread_mutex_unlock(&g_rmu); atomic_fetch_add(&g_reg_gen, 1); }   // IDs past it are empty slots (tex_lookup)
 void mtl_tex_init(const tex_t *t) {   // a texture in a CPU-no-access pool (the render-target pools) gets its host image now; others when first set as a target
@@ -1662,7 +2360,7 @@ void mtl_reg_samp(int id, const samp_par *p) {   // sampler ID → its parameter
     pthread_mutex_lock(&g_rmu);
     if (id >= g_nsreg) { int n = id + 256; sreg_t *g = realloc(g_sreg, (size_t)n * sizeof *g); if (!g) die("vkn backend: sampler table allocation failed"); memset(g + g_nsreg, 0, (size_t)(n - g_nsreg) * sizeof *g); g_sreg = g; g_nsreg = n; }
     sreg_t *r = &g_sreg[id];
-    if (!r->ok || memcmp(&r->p, p, sizeof *p)) { r->p = *p; r->s = VK_NULL_HANDLE; r->ok = 1; atomic_fetch_add(&g_reg_gen, 1); }
+    if (!r->ok || memcmp(&r->p, p, sizeof *p)) { r->p = *p; r->s = r->si = VK_NULL_HANDLE; r->ok = 1; atomic_fetch_add(&g_reg_gen, 1); }
     pthread_mutex_unlock(&g_rmu);
 }
 void mtl_prog_release(prog_t *p) { (void)p; }
@@ -1691,15 +2389,15 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     free(lin);
 }
 
-// ---------- Statistics and diagnostics: the pass count; the rest has nothing to count yet ----------
-void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = atomic_load(&g_stat_pass); *draws = 0; }   // nothing is drawn yet
+// ---------- Statistics and diagnostics: passes, draws, sampled-texture uploads, modules and pipelines made; the rest has nothing to count yet ----------
+void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = atomic_load(&g_stat_pass); *draws = atomic_load(&g_dr_n); }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = *reuse = 0; }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = *skip = 0; }
 void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip) { *resolve = *reuse = *set = *skip = 0; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = *store = *full = 0; }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = atomic_load(&g_ts[TS_UP1]); *reuploads = atomic_load(&g_ts[TS_RE]) + atomic_load(&g_ts[TS_REALW]); }   // sampled textures uploaded from guest memory
-void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = *pso = 0; }
-void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = *pso_ns = 0; }
+void mtl_create_stats(uint64_t *lib, uint64_t *pso) { uint64_t r; vkn_shader_stats(lib, &r); *pso = atomic_load(&g_pso_made); }   // shader modules loaded, pipelines made
+void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = 0; *pso_ns = atomic_load(&g_pso_ns); }
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = *grown = 0; *n = 0; }
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = *full = 0; }
 void mtl_ubd_stats(uint64_t *deferred, uint64_t *conflicts) { *deferred = *conflicts = 0; }

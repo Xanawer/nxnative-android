@@ -228,7 +228,11 @@ Results: Stardew Valley's title-screen clears on KosmicKrisp, the system driver,
 
 Open after slice 1:
 - **Turnip:** in its default GMEM mode the device is lost once presents run. With `sysmem,noubwc`, the present test pattern (quadrants cleared into an image, then sampled) comes out as 8 px vertical stripes; review found nothing invalid in that image's setup. Turnip is not a target until this is understood.
-- **Suspend can still hang:** `hle_nvn.c` waits without a bound, before `dm_gfx_suspend(1)`, for a submit blocked on a free slot. A GPU that hangs without reporting loss can block `onStop`. No backend-only fix keeps pending work safe.
+- **Suspend can still hang:** `dm_gfx_suspend(1)` waits without a bound for the submits under way (`hle_nvn.c:1157`), before `mtl_drain`'s 4 s, and a submit can be blocked:
+  - on a free slot (the completion thread gives a submission up only once the GPU is reported lost);
+  - on `vkn_qmu`, while the present thread holds it in a `vkQueueWaitIdle` that has no timeout (`vk_present.c:98`; `QIDLE_NS` bounds only the retries after it returns).
+
+  A GPU that hangs without reporting loss can so block `onStop`. No backend-only fix keeps pending work safe. (Opus review of slices 1–2b.)
 - **Crop changes:** a new crop compiles a present pipeline (4-entry cache). Games with dynamic resolution need a uniform-buffer path.
 - **Format-changing views:** render-target views of another format are only reported in red, for example Mario Wonder's RGBA8 window texture written through an sRGB view.
 
@@ -256,7 +260,7 @@ Open after slice 1:
 3. **Pool delete:** under the pool lock, the pool's pages are made writable (`dm_guest_write_prepare`, then `mprotect` read-write over the whole range) and its shadow leaves the address table. The shadow is destroyed through slice 1's dead list (`vkn_sweep`) once every submission that used it has completed, and never after `g_leak`.
 4. **No shadow, no tracking:** `mtl_pool_add` gets no pool flags. A pool gets a shadow, and its pages tracking, only when a replayed record reads it as a buffer (vertex, index, uniform, storage, indirect, copy source). So render-target (CPU_NO_ACCESS) pools and shader-code pools get none. A buffer read from a pool that `mtl_tex_init` saw as CPU_NO_ACCESS is reported in red and gets no shadow.
 - **Address lookup:** an address resolves to the pool whose own bytes hold it, never through the page rounding (a neighbour's shadow never has this pool's bytes of a shared page). `mtl_addr` returns the shadow `VkBuffer` (NULL before the pool has one) and the offset from the page-rounded pool start. `mtl_gpu_addr` also returns the buffer device address (`bufferDeviceAddress` is enabled), and fails for a pool with no shadow.
-- **Not covered yet:** a CPU-run GPU op (buffer copy, fill, uniform update) lands in guest memory at replay and is uploaded at commit. A draw earlier in the same submission therefore sees its result. Stardew Valley makes none of these ops on this route. Texture storage is not tracked; textures are slice 2b.
+- **Not covered yet:** a CPU-run GPU op (buffer copy, fill, uniform update) lands in guest memory at replay and is uploaded at commit. A draw earlier in the same submission therefore sees its result. A uniform update inside a submission is seen in order by a draw whose uniform buffer is unaligned (its ring copy is made at replay, §2.5), but not by an aligned one, so alignment changes what such a draw reads until updates are ordered. Stardew Valley makes none of these ops on this route. Texture storage is not tracked; textures are slice 2b.
 - **Checking frames:** `DM_NVN_SHOT` works on vkn: the window texture is read back at the requested presents and written in the Metal backend's format and orientation. `dm/android/tools/imgdiff.py` compares two frames: mean error per channel, the share of pixels over a threshold, and the bounding box. Metal reruns of the title screen already differ from frame 600 on (cloud and title animation), so frames are compared with a tolerance.
 - **Detclock workaround:** under `DM_DETCLOCK`, vkn sleeps one frame of wall time at the first present. The guest clock freezes at the first present, and MonoGame's fixed time step then waits on it forever when that present came quickly. The fix belongs in `hle_os.c`, where it would change the Metal reference frames; the workaround goes when that lands.
 - **Results:** title-screen uploads of 3.26 pages a frame at 16 KB pages (the Mac) and 4.18 at 4 KB (the phone), as measured beforehand, at 0.04–0.07 ms of commit time on the Mac and about 0.27 ms on the phone.
@@ -301,13 +305,14 @@ Open after slice 1:
 
 Open after slice 2b:
 - **Mac shared-page cost:** protect the texture's interior pages, and at each use compare its bytes in the shared pages with a copy kept at upload.
-- **Slice 2c** resolves only the slots the program samples.
+- ~~**Slice 2c** resolves only the slots the program samples.~~ Done in slice 2c: 16 first uploads, as on Metal.
 - **Metal's row pitch for a stride-0 LINEAR texture** is `width * bpb` (`nvn_mtl.m:1941`). `nvn_tex_layout` rounds the row up to 32 bytes (128 for a linear render target, `nvn_tex.c:108-111`), and that layout sizes the storage the game is given (`nvnTextureBuilderGetStorageSize`). The two differ when a row is not a multiple of 32 bytes. vkn follows `nvn_tex_layout`; Metal is unchanged.
 - **No initial fill when a texture's first use is as a render target.** Metal fills at creation, whatever the first use (`nvn_mtl.m:2095`). vkn fills only at the first sampled use, so a pass that loads such a target first reads undefined content.
 - **Not yet:** BC and the other formats, 3D, cube and buffer textures, and the GPU deswizzle.
 - **Latent in Metal, left as is (Metal must stay exact):** the "generation has not moved" shortcut in the packaged-texture check (`nvn_mtl.m:2028`) and in the index-range cache (`nvn_mtl.m:4074`) can miss a write, for the reason given above.
 - **Shared front half, not changed here:**
   - A whole-level `WriteTexels` on a LINEAR texture writes nothing and prints no `[RED]`: the whole-level path skips the deswizzle, and the `-1` from `nvn_swizzle` is ignored (`hle_nvn.c:2377`). It still calls `mtl_tex_cpu_written`. A partial region does print `[RED]`.
+  - `ft_add` (`hle_nvn.c:334`, under `tex_dirty_upload`) reads its stamp and then calls `nvn_dirty_protect`, which skips a page another thread is unprotecting. A write fault that has taken its generation but not yet stored it then leaves the page writable with nothing newer than the stamp, and the texture's later writes are never seen (staged in a test by the Opus review of slices 1–2b). `nvn_dirty_protect_wait` would close it. Four profiles turn `tex_dirty_upload` on (010038B015560000, 0100B04011742000, 0100F2C0115B6000, 010036E00FB20000); Stardew does not.
   - LINEAR_RENDER_TARGET (0x40) without LINEAR (0x10) is linear for Metal (`nvn_mtl.m:1935-1937`, from Mario Wonder's sky ramps) but block-linear for `nvn_tex_layout` (`nvn_tex.c:108`), which vkn follows. Which one the hardware does is not settled.
 
 ### 2.4 Shader chain, Vulkan target (`dmsh_build.py --target vk`)
@@ -367,6 +372,67 @@ Several go away on Vulkan: triangle fans are native, indirect-count draws are na
   - DRV0/DRV2 synthesized driver constant buffers
   - dummies for unbound slots
 - **Mechanism, chosen from P0.7:** descriptor buffers (present on 842.6), push descriptors, or per-frame pools.
+
+**As built, slice 2c (2026-10-26):** the draws, in `dm/gfx/vkn/nvn_vk.c` (section "Draws") and `dm/gfx/vkn/vk_shader.c`. The shaders are slice 0's modules (§2.4), read from `DM_VK_SHADERS`, a development-time directory of decompressed `.spv` files beside their `.json` (packaging is Phase 3's). Only `<key>_b.spv` is read: a module whose `.spv.zst` alone is there is refused, and the refusal says so.
+- **Descriptors: one push-descriptor set per draw** (`VK_KHR_push_descriptor`, with a limit of 32 on KosmicKrisp, stock and 842.6). Vertex bindings keep their numbers and pixel bindings get 32 more. `vk_shader.c` patches only the modules' `DescriptorSet` and `Binding` decorations. There is one pipeline layout per (vertex, pixel) pair. Nothing is allocated or freed per draw, the descriptors live in the command buffer, and the extension is on every target; descriptor buffers are on 842.6 only, and per-frame pools need lifetime tracking. A pair over the device's push limit is said in red and its draws are skipped. Stardew Valley writes 2 descriptors a draw.
+- **Resolution,** as in `encode_args_`: only the slots the program's shaders sample (16 first uploads now, as on Metal). An unbound or unusable slot gets a dummy, counted. A view's numeric class is its aspect's and format's, so a stencil view is unsigned integers. A binding the shader reads as integers, a dummy included, gets its sampler's nearest twin (nearest filters and mip, no anisotropy, comparison or reduction, the integer border colour), since Vulkan filters integer formats only with nearest. The shader's c1 bank is a buffer of the reflection's bytes. Modules that read driver banks (`drv_reads`) or bindless handles are refused. Bindless reads appear as the binding and sampler kinds `tex_ubo`, `tex_c2a`, `samp_ubo` and `samp_c2a`, which fall into the unknown-kind refusals.
+- **Uniform buffers** come from strategy B's shadows.
+  - **Alignment:** `minUniformBufferOffsetAlignment` is 64 on KosmicKrisp and 256 on stock and 842.6. An offset the device cannot bind is copied at replay into a 1 MiB ring per submission slot, and past the ring the draw is skipped in red. Stardew Valley binds every uniform buffer 256-aligned, so there are 0 copies on all three targets; a temporary 256-byte check on the Mac agreed, with 0 of 40,000 binds.
+  - **Range:** the bound size, cut to the pool's end and to 64 KiB (`maxUniformBufferRange` on every target), counted as cut short.
+  - **Declared size:** the modules declare 64 KiB blocks but are bound with the game's size (64 bytes in Stardew Valley).
+- **Modules** are loaded at a program's first draw. A module is refused (said in red once, its draws skipped) when:
+  - its status is not ok, or its reflection is of another key, stage or chain (the reflection's `chain` against the host's; the directory's stamp, `inputs.tsv`, names the game and the profile inputs, not the chain);
+  - its size is not the reflection's `spv_bytes`, the first 64 bits of its SHA-256 are not `spv_sha256` (with the vendored `dm/host/plat/sha256.h`), or its SPIR-V has other than one entry point, `main`, whose execution model is the reflection's stage;
+  - it has decoration groups, a binding kind not handled yet, a descriptor array (found in the SPIR-V's types, whatever the reflection's count says; a null count is refused too), a slot or another number that does not fit its field (never cut to it), or a capability the device does not offer;
+  - an interface or image type is other than the builder's 32-bit `float`, `uint` and `sint` (16- and 64-bit types such as `float16` are a later slice), or an interface array the reflection does not describe (its `array` first location and 1–4 lengths).
+
+  `shaderImageGatherExtended` and `shaderDrawParameters` are enabled where offered: all 65 Stardew Valley modules declare ImageGatherExtended, and the 42 vertex ones DrawParameters. `sampleRateShading` is enabled where offered, for InterpolationFunction, which no Stardew module declares.
+- **Pairs:** a (vertex, pixel) pair is matched when its layout is made. Vulkan matches variables, not locations, so, as the builder's `pair_inputs` does, every pixel input variable must be written by the vertex shader as the same variable: at each of its locations the same first location, component type, components and array lengths (a `vec4[2]` is not two `vec4`s). More components out than in would need `maintenance4`, which is not enabled, and slice 0's chain pads without widening. Component decorations cannot reach the match: the builder marks them unsupported, and non-ok modules are refused. A pair that does not match is said in red and its draws are skipped; no Stardew Valley pair is refused (none has a signed or array interface).
+- **Pipelines** are monolithic. They are keyed by vkn's own key in `nvn_vk.c` (modules, attachment formats, vertex layout, blend, masks, depth-stencil, raster state, topology, depth mode) and kept in a hash map with an in-memory `VkPipelineCache`; `nvn_pso_skey.h` is unchanged.
+  - Vertex formats are checked against the inputs' component types, and colour formats against the outputs'.
+  - Alpha to coverage is on only where the pixel shader writes all four components of colour 0 and has no output of Index 1 (the reflection does not give an output's Index, so the loader notes one in the SPIR-V); otherwise it is off, said in red. Such a shader is not refused, as its draws would then be skipped; a location that only an Index 1 output covers is not written either (the reflection lists it as colour written, but with no Index 0 output Vulkan leaves that target undefined, so the loader clears it from the write mask and the target keeps its content). No Stardew Valley module has an Index decoration.
+  - NVN's near = −w uses `VK_EXT_depth_clip_control`; `SetDepthMode` near = 0 does not.
+  - Dynamic state: viewport, scissor, blend constants, stencil masks and reference, depth bias.
+- **Y and winding:** the viewport is flipped for an upper-left origin, and NEGATIVE_Y toggles the flip. The front face depends on the origin only, because NVN decides facing after the swizzle, as `nvn_mtl.m:7177` does.
+- **Draws:** indexed (16- and 32-bit indices, base vertex), non-indexed and instanced. Indices that run past their pool's end, and the vertices of a non-indexed draw or a per-instance stream that do, are said in red once and the draw is skipped. Per-vertex streams of indexed draws are not checked: the bound needs the largest index, which the GPU reads from what the commit uploads. Indirect and multi-draw, base instance, 8-bit indices, points, quads, adjacency and patches, geometry and tessellation, and rasterizer discard are said in red once and skipped.
+- **Barriers:** `OP_BARRIER` becomes a memory barrier. A render target sampled later in the same submission gets an image barrier. Sync validation is clean on `t_vkn` and on a 60 s Stardew Valley run, and it reports a hazard when that barrier is weakened.
+- **Strategy B fix (a slice 2a/2b fix landing with 2c):** a pool that a commit reads before `hle_nvn.c` adds its write tracking (`nvn_dirty_span`) was copied unprotected, and a write made in that gap never reached the shadow. Now, when the range appears, every buffer page of the pool is treated as read for the first time: picked, protected, copied. Every acquisition of the range goes through one helper (`pool_span`): `b_commit`'s buffer pass, or a texture's upload in the same commit when the range appears between the two.
+- **Test:** `t_vkn` adds 82 checks (185 in all), with validation on and 0 messages:
+  - a 24-case orientation and winding matrix, on a triangle with no mirror image of itself about x = y, plus a viewport off the target's origin and short of its height, and a partial scissor, each with both origins and NEGATIVE_Y;
+  - a render target sampled in a second pass, in the same submission and in the next, with both origins;
+  - a `DM_NVN_SHOT` of a drawn corner;
+  - descriptor checks: a CPU-written texture, aligned, unaligned and pool-end uniform buffers, dummies, and an unfed input;
+  - near = −w and near = 0 depth;
+  - pipeline-cache hit and miss;
+  - a refused module and a push-limit skip;
+  - the span gap, also when a texture's upload is the first to find the range, which fails with the fix reverted;
+  - from the review: a stencil view sampled as unsigned integers; a linear sampler on integer bindings; indices and non-indexed vertices past their pool, skipped; InterpolationFunction only with `sampleRateShading`; alpha to coverage with no colour 0; a pair whose pixel shader reads a location the vertex shader does not write; a vertex module under a pixel reflection; a module whose bytes are not its reflection's; slots past their field or not integers; sampler arrays with count 1 or null; a reflection cut inside a string; line-mode polygons filled with the line offset; signed integers through an unfed vertex input, a flat varying and an `isampler2D`; pairs matched by variable (a `vec4[2]` against a `vec4[2]`, two `vec4`s and one); malformed interface arrays; alpha to coverage with an Index 1 output, and that output's location left unwritten. Each fails with its fix reverted; the cut reflection crashes the old code at -O0 only, as the test's -O1 drops the stray read.
+  The test kernels are `dm/gfx/tests/vkn_kernels/` (GLSL, `t_vkn_spv.h`).
+- **Results,** from the title screen to character creation:
+  - **Clean runs:** 0 `[RED]` and 0 validation messages on KosmicKrisp, the system driver and 842.6. Every draw is indexed. 2 pipelines, the first made at frame 0 in 11–19 ms; one cold Mac run took 648 ms.
+  - **Record time:** 0.3–0.6 ms a frame on the Mac. On the phone 0.6 ms without validation and 2.3 ms with it.
+  - **Frames:** the Mac frames are within the Metal runs' own spread at all six shots, and the phone frames match them by eye.
+
+Open after slice 2c:
+- **Reads past a uniform buffer's bound range** are undefined in Vulkan, while Maxwell returns zeros. `robustBufferAccess2` would match it.
+- **Not drawn yet:**
+  - driver-bank and bindless-handle reads;
+  - integer vertex formats converted on the CPU;
+  - cube textures;
+  - a copy for a texture sampled while it is the pass's target (it reads zeros now);
+  - vertex divisors > 1;
+  - logic op, alpha test and dual-source blending;
+  - the draw kinds listed above;
+  - other viewport swizzles than NEGATIVE_Y;
+  - a view swizzle applied in the shader where the portability subset has no `imageViewFormatSwizzle`;
+  - more than the push limit (a second set or pools).
+- **Facing under NEGATIVE_Y is unverified on hardware.** The code assumes the swizzle comes before facing, as in `NV_viewport_swizzle`. The `t_vkn` matrix encodes the same model, so it cannot catch an error they share. The only game seen with NEGATIVE_Y so far is Absolum, which is 2D and was run on Metal (`hle_nvn.c:2296`).
+- **Pipelines:** an on-disk `VkPipelineCache` per driver identity, and a prewarm (§2.4). KosmicKrisp has no `fillModeNonSolid`, so line-mode polygons are filled there, with the line mode's polygon offset enable.
+- **Lifetimes:** pipelines, layouts, modules and program entries (one per `SetShaders` serial) are kept for the run, because `mtl_prog_release` is a no-op.
+- **Detclock timeline:** under `DM_DETCLOCK_PACE`, background loading still runs on wall time, so the title pan is not at the same place at the same frame number from run to run.
+  - Under load, vkn runs fall outside the Metal spread at f900–f1400 and inside it at f300, f600 and f1700. A 648 ms cold pipeline did it too.
+  - Checked in one such run (f1200): the picture sits 32 px further along the pan than Metal's. With that offset removed, the sky matches Metal's to 3 levels, with the same colour steps.
+  - So at those frames the pixel count measures timing, not rendering. A check there should align the pan first, or the shots should wait for the hle_os.c detclock fix.
 
 ### 2.6 Pipelines
 - **Key:** today's `pso_skey` stores Metal pixel formats (`nvn_pso_skey.h:7`; filled from `pixelFormat` in `nvn_mtl.m`). Switch it to NVN formats, so that `pso_manifest.tsv` and `pso_user.tsv` work for both backends. This change could go upstream.

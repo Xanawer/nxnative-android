@@ -37,7 +37,9 @@ typedef VkResult (VKAPI_PTR *vkn_create_surface_fn)(VkInstance, const void *, co
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
     X(vkInvalidateMappedMemoryRanges) X(vkFlushMappedMemoryRanges) X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkGetBufferDeviceAddress) X(vkCmdCopyBufferToImage) \
-    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage)
+    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdSetBlendConstants) \
+    X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdPushDescriptorSetKHR) X(vkCreatePipelineCache) \
+    X(vkDestroyPipelineCache)
 typedef struct {
 #define VKN_PFN(n) PFN_##n n;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
@@ -58,6 +60,10 @@ typedef struct {
     int aniso, mirror, minmax;           // samplerAnisotropy, samplerMirrorClampToEdge, samplerFilterMinmax are on (where the device has them: nvn_vk.c samp_make says a sampler that needs a missing one)
     int port, port_bias, port_swz;       // VK_KHR_portability_subset is on (required where the driver has it), with its samplerMipLodBias / imageViewFormatSwizzle features; every feature it
                                          // offers is enabled, and nvn_vk.c avoids a use whose feature is absent (a LOD bias of 0, an identity view swizzle: said once)
+    int push; uint32_t max_push;         // VK_KHR_push_descriptor is on, and its maxPushDescriptors (the draws' one set: nvn_vk.c)
+    int clip_ctl;                        // VK_EXT_depth_clip_control's depthClipControl is on (near = -w: mtl_set_depth_zero)
+    int depth_clamp, indep_blend, dual_src, bias_clamp, fill_ns;   // depthClamp, independentBlend, dualSrcBlend, depthBiasClamp, fillModeNonSolid are on
+    int gather_ext, draw_params, sample_rate;   // shaderImageGatherExtended, shaderDrawParameters, sampleRateShading are on (vk_shader.c refuses a module declaring a capability whose feature is off)
 } vkn_dev_t;
 extern vkn_dev_t vd;
 int vkn_dev_init(void);                  // 1 = a device; logs the driver's identity
@@ -109,3 +115,26 @@ uint64_t vkn_present_enqueue(uint64_t serial, uint32_t w, uint32_t h, const int 
 void vkn_present_wait(uint64_t ticket);
 void vkn_present_flush(void);            // every ticket so far done, and the GPU through their present work
 int vkn_present_drain(uint64_t ns);      // the same within ns: 1 = done
+
+// Shader modules (vk_shader.c, PLAN.md 2.4, slice 2c): slice 0's SPIR-V of this translation chain (dmsh_build_vk.py; a module of another is refused), by the shader's key (hle_nvn.c prog_key)
+#define VKN_CHAIN "755696b45d84"
+#define VKN_MAXB 32
+enum { VKN_B_UBO = 1, VKN_B_C1, VKN_B_ZERO, VKN_B_TEX };   // a binding: an NVN uniform slot (reg), the shader's c1 bank, a driver bank it reads nothing of (zeros), a combined texture slot (reg)
+enum { VKN_S_TEX = 1, VKN_S_SAMP, VKN_S_ID };              // its sampler: the sampler half of combined slot sreg, separate sampler slot sreg, the constant sampler ID sreg
+enum { VKN_VT_2D, VKN_VT_2D_ARRAY, VKN_VT_CUBE };
+typedef struct { uint8_t kind, skind, vt, comp, set; uint16_t orig, binding, reg, sreg; } vkn_sbind;   // binding: in the draws' set (pixel ones + 32); comp 0 float 1 uint 2 sint
+typedef struct vkn_shader {
+    char key[17]; int stage;             // NVN stage: 0 vertex, 1 pixel
+    VkShaderModule mod; uint32_t id;     // id: a small number, for the pipeline keys
+    int nb; vkn_sbind b[VKN_MAXB];
+    int nin; struct { uint8_t loc, ct, n; } in[16];   // vertex inputs: location, component type (as comp), components
+    uint32_t out_mask; uint8_t out_ct[8], out_n[8];   // pixel outputs written, by location, and their component types and components
+    uint32_t io_mask; uint8_t io_ct[32], io_n[32];    // the interface between the stages, by location: a vertex shader's outputs, a pixel shader's inputs (component type as comp, components)
+    uint8_t io_first[32], io_nd[32], io_dims[32][4];  // and the variable on each: its first location and array lengths (outermost first; io_nd 0: no array, io_first the location)
+    int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
+    VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
+} vkn_shader;
+int vkn_shmap_stage(const uint8_t key[8]);           // the shader map's NVN stage of a key, -1 = not in it
+vkn_shader *vkn_shader_get(const uint8_t key[8], int stage);   // NULL = refused or missing (said once)
+vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes);   // t_vkn's modules
+void vkn_shader_stats(uint64_t *loaded, uint64_t *refused);
