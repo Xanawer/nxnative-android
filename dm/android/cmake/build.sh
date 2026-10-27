@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Android host (docs/android/PLAN.md 1.1): build.sh <GAME> [--gpu null|vkn] [--tests] [--clean]: dmhost (the adb loop) and libdmhost.so (the app, dm/android/app/build_app.sh)
 #   GAME: base game title ID (dm/games/<id>/), as make GAME= for the Mac host
-#   --tests: also the unit tests that run on the phone (t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_sig_guard t_tex t_sha256)
+#   --tests: also the unit tests that run on the phone (t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_sig_guard t_tex t_sha256 t_movie_mc)
 #   --gpu: the GPU backend (CMakeLists.txt GPU_BACKEND): null (the default) or vkn, the Vulkan backend, built in build-vkn/ so neither build reconfigures the other
 #   --clean: start from an empty build directory
 # Output: dm/android/cmake/build/dmhost and libdmhost.so (build-vkn/ with --gpu vkn) (arm64-v8a, android-35), the tests beside them. ANDROID_HOME / ANDROID_NDK_HOME override the SDK / NDK locations;

@@ -2,7 +2,8 @@
 # (dm/gfx/null, the default, Phase 1) or vkn (dm/gfx/vkn, the Vulkan backend of Phase 2, which loads Vulkan at run time: no libvulkan link).
 # Driven by build.sh beside this file; build outputs stay under build/ (.gitignore). Source lists follow dm/host/Makefile (SRC, GFX) minus its Objective-C files (nvn_mtl.m, nvn_refl.m,
 # hle_vk.m, hle_gl.m, tex/nvn_deswizzle_gpu.m, memstat.m, haptics_apple.m, front_mac.m), plus the platform layer (dm/host/plat), the GPU backend (GPU_BACKEND) and a front end
-# (dm/android/front). New hle_*.c / dm/gfx sources are picked up by the same wildcards as the Makefile's
+# (dm/android/front). New hle_*.c / dm/gfx sources are picked up by the same wildcards as the Makefile's. The movie decoders' MediaCodec back ends (dm/android/media: H.264 behind
+# hle_movie_avc.h, AAC for hle_movie.c) go into both targets, with libmediandk
 cmake_minimum_required(VERSION 3.22)
 project(nxhost C ASM)
 
@@ -56,7 +57,7 @@ list(SORT HLE_SRC)
 list(SORT GFX_SRC)
 set(HOST_SRC
     "${DM}/host/loader.c" "${DM}/host/hle.c" "${DM}/host/crash.c" "${DM}/host/probe.c" "${DM}/host/thread.c" ${HLE_SRC} "${DM}/host/entry.S"
-    "${DM}/host/plat/plat_linux.c"
+    "${DM}/host/plat/plat_linux.c" "${DM}/android/media/movie_mc.c" "${DM}/android/media/movie_avc_mc.c" "${DM}/android/media/movie_aac_mc.c"
     ${GFX_SRC} "${DM}/gfx/nvn/nvn_entry.S" "${GEN}/nvn_thunks_elf.S"
     ${GPU_SRC})
 add_executable(dmhost ${HOST_SRC} "${DM}/host/main.c" "${DM}/android/front/front_headless.c")
@@ -65,7 +66,7 @@ target_compile_options(dmhost PRIVATE ${DM_CFLAGS})
 target_include_directories(dmhost PRIVATE ${DM_INC})
 # --export-dynamic: dladdr names host functions in crash dumps and stack scans (Mach-O executables export theirs). 16 KB segment alignment: runs on 4 KB and 16 KB page kernels alike
 target_link_options(dmhost PRIVATE -Wl,--export-dynamic -Wl,-z,max-page-size=16384)
-target_link_libraries(dmhost PRIVATE vpx aaudio log m dl)
+target_link_libraries(dmhost PRIVATE vpx aaudio mediandk log m dl)
 if(GPU_BACKEND STREQUAL "vkn")
     target_link_libraries(dmhost PRIVATE android)   # ANativeWindow_acquire / _release in vk_present.c (the adb route has no window, the calls are linked all the same)
 endif()
@@ -80,7 +81,7 @@ add_dependencies(dmhost_lib game_profile)
 target_compile_options(dmhost_lib PRIVATE ${DM_CFLAGS})
 target_include_directories(dmhost_lib PRIVATE ${DM_INC} "${DM}/host")
 target_link_options(dmhost_lib PRIVATE -Wl,-soname,libdmhost.so -Wl,-Bsymbolic -Wl,-z,text -Wl,-z,max-page-size=16384)
-target_link_libraries(dmhost_lib PRIVATE vpx aaudio android log m dl)
+target_link_libraries(dmhost_lib PRIVATE vpx aaudio mediandk android log m dl)
 
 # Unit tests that run on the phone (build.sh --tests): the portable ones of dm/gfx/tests and dm/gfx/tex/tests, built as their Makefiles build them
 set(T "${DM}/gfx/tests")
@@ -108,4 +109,12 @@ add_dependencies(t_sig_guard game_profile)
 target_compile_options(t_sig_guard PRIVATE ${DM_CFLAGS})
 target_include_directories(t_sig_guard PRIVATE ${DM_INC})
 target_link_libraries(t_sig_guard PRIVATE dl)
-add_custom_target(tests DEPENDS t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_sig_guard t_tex t_sha256)
+# The movie decoders on MediaCodec against synthetic clips (dm/android/tests/gen_movie_clips.py): t_movie_mc <out dir> <clips dir>. Its main is the probe harness's, so the same file also
+# runs inside an APK (dm/android/probe/common/build_probe.sh)
+add_executable(t_movie_mc EXCLUDE_FROM_ALL "${DM}/android/tests/t_movie_mc.c" "${DM}/android/probe/common/probe_glue.c" "${DM}/android/media/movie_mc.c" "${DM}/android/media/movie_avc_mc.c"
+    "${DM}/android/media/movie_aac_mc.c")
+add_dependencies(t_movie_mc game_profile)
+target_compile_options(t_movie_mc PRIVATE ${DM_CFLAGS} -DPROBE_EXE)
+target_include_directories(t_movie_mc PRIVATE ${DM_INC})
+target_link_libraries(t_movie_mc PRIVATE mediandk z log m dl)
+add_custom_target(tests DEPENDS t_hmap t_cover t_pace t_fstep t_dirty_slots t_dirty_race t_dirty_fail t_dirty_wait t_sig_guard t_tex t_sha256 t_movie_mc)

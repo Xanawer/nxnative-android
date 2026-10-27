@@ -161,8 +161,26 @@ On the guest–host ABI: Apple's arm64 ABI passes variadic arguments on the stac
 
 ### 1.5 Services
 - **Audio out:** the AudioUnit code in `hle_audio.c:146-260,434-465` becomes AAudio (48 kHz, 16-bit, low latency). The queue, downmix and volume code (`:62-142, :201-213`) stays.
-- **Movie sound:** AAC (`hle_movie.c:331-371`, AudioConverter) moves to `AMediaCodec`. libvpx and stb_vorbis are already portable.
-- **H.264:** `hle_movie_avc.c` (VideoToolbox) becomes `AMediaCodec` behind the same interface (`hle_movie_avc.h:7-17`), producing NV12. The SDK's decoder wraps MediaCodec too (`hle_movie.c:34`).
+- **Movie sound:** AAC (`hle_movie.c:338-405`, AudioConverter) moves to `AMediaCodec`. libvpx and stb_vorbis are already portable. Done, with H.264 (below).
+- **H.264:** `hle_movie_avc.c` (VideoToolbox) becomes `AMediaCodec` behind the same interface (`hle_movie_avc.h:7-17`), producing NV12. The SDK's decoder wraps MediaCodec too (`hle_movie.c:42`).
+  - **Done (2026-10-27):** H.264 and AAC on `AMediaCodec`, synchronous, byte-buffer output, in `dm/android/media/`: `movie_mc.{h,c}` (shared), `movie_avc_mc.c`, `movie_aac_mc.c`. The code is adapted from nx2apk (MIT), with the credit and licence in `dm/third_party/`. `hle_movie_avc.c` is now Apple-only, and `hle_movie.c` changes only in its non-Apple branches.
+  - **Fallback and bounds:** a decoder that cannot be made, configured or fed, or that fails mid-stream, gives black pictures in presentation order or silence of each packet's length, with one [RED], so the movie's clock runs. Create + configure + start, flush, and stop + delete run on a helper thread with deadlines of 2 s, 0.5 s and 0.5 s. Past a deadline the movie thread goes on and the helper deletes the codec once its call returns. A failed decoder is not waited for, and dequeue timeouts are capped. An adb executable starts the binder thread pool itself (`ABinderProcess_startThreadPool` through `dlsym`).
+  - **Tested by:** `dm/android/tests/t_movie_mc.c` (the `tests` target), on synthetic clips from `gen_movie_clips.py`, which writes them outside the repo. 287 checks pass on the Nubia NX789J (SM8750, Android 16) as an adb executable and in an APK (`untrusted_app`), with `c2.qti.avc.decoder` and `c2.android.aac.decoder`.
+  - **Not verified:**
+    - in any game, since Stardew Valley plays no movie;
+    - on the Galaxy Z Fold 7 beyond the first run. That build had no binder thread pool: `c2.qti.avc.decoder` took 8 units and gave no picture in each of the 5 H.264 cases, which fell back, and the run went no further than the sixth decoder;
+    - with `c2.qti.aac.hw.decoder`, which the Nubia lists.
+  - **Still unbounded:**
+    - codec creation itself: the movie thread stops waiting at 2 s, but the helper stays until the call returns;
+    - when `pthread_create` fails, the job runs on the calling thread with no limit;
+    - a hung binder call on the decoder's own thread (dequeue, queue, get-buffer, `getOutputFormat`, release).
+  - **Upstream candidates** (shared or Apple-only code, left unchanged; the Apple ones are read from the code, not run):
+    - nx2apk's `nv12-colorspace` (its `hle_movie.c:690`), not applied to `md_format` (`hle_movie.c:737`).
+    - 960-sample frames on Apple: `GetOutputBufferSize` gives 1,024 per packet (`hle_movie.c:770-771`), and the converter takes 1,024 frames per packet (`:360`).
+    - Output-slot reuse after Flush: `md_reset` frees every output slot (`hle_movie.c:639`), and a client releasing an index it held across the Flush clears the new output in that slot (`:838`). This affects every decoder type, Apple included.
+    - `GetOutputBufferSize` with SBR signalled only by extension (0x2b7): it doubles only for object type 5 or 29 (`hle_movie.c:770`). The Apple path keeps Configure's rate for HE-AAC (`:356`, `:360-361`).
+    - A mono parametric-stereo core with no channel count from Configure: 1 channel on Apple (`hle_movie.c:356`), 2 on Android (run on the Nubia).
+  - **Error paths on the Mac:** `dm/android/tests/mock/build.sh` builds the three media sources unchanged against a scripted fake MediaCodec under ASan and UBSan and runs it: 40 checks (damaged and passed-over units, repeated or too-long output, format changes, slow flush, failures). It needs the game profile header from a Mac `make` first.
 - **Haptics:** `haptics_apple.m` becomes Vibrator / VibratorManager, plus controller rumble through `InputDevice`, called through JNI.
 - **Lifecycle:** `hle_lifecycle.c` (GCD) becomes a timer thread, driven by the activity's pause and resume.
 

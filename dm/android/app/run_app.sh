@@ -106,8 +106,8 @@ if [ -n "$ZIP" ]; then
     "$ADB" shell "run-as $PKG sh -c 'rm -rf files/drivers/$DRV && mkdir -p files/drivers/$DRV && cp $STAGE/drivers/$DRV.zip files/drivers/$DRV.zip && cd files/drivers/$DRV && unzip -o -q ../$DRV.zip && rm ../$DRV.zip'"
     echo "driver $DRV: $("$ADB" shell "run-as $PKG ls files/drivers/$DRV" | tr -d '\r' | tr '\n' ' ')"
 fi
-# env.txt: the first line that sets a variable wins (front_android.c env_file), so --driver's lines go first
-{ [ ${#DENV[@]} -eq 0 ] || printf '%s\n' "${DENV[@]}"; [ -z "$ENVF" ] || cat "$ENVF"; [ ${#ENVS[@]} -eq 0 ] || printf '%s\n' "${ENVS[@]}"; } | "$ADB" shell "run-as $PKG sh -c 'cat > files/env.txt'"
+# env.txt: the first line that sets a variable wins (front_android.c env_file), so --driver's lines go first. files/ is made first: on a fresh install with modules "-" nothing else has made it
+{ [ ${#DENV[@]} -eq 0 ] || printf '%s\n' "${DENV[@]}"; [ -z "$ENVF" ] || cat "$ENVF"; [ ${#ENVS[@]} -eq 0 ] || printf '%s\n' "${ENVS[@]}"; } | "$ADB" shell "run-as $PKG sh -c 'mkdir -p files && cat > files/env.txt'"
 echo "env.txt:"; "$ADB" shell "run-as $PKG cat files/env.txt" | sed 's/^/  /'
 [ $FRESH = 0 ] || "$ADB" shell "run-as $PKG sh -c 'rm -rf files/save files/temp'"
 

@@ -13,9 +13,10 @@
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>   // AAC
-#else   // Android: no AAC decoder yet (AMediaCodec comes later); the decoder fields keep their types, md_aac reports the track once and gives no samples
-typedef void *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; UInt32 mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
-#define AudioConverterDispose(c) ((void)(c))
+#else   // Android: AAC on MediaCodec (dm/android/media/movie_aac_mc.c); the decoder fields keep their types, the converter being that decoder
+#include "../android/media/movie_mc.h"
+typedef maac *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; UInt32 mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
+#define AudioConverterDispose(c) maac_free(c)
 #endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
@@ -83,6 +84,9 @@ typedef struct {
     pthread_mutex_t dmu, wmu; pthread_cond_t wcv; pthread_t wk;
     int job; const uint8_t *jp; int jn, jslot, jgot; int64_t jpts, jpts_out; int jflush;
     mavc *avc; int avc_drain;                    // H.264 (hle_movie_avc.c); avc_drain: the end-of-stream packet came with pictures still queued, they leave one per free slot
+#ifndef __APPLE__
+    _Atomic int aac_late;                        // AAC on MediaCodec: packets whose PCM came after their own call, waiting for a free slot (md_pump hands them out)
+#endif
     vpx_codec_ctx_t vpx; int vpx_on, red_dec, red_img;
     // Vorbis: the identification and setup headers from Configure's MediaData ("csd-0", "csd-1", as with Android's MediaCodec), the decoder (opened at the first packet), channels / rate, Ogg page sequence
     uint8_t *vhdr[2]; int vhdr_n[2]; stb_vorbis *vb; int ch, rate; uint32_t ogg_seq; int64_t ogg_gran; int red_vb;
@@ -382,21 +386,21 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     return frames > 0;
 }
 #else
-// One AAC frame of silence per packet (1,024 samples per channel, 2,048 with SBR, as GetOutputBufferSize reports): the track keeps its length and the movie's audio clock runs.
-// Channels and rate as the AudioToolbox path takes them: Configure's, else the AudioSpecificConfig's, else 2 channels at 48 kHz
+// MediaCodec (dm/android/media/movie_aac_mc.c), opened at the first packet from the AudioSpecificConfig (csd-0, kept in vhdr[0]) or, without one, an AAC-LC configuration from Configure's rate
+// and channels. Configure settled d->rate / d->ch to the PCM it hands out (maac_settle; HE-AAC: see there), before the format event announces them; each packet gives one AAC frame (1,024 samples
+// per channel, 2,048 with SBR by object type, as GetOutputBufferSize reports) with that packet's time (jpts_out), possibly a call or more later, or silence of that length when MediaCodec is
+// missing or fails (one [RED]): the track keeps its length and the movie's audio clock runs
 static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
-    (void)p;
-    if (d->vhdr_n[0] >= 2) { static const int rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
-        int fi = (d->vhdr[0][0] & 7) << 1 | d->vhdr[0][1] >> 7, cc = d->vhdr[0][1] >> 3 & 15;
-        if (fi < 13 && d->rate <= 0) d->rate = rates[fi]; if (cc && cc < 8 && d->ch <= 0) d->ch = cc == 7 ? 8 : cc; }
-    if (d->rate <= 0) d->rate = 48000; if (d->ch <= 0) d->ch = 2;
-    static _Atomic int said; if (!said++) LOG("[RED] movie: AAC unsupported on Android (no decoder yet; %d channels %d Hz): the track plays silence", d->ch, d->rate);
-    if (n <= 0) return 0;
+    // Configure settled d->rate / d->ch already (maac_settle) and maac_new gives the same values: written only when Configure never ran (as md_aac_open does on Apple), so guest threads
+    // reading them (GetOutputFormat, GetOutputBufferSize) do not race a write of the same value
+    if (!d->aac) { int r = d->rate, c = d->ch; d->aac = maac_new(d->vhdr[0], d->vhdr_n[0], &r, &c); if (r != d->rate) d->rate = r; if (c != d->ch) d->ch = c; }
+    int take = d->job == MDJ_TAKE;   // no packet: the next packet's PCM that came after its own call (md_pump), with jflush every one the decoder still holds (the end of stream)
+    if (!take && n <= 0) return 0;
     if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
-    int sbr = d->vhdr_n[0] > 0 && ((d->vhdr[0][0] >> 3) == 5 || (d->vhdr[0][0] >> 3) == 29);
-    size_t bytes = (size_t)(sbr ? 2048 : 1024) * 2 * d->ch; if (bytes > MD_PCM_CAP) bytes = MD_PCM_CAP / (2 * d->ch) * 2 * d->ch;
-    memset(d->out[slot].frm, 0, bytes); d->out[slot].bytes = bytes;
-    return 1;
+    int frames = maac_decode(d->aac, take ? NULL : p, take ? 0 : n, d->jpts, take && d->jflush, (int16_t *)d->out[slot].frm, MD_PCM_CAP, &d->jpts_out);
+    d->aac_late = maac_ready(d->aac);
+    d->out[slot].bytes = (size_t)frames * 2 * d->ch;
+    return frames > 0;
 }
 #endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
@@ -453,6 +457,9 @@ static void md_pump(mdec_t *d) {
             if (s < 0) { pthread_mutex_unlock(&d->mu); break; }
             d->out[s].used = 1; pthread_mutex_unlock(&d->mu);
             d->jslot = s; d->jflush = 1; md_job(d, MDJ_TAKE); int got = d->jgot, left = d->avc ? mavc_queued(d->avc) : 0;
+#ifndef __APPLE__
+            if (d->type == MD_TYPE_AAC) left = d->aac ? maac_queued(d->aac) : 0;   // AAC on MediaCodec: the PCM the decoder still held at the end of stream
+#endif
             pthread_mutex_lock(&d->mu);
             d->out[s].pic = got; d->out[s].pts = got ? d->jpts_out : 0; d->out[s].flags = left ? 0 : 4; d->outq[d->noutq++] = s;
             if (!left) d->avc_drain = 0;
@@ -460,6 +467,20 @@ static void md_pump(mdec_t *d) {
             md_event(d, 1);
             continue;
         }
+#ifndef __APPLE__
+        if (d->type == MD_TYPE_AAC && d->aac_late) {   // AAC on MediaCodec: a packet's PCM that came after its own call leaves in the next free slot, before the next packet is decoded
+            int s = -1; for (int k = 0; k < d->nout; k++) if (!d->out[k].used) { s = k; break; }
+            if (s < 0) { pthread_mutex_unlock(&d->mu); break; }
+            d->out[s].used = 1; pthread_mutex_unlock(&d->mu);
+            d->jslot = s; d->jflush = 0; md_job(d, MDJ_TAKE); int got = d->jgot;
+            pthread_mutex_lock(&d->mu);
+            if (got) { d->out[s].pic = 1; d->out[s].pts = d->jpts_out; d->out[s].flags = 0; d->outq[d->noutq++] = s; } else d->out[s].used = 0;
+            pthread_mutex_unlock(&d->mu);
+            if (!got) { d->aac_late = 0; continue; }
+            md_event(d, 1);
+            continue;
+        }
+#endif
         int slot = -1;
         if (d->npend) for (int k = 0; k < d->nout; k++) if (!d->out[k].used) { slot = k; break; }
         if (slot < 0) { pthread_mutex_unlock(&d->mu); break; }
@@ -475,6 +496,13 @@ static void md_pump(mdec_t *d) {
         if ((pk.size > 0 && (d->type == MD_TYPE_VP9 || MD_AUDIO(d) || avc)) || (avc && eos)) {
             d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; d->jpts = pk.pts; d->jflush = avc && eos; md_job(d, MDJ_DECODE); got = d->jgot; }
         int more = avc && eos && d->avc && mavc_queued(d->avc) > 0;   // H.264 pictures still queued: they follow this output, the last of them carries the end-of-stream flag
+#ifndef __APPLE__
+        if (d->type == MD_TYPE_AAC && d->aac) {   // AAC on MediaCodec: the output carries its own packet's time; at the end of stream the PCM the decoder still holds follows, the last with the flag
+            if (eos && !got && maac_queued(d->aac) > 0) { d->jslot = slot; d->jflush = 1; md_job(d, MDJ_TAKE); got = d->jgot; }
+            if (got) pk.pts = d->jpts_out;
+            more = eos && maac_queued(d->aac) > 0;
+        }
+#endif
         pthread_mutex_lock(&d->mu);
         d->infree[d->ninfree++] = pk.in;
         int ready = got || eos || (d->type != MD_TYPE_VP9 && !MD_AUDIO(d) && !avc);   // an end-of-stream packet without a picture still yields an output to carry the flag back; VP8 has no decoder and gives black frames
@@ -560,6 +588,9 @@ HLE_FORCE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", "movie decoder configur
             if (G.find_buf(md, key, &b) && b && G.data(b) && G.size(b)) { size_t n = G.size(b); free(d->vhdr[k]); d->vhdr[k] = malloc(n); memcpy(d->vhdr[k], G.data(b), n); d->vhdr_n[k] = (int)n; } }
         int ch = 0, rate = 0; if (md) { G.find_i32(md, "channel-count", &ch); G.find_i32(md, "sample-rate", &rate); }
         if (ch > 0) d->ch = ch; if (rate > 0) d->rate = rate;
+#ifndef __APPLE__
+        if (d->type == MD_TYPE_AAC) maac_settle(d->vhdr[0], d->vhdr_n[0], &d->rate, &d->ch);   // MediaCodec: the PCM's rate and channels (HE-AAC's rate is not always Configure's), known before the format event
+#endif
         MD_TRACE(d, 0, "Configure (%s): %d channels %d Hz, headers %d + %d bytes", d->type == MD_TYPE_AAC ? "AAC" : "Vorbis", ch, rate, d->vhdr_n[0], d->vhdr_n[1]);
         return 0;
     }
@@ -594,6 +625,10 @@ static void md_reset(mdec_t *d, int close) {
     pthread_mutex_lock(&d->dmu);   // wait for the packet being decoded
     if (close) md_job(d, MDJ_CLOSE);
     if (d->avc) mavc_drop(d->avc);   // H.264 pictures waiting for their turn belong to the old position
+#ifndef __APPLE__
+    if (d->aac) maac_drop(d->aac);   // AAC on MediaCodec: so does the PCM the decoder holds or that waits for a slot
+    d->aac_late = 0;
+#endif
     pthread_mutex_lock(&d->mu);
     // Every input goes back to the free list, as with MediaCodec, but one the client holds may still be sent: Big Brain Academy: Brain vs. Brain's event thread acquires inputs while its
     // control thread flushes to loop an activity preview, and sends them after the flush (SendInputBufferForDecode claims them back). Those are withheld for a while (h_movie_AcqIn)
@@ -734,6 +769,9 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
     if (MD_AUDIO(d)) {
         int sbr = d->vhdr_n[0] > 0 && ((d->vhdr[0][0] >> 3) == 5 || (d->vhdr[0][0] >> 3) == 29);
         *size = d->type == MD_TYPE_AAC && d->ch > 0 ? 1024 * (sbr ? 2 : 1) * d->ch * 2 : MD_PCM_CAP; *mode = d->mode;
+#ifndef __APPLE__
+        if (d->type == MD_TYPE_AAC && d->ch > 0) *size = maac_frames(d->vhdr[0], d->vhdr_n[0]) * d->ch * 2;   // MediaCodec: what each output holds, 960-sample frames included (frameLengthFlag)
+#endif
         MD_TRACE(d, 11, "GetOutputBufferSize → %d (PCM)", *size); return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
@@ -803,6 +841,9 @@ HLE_FORCE("_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "movie decoder: relea
     MD_TRACE(d, 13, "ReleaseOutputBufferIndex index %d (%d packets queued%s)", i, queued, drain ? ", H.264 pictures draining" : "");
     // An H.264 drain waits for a free slot too: AI: THE SOMNIUM FILES (Unity 2017.4) held all 16 video slots when its logo movie's end-of-stream packet came, the drain stopped
     // with no packet queued, the last pictures and the end-of-stream flag never came out, and the game waited for the movie's end for good
+#ifndef __APPLE__
+    if (d->aac_late) drain = 1;   // AAC on MediaCodec: a packet's PCM that came late waits for a free slot
+#endif
     if (queued || drain) md_pump(d);
     return 0;
 }
