@@ -3,7 +3,10 @@
 //   summary.txt (every step, flushed line by line, RESULT lines with PASS / FAIL / SKIP / INFO), results.tsv (the RESULT lines),
 //   extensions.txt, features.txt, properties.txt, memory.txt, formats.txt, maps_*.txt.
 // Arguments: --label <name> --load system|adrenotools [--drvdir <dir> --drvname <file>] [--expect-lib <s>] [--expect-id <n>] [--expect-info <s>]
-//            [--tests caps,a,d,c,bw,kdiag,coh,fresh,dirty,vmas,types,free,b,e] [--heavy] [--bw-reps <n>] [--max-total-gb <x>] [--floor-gb <x>]
+//            [--tests caps,a,d,c,bw,kdiag,coh,fresh,dirty,vmas,types,free,b,e,ahb,ahbbw,ahbsize,ahbmany,ahbchurn] [--heavy] [--bw-reps <n>] [--max-total-gb <x>] [--floor-gb <x>]
+//            [--ahb-floor-gb <x>] [--ahb-many-max <n>] [--ahb-churn-cycles <n>]
+//   ahb*: AHardwareBuffer-backed pools (ahb_probe.c; the method is shirai91/nx2android's). ahbsize, ahbmany and ahbchurn allocate heavily: APK only.
+//         No AHB above 64 MB is ever requested or queried (AHB_CAP: a larger query crashed the system allocator service on the Fold 7).
 //   --heavy adds b (one 3.5 GB allocation). e (total allocatable up to --max-total-gb) needs a process of its own (--tests e): the drivers
 //   tested do not give freed memory back to the system before the process exits (test "free"), so e after b would measure b's leftovers.
 //   Run b and e in the APK only: an adb shell process has oom_score_adj -1000, so the low-memory killer would kill other apps first.
@@ -41,7 +44,8 @@ static FILE *g_sum;
 static char g_resdir[600];
 static int g_in_app;
 typedef struct { char item[48]; char verdict[8]; char detail[600]; } result_t;
-static result_t g_results[160]; static int g_nres;
+#define NRES 400
+static result_t g_results[NRES]; static int g_nres;
 
 static void S(const char *fmt, ...) {
     char buf[4096]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
@@ -52,7 +56,7 @@ static void S(const char *fmt, ...) {
 static vkc_t V;
 static int g_lost_seen;   // the device was lost: every later GPU result is void (V.lost, set by vkc_cmd_submit_wait)
 static void R(const char *item, const char *verdict, const char *fmt, ...) {
-    result_t *r = g_nres < 160 ? &g_results[g_nres++] : &g_results[159];
+    result_t *r = g_nres < NRES ? &g_results[g_nres++] : &g_results[NRES - 1];
     snprintf(r->item, sizeof r->item, "%s", item); snprintf(r->verdict, sizeof r->verdict, "%s", verdict);
     va_list ap; va_start(ap, fmt); vsnprintf(r->detail, sizeof r->detail, fmt, ap); va_end(ap);
     if (g_lost_seen || V.lost) { size_t l = strlen(r->detail); snprintf(r->detail + l, sizeof r->detail - l, " [AFTER VK_ERROR_DEVICE_LOST: void]"); }
@@ -194,6 +198,9 @@ static VkDeviceSize g_min_align = 4096;
 static VkDeviceSize g_max_alloc, g_max_buffer;
 static uint8_t *g_res5, *g_rb; static size_t g_res5_len;   // the 5 GB reservation and its 2 MB-aligned base
 
+static int test_on(const char *t);
+static void ahb_add_exts(const char **exts, uint32_t *ne);   // ahb_probe.c
+static void ahb_after_device(void);
 static uint32_t eff_api(void) { return V.props.apiVersion < V.inst_api ? V.props.apiVersion : V.inst_api; }
 static int enabler_ok(const char *en) {
     char buf[512], *sp; snprintf(buf, sizeof buf, "%s", en);
@@ -373,6 +380,7 @@ static int make_device(char *err, size_t errn) {
     int has_m2 = vkc_has_ext(&V, "VK_KHR_map_memory2"), has_pl = vkc_has_ext(&V, "VK_EXT_map_memory_placed");
     if (has_m2) exts[ne++] = "VK_KHR_map_memory2";
     if (has_pl) exts[ne++] = "VK_EXT_map_memory_placed";
+    ahb_add_exts(exts, &ne);
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT sup_pl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT };
     VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pl_props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT };
     if (has_pl) { q_feat(&sup_pl); q_prop(&pl_props); g_min_align = pl_props.minPlacedMemoryMapAlignment; }
@@ -407,6 +415,7 @@ static int make_device(char *err, size_t errn) {
     g_unmap_reserve = g_placed_ok && sup_pl.memoryUnmapReserve;
     g_range_placed = g_placed_ok && sup_pl.memoryMapRangePlaced;
     g_bda = bda_sup && V.GetBufferDeviceAddress;
+    ahb_after_device();
     S("device created; vkMapMemory2 %p vkUnmapMemory2 %p vkGetBufferDeviceAddress %p", (void *)V.MapMemory2, (void *)V.UnmapMemory2, (void *)V.GetBufferDeviceAddress);
     return 0;
 }
@@ -830,6 +839,42 @@ static void mem_warm(uint8_t *p, size_t len, double secs) { double t = now_s(); 
 static const char *bw_opn[3] = { "memset", "memcpy", "read-sum" };
 typedef struct { const char *name; uint8_t *a, *b; double v[3][BW_MAX]; } bwk_t;
 static double bw_op(int op, bwk_t *k, size_t len) { return op == 0 ? bw_memset(k->b, len) : op == 1 ? bw_memcpy(k->b, k->a, len) : bw_read(k->a, len); }
+// The paired measurement over nk kinds (k[0] is anonymous memory, the reference); result items <pfx><kind name>
+static void bw_pairs(bwk_t *k, int nk, size_t len, int reps, const char *pfx) {
+    pin_big();
+    char sc[256]; sched_ctx(sc, sizeof sc);
+    int pinned = sched_getcpu() == g_bw_cpu;
+    S("  scheduling: %s; pinned to the fastest core: %s", sc, pinned ? "yes" : "NO (numbers not comparable)");
+    for (int i = 0; i < nk; i++) { memset(k[i].a, 1, len); memset(k[i].b, 2, len); g_sink += readsum(k[i].a, len); }   // fault in every page
+    spin_warm(0.3); mem_warm(k[0].b, len, 1.0);
+    for (int r = 0; r < reps; r++)
+        for (int op = 0; op < 3; op++)
+            for (int j = 0; j < nk; j++) { int i = (j + r) % nk; k[i].v[op][r] = bw_op(op, &k[i], len); }
+    pinned = pinned && sched_getcpu() == g_bw_cpu;
+    unpin();
+    for (int i = 0; i < nk; i++) {
+        for (int op = 0; op < 3; op++) {
+            char l[700]; size_t u = snprintf(l, sizeof l, "  %-12s %-8s", k[i].name, bw_opn[op]);
+            for (int r = 0; r < reps; r++) u += snprintf(l + u, sizeof l - u, " %.1f", k[i].v[op][r]);
+            S("%s GB/s; best %.2f median %.2f", l, best_of(k[i].v[op], reps), median_of(k[i].v[op], reps));
+        }
+        char item[48]; snprintf(item, sizeof item, "%s%s", pfx, k[i].name);
+        if (i == 0) { R(item, pinned ? "INFO" : "FAIL", "best memset %.2f memcpy %.2f read-sum %.2f GB/s; median %.2f %.2f %.2f (cpu%d, %d reps)%s", best_of(k[0].v[0], reps), best_of(k[0].v[1], reps), best_of(k[0].v[2], reps),
+                        median_of(k[0].v[0], reps), median_of(k[0].v[1], reps), median_of(k[0].v[2], reps), g_bw_cpu, reps, pinned ? "" : " NOT PINNED, INVALID"); continue; }
+        if (!pinned) { R(item, "FAIL", "INVALID: not running pinned on the fastest core (%s)", sc); continue; }
+        double mr[3], br[3];
+        for (int op = 0; op < 3; op++) {
+            double q[BW_MAX]; for (int r = 0; r < reps; r++) q[r] = k[i].v[op][r] / k[0].v[op][r];
+            mr[op] = median_of(q, reps); br[op] = best_of(k[i].v[op], reps) / best_of(k[0].v[op], reps);
+            char l[700]; size_t u = snprintf(l, sizeof l, "  %-12s %-8s ratio to anon per pair:", k[i].name, bw_opn[op]);
+            for (int r = 0; r < reps; r++) u += snprintf(l + u, sizeof l - u, " %.2f", q[r]);
+            S("%s", l);
+        }
+        int pass = mr[0] >= 0.9 && mr[1] >= 0.9 && mr[2] >= 0.9;
+        R(item, pass ? "PASS" : "FAIL", "median paired ratio to anon: memset %.0f%% memcpy %.0f%% read-sum %.0f%% (pass >= 90%% each); best memset %.2f (%.0f%%) memcpy %.2f (%.0f%%) read-sum %.2f (%.0f%%) GB/s",
+          mr[0] * 100, mr[1] * 100, mr[2] * 100, best_of(k[i].v[0], reps), br[0] * 100, best_of(k[i].v[1], reps), br[1] * 100, best_of(k[i].v[2], reps), br[2] * 100);
+    }
+}
 static void bw_suite(int reps) {
     if (reps > BW_MAX) reps = BW_MAX;
     S("== (4) CPU bandwidth, 256 MB buffers, %d paired repetitions (each operation on every kind back to back, order rotating)", reps);
@@ -856,39 +901,7 @@ static void bw_suite(int reps) {
             k[nk].name = "vkMapMemory"; k[nk].a = q0; k[nk].b = q1; nk++; have_n = 1;
         } else S("  normal-mapped buffers for the bandwidth test failed: %s %s", vkc_result_str(r0), vkc_result_str(r1));
     }
-    pin_big();
-    char sc[256]; sched_ctx(sc, sizeof sc);
-    int pinned = sched_getcpu() == g_bw_cpu;
-    S("  scheduling: %s; pinned to the fastest core: %s", sc, pinned ? "yes" : "NO (numbers not comparable)");
-    for (int i = 0; i < nk; i++) { memset(k[i].a, 1, len); memset(k[i].b, 2, len); g_sink += readsum(k[i].a, len); }   // fault in every page
-    spin_warm(0.3); mem_warm(k[0].b, len, 1.0);
-    for (int r = 0; r < reps; r++)
-        for (int op = 0; op < 3; op++)
-            for (int j = 0; j < nk; j++) { int i = (j + r) % nk; k[i].v[op][r] = bw_op(op, &k[i], len); }
-    pinned = pinned && sched_getcpu() == g_bw_cpu;
-    unpin();
-    for (int i = 0; i < nk; i++) {
-        for (int op = 0; op < 3; op++) {
-            char l[700]; size_t u = snprintf(l, sizeof l, "  %-12s %-8s", k[i].name, bw_opn[op]);
-            for (int r = 0; r < reps; r++) u += snprintf(l + u, sizeof l - u, " %.1f", k[i].v[op][r]);
-            S("%s GB/s; best %.2f median %.2f", l, best_of(k[i].v[op], reps), median_of(k[i].v[op], reps));
-        }
-        char item[48]; snprintf(item, sizeof item, "bw.%s", k[i].name);
-        if (i == 0) { R(item, pinned ? "INFO" : "FAIL", "best memset %.2f memcpy %.2f read-sum %.2f GB/s; median %.2f %.2f %.2f (cpu%d, %d reps)%s", best_of(k[0].v[0], reps), best_of(k[0].v[1], reps), best_of(k[0].v[2], reps),
-                        median_of(k[0].v[0], reps), median_of(k[0].v[1], reps), median_of(k[0].v[2], reps), g_bw_cpu, reps, pinned ? "" : " NOT PINNED, INVALID"); continue; }
-        if (!pinned) { R(item, "FAIL", "INVALID: not running pinned on the fastest core (%s)", sc); continue; }
-        double mr[3], br[3];
-        for (int op = 0; op < 3; op++) {
-            double q[BW_MAX]; for (int r = 0; r < reps; r++) q[r] = k[i].v[op][r] / k[0].v[op][r];
-            mr[op] = median_of(q, reps); br[op] = best_of(k[i].v[op], reps) / best_of(k[0].v[op], reps);
-            char l[700]; size_t u = snprintf(l, sizeof l, "  %-12s %-8s ratio to anon per pair:", k[i].name, bw_opn[op]);
-            for (int r = 0; r < reps; r++) u += snprintf(l + u, sizeof l - u, " %.2f", q[r]);
-            S("%s", l);
-        }
-        int pass = mr[0] >= 0.9 && mr[1] >= 0.9 && mr[2] >= 0.9;
-        R(item, pass ? "PASS" : "FAIL", "median paired ratio to anon: memset %.0f%% memcpy %.0f%% read-sum %.0f%% (pass >= 90%% each); best memset %.2f (%.0f%%) memcpy %.2f (%.0f%%) read-sum %.2f (%.0f%%) GB/s",
-          mr[0] * 100, mr[1] * 100, mr[2] * 100, best_of(k[i].v[0], reps), br[0] * 100, best_of(k[i].v[1], reps), br[1] * 100, best_of(k[i].v[2], reps), br[2] * 100);
-    }
+    bw_pairs(k, nk, len, reps, "bw.");
     munmap(k[0].a, len); munmap(k[0].b, len);
     if (have_p) { placed_release(pm[0], g_rb + 64 * MB, len); placed_release(pm[1], g_rb + 64 * MB + len, len); }
     else { if (pm[0]) V.vkFreeMemory(V.dev, pm[0], NULL); if (pm[1]) V.vkFreeMemory(V.dev, pm[1], NULL); }
@@ -1067,14 +1080,16 @@ static void kdiag_suite(int bda, int push_only) {
 
 // ---------------------------------------------------------------- (5) coherence
 static void coherence_one(gmap_t *g, const char *label, int bda, int flush) {
-    const size_t SRC = 0, DST = 32 * MB, RES = 64 * MB;
+    // source and destination halves of 32 MB, the result block after them; a smaller mapping (the 64 MB AHB pool) gets smaller halves
+    size_t half = 32 * MB; if (g->size < 2 * half + MB) half = ((g->size - MB) / 2) & ~(size_t)(MB - 1);
+    const size_t SRC = 0, DST = half, RES = 2 * half;
     int rounds_small = 200, rounds_large = 4, fail_gpu = 0, fail_sum = 0, fail_cpu = 0, fail_sub = 0, total = 0; long bad_words = 0;
     VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g->mem, 0, VK_WHOLE_SIZE };
     volatile uint32_t *src = (uint32_t *)(g->ptr + SRC), *dst = (uint32_t *)(g->ptr + DST);
     volatile kres_t *res = (kres_t *)(g->ptr + RES);
     double t0 = now_s();
     for (int i = 0; i < rounds_small + rounds_large; i++) {
-        uint32_t n = i < rounds_small ? 256 * 1024 : 8 * 1024 * 1024;   // 1 MB (stays in the CPU caches) or 32 MB
+        uint32_t n = i < rounds_small ? 256 * 1024 : (uint32_t)(half / 4);   // 1 MB (stays in the CPU caches) or a half (32 MB)
         uint32_t seed = rnd();
         uint32_t prime = 0; for (uint32_t k = 0; k < n; k += 16) prime += dst[k];   // leave the destination's old lines in the CPU caches
         (void)res->sum; g_sink += prime;
@@ -1094,8 +1109,8 @@ static void coherence_one(gmap_t *g, const char *label, int bda, int flush) {
     }
     char item[48]; snprintf(item, sizeof item, "coh.%s", label);
     int pass = total == rounds_small + rounds_large && !fail_gpu && !fail_sum && !fail_cpu;
-    R(item, pass ? "PASS" : "FAIL", "%d rounds (%d x 1 MB, %d x 32 MB) in %.2f s: GPU saw stale CPU writes in %d, wrong sum in %d, CPU saw stale GPU writes in %d (%ld words)%s",
-      total, rounds_small, rounds_large, now_s() - t0, fail_gpu, fail_sum, fail_cpu, bad_words, fail_sub ? ", SUBMIT FAILED" : "");
+    R(item, pass ? "PASS" : "FAIL", "%d rounds (%d x 1 MB, %d x %zu MB) in %.2f s: GPU saw stale CPU writes in %d, wrong sum in %d, CPU saw stale GPU writes in %d (%ld words)%s",
+      total, rounds_small, rounds_large, (size_t)(half / MB), now_s() - t0, fail_gpu, fail_sum, fail_cpu, bad_words, fail_sub ? ", SUBMIT FAILED" : "");
 }
 static void coherence_suite(const char *kind, int placed, int bda) {
     S("== (5) coherence on %s memory (%s)", kind, bda ? "buffer device address" : "descriptors");
@@ -1258,11 +1273,18 @@ static int store_expect_fault(uint8_t *a, uint32_t v, int expect_n_before) {
     if (!ok) S("    store at %p: unexpected fault sig %d code %d addr %#lx", a, g_guard_sig, g_guard_code, (unsigned long)g_guard_addr);
     return ok && g_trk_n == expect_n_before + 1 && g_trk_addr[expect_n_before] == ((uintptr_t)a & 0x00ffffffffffffffull) && g_trk_code[expect_n_before] == SEGV_ACCERR;
 }
+static void dirty_on(gmap_t *g, const char *kind);
 static void dirty_suite(const char *kind, int placed) {
     S("== (6) mprotect + write-fault dirty tracking on %s memory", kind);
     if (kernels_init()) { R("dirty.pipeline", "FAIL", "compute pipeline creation failed"); return; }
     gmap_t g; char item[48];
     if (gmap_create(&g, 64 * MB, placed ? g_rb + 64 * MB : NULL, 0)) { snprintf(item, sizeof item, "dirty.%s", kind); R(item, "FAIL", "could not create the mapping"); gmap_destroy(&g); return; }
+    dirty_on(&g, kind);
+    gmap_destroy(&g);
+}
+// The test on an existing 64 MB GPU-visible mapping (g->ptr, g->buf); the caller creates and destroys it
+static void dirty_on(gmap_t *gp, const char *kind) {
+    gmap_t g = *gp; char item[48];
     const size_t SRCB = 0, DSTB = 32 * MB, RESB = 60 * MB, REG = 16 * MB; const uint32_t NW = REG / 4;
     uint8_t *base = g.ptr; uint32_t *shadow = malloc(REG);
     uint32_t seedA = rnd();
@@ -1275,7 +1297,7 @@ static void dirty_suite(const char *kind, int placed) {
     S("  mprotect(%p, %zu, PROT_READ) = %d errno %d; maps around it:", page, P, rc, rc ? e : 0); S_lines("    ", ri.lines);
     snprintf(item, sizeof item, "dirty.%s.mprotect", kind);
     R(item, rc == 0 ? "PASS" : "FAIL", "mprotect RO on a driver page in the middle of the mapping: rc %d errno %d, VMA lines around it %d", rc, rc ? e : 0, ri.nlines);
-    if (rc) { free(shadow); gmap_destroy(&g); return; }
+    if (rc) { free(shadow); return; }
     int okr; volatile long rbad = 0;
     GUARD_BEGIN(okr) for (size_t i = 0; i < P / 4; i++) if (((volatile uint32_t *)page)[i] != shadow[tp * P / 4 + i]) rbad++; GUARD_END(okr);
     S("  read under PROT_READ: %s, %ld words differ from what was written", okr ? "no fault" : "FAULT", rbad);
@@ -1347,7 +1369,6 @@ static void dirty_suite(const char *kind, int placed) {
       f1 ? "yes" : "NO", landed ? "yes" : "NO", intact ? "yes" : "NO", seq_ok ? "ok" : "BAD", alt_ok ? "ok" : "BAD", none_kept ? "yes" : "NO",
       gpu_read_ok ? "yes" : "NO", gpu_write_ok ? "yes" : "NO", n_timed ? tt * 1e6 / n_timed : 0);
     free(shadow);
-    gmap_destroy(&g);
 }
 
 // ---------------------------------------------------------------- main
@@ -1400,6 +1421,8 @@ static void vmas_suite(void) {
     if (g_placed_ok) vmas_one("placed", 2, 4096);
 }
 
+#include "ahb_probe.c"
+
 static const char *arg(int argc, char **argv, const char *name, const char *def) {
     for (int i = 0; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return def;
@@ -1419,15 +1442,17 @@ int probe_main(const char *out_dir, int in_app, int argc, char **argv) {
     int reps = atoi(arg(argc, argv, "--bw-reps", "32"));
     double max_gb = atof(arg(argc, argv, "--max-total-gb", "6")), floor_gb = atof(arg(argc, argv, "--floor-gb", "1.5"));
     g_rng ^= (uint32_t)(now_s() * 1e6) ^ (uint32_t)getpid() * 2654435761u;
+    g_ahb_floor = atof(arg(argc, argv, "--ahb-floor-gb", "2")); snprintf(g_outdir, sizeof g_outdir, "%s", out_dir);
+    int ahb_many_max = atoi(arg(argc, argv, "--ahb-many-max", "36000")), ahb_cycles = atoi(arg(argc, argv, "--ahb-churn-cycles", "100"));
 
     char ctx[256] = "?"; FILE *c = fopen("/proc/self/attr/current", "r"); if (c) { if (fgets(ctx, sizeof ctx, c)) ctx[strcspn(ctx, "\n")] = 0; fclose(c); }
     struct utsname un; uname(&un);
-    char fp[256] = "", gd[PROP_VALUE_MAX] = "", hv[PROP_VALUE_MAX] = "";
+    char fp[256] = "", gd[PROP_VALUE_MAX] = "", hv[PROP_VALUE_MAX] = "", model[PROP_VALUE_MAX] = "";
     const prop_info *pi = __system_property_find("ro.build.fingerprint");
     if (pi) __system_property_read_callback(pi, prop_cb, fp);
-    __system_property_get("ro.gfx.driver.1", gd); __system_property_get("ro.hardware.vulkan", hv);
+    __system_property_get("ro.gfx.driver.1", gd); __system_property_get("ro.hardware.vulkan", hv); __system_property_get("ro.product.model", model);
     S("gpu probe: label %s, context %s, uid %d, pid %d, selinux %s, page %zu, kernel %s", label, in_app ? "app" : "exe", (int)getuid(), (int)getpid(), ctx, g_pg, un.release);
-    S("build %s; ro.hardware.vulkan=%s ro.gfx.driver.1=%s; MemAvailable %.2f GB; tests [%s]", fp, hv, gd, avail_gb(), g_tests);
+    S("device %s; build %s; ro.hardware.vulkan=%s ro.gfx.driver.1=%s; MemAvailable %.2f GB; tests [%s]", model, fp, hv, gd, avail_gb(), g_tests);
     for (int i = 0; i < argc; i++) S("arg[%d] %s", i, argv[i]);
     { int fd_ok = access("/dev/kgsl-3d0", R_OK | W_OK); S("/dev/kgsl-3d0 access: %s", fd_ok ? strerror(errno) : "rw ok"); }
     { char sc[256]; sched_ctx(sc, sizeof sc); S("scheduling at start: %s", sc); }
@@ -1480,6 +1505,11 @@ int probe_main(const char *out_dir, int in_app, int argc, char **argv) {
     if (test_on("vmas")) vmas_suite();
     if (test_on("free")) test_free();
     if (test_on("e")) test_e(max_gb, floor_gb);
+    if (test_on("ahb")) ahb_suite();
+    if (test_on("ahbbw")) ahb_bw(reps < 5 ? 5 : reps);
+    if (test_on("ahbsize")) ahb_size();
+    if (test_on("ahbmany")) ahb_many(ahb_many_max);
+    if (test_on("ahbchurn")) ahb_churn(ahb_cycles);
     // kernels using buffer device addresses last: a driver that loses the device there does not void the results above
     if (g_bda && test_on("kdiag")) kdiag_suite(1, 0);
     if (g_bda && test_on("coh")) { if (g_placed_ok) coherence_suite("placed", 1, 1); coherence_suite("mapped", 0, 1); }

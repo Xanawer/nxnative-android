@@ -21,6 +21,6 @@ python3 -I "$HERE/gen_vkdump.py" "$VKH/vulkan/vulkan_core.h" "$GEN/vkdump_gen.h"
 
 LIBS=("$AT/libadrenotools.so" "$AT/src/hook/libhook_impl.so" "$AT/src/hook/libmain_hook.so" "$AT/src/hook/libfile_redirect_hook.so" "$AT/src/hook/libgsl_alloc_hook.so")
 EXTRA=(); for l in "${LIBS[@]}"; do [ -f "$l" ] || die "missing $l (build libadrenotools first)"; EXTRA+=(--extra-lib "$l"); done
-"$HERE/build_probe_gpu.sh" gpu org.nxnative.probe.gpu "$OUT" "${EXTRA[@]}" -- "$HERE/gpu_probe.c" "$HERE/vk_common.c" -- -I"$VKH" -I"$GEN" -I"$HERE"
+"$HERE/build_probe_gpu.sh" gpu org.nxnative.probe.gpu "$OUT" "${EXTRA[@]}" -- "$HERE/gpu_probe.c" "$HERE/vk_common.c" -- -I"$VKH" -I"$GEN" -I"$HERE" -lnativewindow -Wl,-z,max-page-size=16384   # 16 KB LOAD alignment (Android 16 page-size compat dialog otherwise)
 mkdir -p "$OUT/lib"; cp "${LIBS[@]}" "$OUT/lib/"   # for the adb executable: pushed beside it
 echo "hook libraries for the executable in $OUT/lib"

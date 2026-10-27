@@ -5,7 +5,7 @@ Probe P0.7 of [PLAN.md](PLAN.md), run on 2026-10-25. It decides the GPU memory s
 **P0.7 pass test:** placed memory is cached, coherent and as fast as anonymous memory for the CPU; the GPU and the CPU see each other's writes; `mprotect` works.
 
 **Result:**
-- **Stock driver:** fails. It has no `VK_EXT_map_memory_placed`, so only strategy B is possible on it.
+- **Stock driver:** fails. It has no `VK_EXT_map_memory_placed`, so of the placed strategies only B is possible on it. Zero-copy buffer pools through AHardwareBuffers do work on it (Galaxy Z Fold 7, with conditions): see [AHardwareBuffer-backed pools](#ahardwarebuffer-backed-pools-zero-copy-buffers-on-the-stock-driver-2026-10-26).
 - **842.6 and Turnip:** pass every part of the test, with two conditions that come from the kernel's KGSL driver, not the Vulkan drivers (identical on all three):
   - **Split-VMA fault bug.** It corrupts data whenever `mprotect` splits a GPU mapping and a page is faulted in afterwards. Populating the whole mapping before the first `mprotect` avoids it, as long as nothing drops the pages later: `MADV_DONTNEED` does, and brings the corruption back.
   - **Split KGSL VMAs never merge back.** Every page boundary the dirty tracker ever toggles stays a VMA, and a process has at most `vm.max_map_count` (65,530) of them. So page-granular write tracking does not scale on GPU memory.
@@ -261,6 +261,177 @@ Memory property flags: DL DEVICE_LOCAL, HV HOST_VISIBLE, HC HOST_COHERENT, C HOS
 - Turnip's push-constant bug affects the backend's core path.
 - Turnip is better on everything else it was tested on: spec-correct unmap, memory freed, 4 GB allocations, all subgroup stages.
 
+## AHardwareBuffer-backed pools: zero-copy buffers on the stock driver (2026-10-26)
+
+**The idea is shirai91/nx2android's (MIT):** `probes/vkzc.c`, `pool_zero_copy` in `nxnative/dm/android/gfx_vk_core.c`, and the defragmenting remap `nvn_dirty_defrag` in `nxnative/dm/gfx/nvn/nvn_dirty.c`. They report it working on a Lenovo Legion Y700 (Adreno 830). The test code here is our own (`dm/android/probe/gpu/ahb_probe.c`).
+
+The method:
+1. Allocate a BLOB `AHardwareBuffer` (`CPU_READ_OFTEN | CPU_WRITE_OFTEN | GPU_DATA_BUFFER`).
+2. Get its dma-buf fd through `AHardwareBuffer_sendHandleToUnixSocket` and a socketpair.
+3. `mmap(MAP_SHARED | MAP_FIXED)` the fd over the pool's guest range, copying the old contents in.
+4. Import the same AHB into Vulkan as a dedicated `VkBuffer` (`VK_ANDROID_external_memory_android_hardware_buffer`).
+
+The game's own pointer is then GPU memory, and the pool needs no shadow buffer and no upload.
+
+**Phones:**
+- **Samsung Galaxy Z Fold 7, `SM-F966B`** (the main runs, 2026-10-26).
+  - Snapdragon 8 Elite, Adreno 830.
+  - Build `F966BXXSDCZJ1` (Android 17, `CP2A.260605.016`), kernel `6.6.127-android15-8` (Samsung), 4 KB pages.
+  - Stock driver: `vulkan.adreno.so`, `E031.47.18.56`, 06/22/26. 842.6: `E031.50.19`, loaded through libadrenotools as before.
+- **nubia `NX789J`**, the phone of the P0.7 runs above: a second device, stock driver only, 2026-10-27. See [Second device](#second-device-nubia-nx789j).
+  - `ro.soc.model` SM8750.
+  - Build `nubia/NX789J-EEA/NX789J:16/BQ2A.250705.001-BP2A.250605.031.A3/20260519.002456`, kernel `6.6.92-android15-8-g3637f4904cf5-ab13944661-4k`, 4 KB pages.
+  - Stock driver: `vulkan.adreno.so`, `E031.47.18.49`, 02/12/26.
+- Turnip: SKIP (its package is gone).
+
+**Result:** the method works on the Fold 7, on both drivers, as an adb executable and in the APK, and on the Nubia's stock driver in both contexts. Two limits are new:
+- **Size: nothing above 64 MB.** On the Fold 7's build, an `isSupported` query for a larger AHB crashed the system allocator service. That is a bug in the vendor's allocator, not ours, but it means no AHB above 64 MB can be requested safely on that phone; see below.
+- **Some kernel paths refuse the mapping.** It is a PFN mapping (`VM_PFNMAP | VM_IO`): `process_vm_readv`, shared futexes, `O_DIRECT` and every `madvise` fail on it.
+
+One limit is known from KGSL: split VMAs never merge back. Unlike KGSL, mapping the fd again over the range restores one VMA. Everything else passed, and CPU bandwidth equals anonymous memory.
+
+### The allocator crash
+
+The first stock APK run (`stock/app/fold7-ahb/`, kept with `NOTE.txt` and `allocator_crash.txt`) queried `AHardwareBuffer_isSupported` for widths from 64 MB to 4 GB − 1.
+- **What crashed:** a query above 64 MB (the 1 GB or the 2 GB one) aborted `vendor.qti.hardware.display.allocator-service`. The abort was `ubsan: mul-overflow` in `snapalloc::SnapConstraintManager::AlignmentToAlignedConstraints`, reached from `SnapAllocCore::IsSupported` through `SnapAllocCore::Allocate`.
+- **What followed:** surfaceflinger aborted ("Failed to get AIDL composer service"), and the framework restarted (BootReceiver: `P|SF`). The kernel did not reboot.
+- **The probe's view:** the later queries returned `DEAD_OBJECT` (-32), and the next `AHardwareBuffer_allocate` (64 MB) returned -129. Those values are artifacts of the dead service, not AHB limits.
+- **Who can trigger it:** an untrusted app (uid 10050), with one `isSupported` call. That makes it a local denial of service on the Fold 7's build.
+
+**Consequences:**
+- `isSupported` is no safe pre-check: it runs the allocator's allocation path.
+- The probe now caps every AHB at 64 MB (`AHB_CAP`, enforced in `ahb_alloc_desc`) and stops its AHB tests if an allocate returns -32 or -129.
+- Every run since went through `~/dm-work/android/ahb/run_checked.sh`. It compares the pids of the allocator service, surfaceflinger and system_server before and after; every run's `services.txt` shows them unchanged.
+- **The largest working size is unknown.** 64 MB (and 64 MB − 4 KB, 32 MB, 16 MB) was allocated, mapped, imported and checked page by page. Nothing above 64 MB was tried again, because each miss restarts the phone's UI. The log does not say which query crashed: its five `DEAD_OBJECT` lines fit either the 1 GB or the 2 GB one, so even 1 GB is not known to be safe.
+
+### Results
+
+Raw results are in `~/dm-work/android/probe-results/gpu/<stock|842>/<exe|app>/`:
+- `fold7-ahb2/`: `--tests kdiag,ahb,fresh,vmas,dirty`;
+- `fold7-ahbbw/`: bandwidth;
+- `fold7-ahbsize/`, `fold7-ahbmany/`, `fold7-ahbchurn/`: the heavy tests, APK only.
+
+Verdicts are identical in the four contexts (stock exe, stock app, 842.6 exe, 842.6 app) unless the table says otherwise. Numbers are given as stock exe / stock app / 842.6 exe / 842.6 app.
+
+**Checks tightened after these runs (review round 1).** The Fold 7 was on its lock screen afterwards, so its tables still hold the earlier build's results. The tightened build ran on the Nubia instead ([Second device](#second-device-nubia-nx789j)): every run met the new validity conditions, and every verdict matches the earlier build's (`ahb.vmas` is still FAIL, as it should be). The changes:
+- **Split tests:** every `mprotect` must succeed, and the range must have more than one VMA afterwards. The earlier runs recorded 19 and 17 pieces but did not record `mprotect` failures.
+- **`ahb.vmas`:** valid only with no `mprotect` failure, a fragmented range and intact data. The earlier runs recorded 0 failures, 1 → 8,193 VMAs and 0 wrong words, so they meet this. The defrag verdicts now also require that there was something to defrag.
+- **Futex wake:** the parent retries the wake (1 ms apart, up to 3 s) until it wakes the waiter, instead of a single wake after 60 ms. The earlier verdicts did not depend on the timing: the private wakes all woke the waiter, and the shared ones failed with EFAULT.
+- **`ahb.churn`:** finalize's return is checked. After each cycle the range must be anonymous again. fds and dma-buf mappings may not grow by more than 2 after cycle 20. The earlier runs' progress lines meet the growth rule (stock fds 134 at cycle 20 and at the end, dma-buf mappings 7 → 7; 842.6: 137 and 137, 11 → 11).
+- **`apool_finalize`:** it no longer destroys a pool it cannot save, and copies back only after the anonymous mapping succeeded.
+
+| Check | Result |
+|---|---|
+| Import extension (`ahb.ext`, `ahb.ext_buffer_props`) | `VK_ANDROID_external_memory_android_hardware_buffer` and `VK_EXT_queue_family_foreign` present on both drivers. Buffer import of the AHB handle type: importable, exportable, not dedicated-only |
+| `isSupported` up to the cap | 1 for 16 KB, 64 KB, 1, 4, 16, 32, 40 and 64 MB |
+| Memory types the import offers (`ahb.import_types`) | `memoryTypeBits` 0x12: type 1 DEVICE_LOCAL and type 4 DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT (both drivers). The probe binds type 1. Imported memory is never `vkMapMemory`'d: the CPU reaches it only through the guest mapping |
+| The mapping (`ahb.vmflags`) | `/dmabuf:qcom,system`, VmFlags `rd wr sh mr mw me ms pf io de dd`: **a PFN mapping (`pf`, `io`)** |
+| Chain over a `PROT_NONE` reservation (`ahb.chain_reserve`) | PASS: 64 MB at a 4 KB-aligned guest address. The GPU reads the CPU's writes (0 wrong) and the CPU reads the GPU's writes after the fence (0 wrong), with no flush or invalidate. Finalize (back to anonymous memory) keeps the data |
+| Chain over part of a live RW heap range (`ahb.chain_heap`) | PASS: a 40 MB pool at offset 0x1007000 of a 128 MB range holding data. Copy out, map and copy back keep it (0 wrong for the CPU and the GPU); the neighbours are intact. Finalize keeps everything. The range goes from 1 VMA to 3 and back to 1 |
+| Pool init cost, 40 MB (`ahb.pool_init_cost`) | allocate 0.30-0.41 ms, dma-buf fd 0.03-0.07 ms, `mmap` 2.8-3.1 ms, import 0.24-0.26 ms; the two copies 14.6-17.8 ms. Finalize 26-28 ms |
+| Page tables (`ahb.populate`) | The whole range is mapped at `mmap`: the first read of 4,096 pages takes 0 page faults (KGSL control: 4,096). Rss does not count it |
+| KGSL split-VMA bug (`ahb.split.*`) | **Not present.** 16 MB written by the GPU and split into 19 VMAs by single-page `mprotect`s, then every word read for the first time: 0 wrong. A CPU store into an untouched page after the split lands at its own offset. A mapping at fd offset 0x101000, split before the first touch: 0 wrong. On the same runs the KGSL control (`split.mapped.*`) reproduces surprise 1 on this phone too (delta −2072 KB, all four contexts) |
+| `madvise` (`ahb.split.madvise`) | `POPULATE_READ`, `POPULATE_WRITE`, `COLD`, `PAGEOUT`, `FREE` and `DONTNEED` all fail with EINVAL. So `hle_svc.c:252`'s `MADV_FREE` would neither drop nor free pool pages |
+| Write faults (`dirty.ahb`, `ahb.faults4096`) | PASS. The dirty-tracking test (6) passes on a 64 MB AHB: 2.8 / 3.1 / 3.2 / 3.4 µs a fault. 4,096 write faults on a read-only 32 MB AHB, one per other page: 3.5 / 4.4 / 4.5 / 4.2 µs a fault; every store landed; no other word changed; the GPU sees all 4,096 |
+| VMA merging (`ahb.vmas`) | FAIL, as on KGSL: 4,096 single-page unprotects in a read-only 64 MB AHB leave 8,193 VMAs, still 8,193 after re-protecting and unprotecting the whole range. 2.3-3.1 µs per `mprotect`; data intact |
+| Defrag: map the same fd again over the range (`ahb.vmas.defrag`, `ahb.faults4096.defrag`, `ahb.split.remap`) | PASS. 8,193 pieces back to 1 VMA in 8.2 / 7.5 / 9.4 / 7.7 ms for 64 MB (119-151 ms per GB); data intact for the CPU and the GPU. The process VMA count returns to its starting value. The range comes back read-write |
+| Coherence without flush (`coh.ahb.desc.noflush`, `coh.ahb.bda.noflush`) | PASS: 204 rounds each (200 × 1 MB, 4 × 31 MB), descriptors and BDA, 0 stale words either way |
+| Buffer device address (`ahb.bda`) | PASS: an import with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` gets an address |
+| GPU writes into a pool the CPU never touched (`ahb.fresh_fill`) | PASS: 32 MB fill, 0 wrong |
+| 256 pools of 64 KB (`ahb.pools256`) | PASS: 0.09-0.12 ms to create a pool and 0.03-0.04 ms to free one. Each pool costs 4.00 fds and 3.0 VMAs. The GPU read every pool's CPU-written word |
+| CPU bandwidth, AHB vs anonymous, 64 MB, paired median of 32 (`ahb.bw`) | PASS. memset / memcpy / read-sum: stock exe 104 / 100 / 101%, stock app 95 / 99 / 110%, 842.6 exe 102 / 98 / 102%, 842.6 app 104 / 99 / 111%. Anonymous memory, best of 32 (stock exe): 35.3 / 22.3 / 51.9 GB/s. The mapping is CPU-cached |
+| Host paths on the mapping (`ahb.host.*`), with anonymous and KGSL controls | see the next table |
+
+**The host's memory paths on an AHB mapping** (the same in all four contexts; the anonymous and KGSL controls pass every item):
+
+| Path | AHB | What uses it in the host | Blocks zero-copy? |
+|---|---|---|---|
+| `process_vm_readv` on self | **FAIL: EFAULT** (page pinning refuses PFN mappings) | `vm_read_overwrite` (`dm/host/plat/plat_linux.c:13`), the host's fault-safe read. Its callers: `crash.c` (crash dumps), `hle_thread.c` (thread and wait diagnostics), `hle_fpslock.c` (reads game variables), `hle_movie.c:127,135` (checks an EventType pointer before signalling it), `probe.c` (debug probes) | **Yes, for any pool those callers read**, until `vm_read_overwrite` has a fallback (condition 2). None of them reads pool data as its job; they would see pool memory as unreadable. Reasoning, not tested: `hle_movie.c` would skip signalling an event that lived in a pool |
+| `write()` from the mapping into a pipe | PASS. On a `PROT_NONE` address it returns EFAULT with no signal | nothing yet: a candidate fallback for `vm_read_overwrite` | no |
+| futex, private | PASS (EAGAIN, timeout, wake) | no futex calls on guest addresses in `dm/host` (its waits use pthread condition variables) | no |
+| futex, shared | **FAIL: EFAULT** | none today | no, today. A future host must keep to private futexes on pool memory |
+| `read()` / `pread()` from a file into the mapping | PASS (1 MB + 3 at an odd offset; the GPU sees it) | `hle_fs.c` `ReadFile` reads straight into guest buffers | no |
+| `write()` from the mapping into a file | PASS | file writes from guest buffers | no |
+| `O_DIRECT` read into the mapping | FAIL: EFAULT | not used by the host | no |
+| `madvise` (any advice) | FAIL: EINVAL (`ahb.split.madvise`) | `hle_svc.c:252` (`MADV_FREE` in UnmapPhysicalMemory) | no, but that call does nothing on a pool range |
+| LDAXR/STLXR, and LSE LDADDAL/CASAL | PASS: 4 threads × 250,000 increments with no lost ones; 7.7-10.7 ns per op, as on anonymous and KGSL memory | the guest's atomics | no |
+
+**Heavy tests (APK only):**
+
+| Test | stock app | 842.6 app |
+|---|---|---|
+| Sizes up to the cap (`ahb.size.*`) | PASS for 16 MB, 32 MB, 64 MB − 4 KB and 64 MB: each was written page by page by the CPU, read back by the GPU from sampled pages (0 wrong), filled at the end by the GPU and read by the CPU (0 wrong). Above 64 MB: SKIP (the allocator crash) | PASS, the same four sizes, 0 wrong. Above 64 MB: SKIP |
+| Many 16 KB pools (`ahb.many`) | 8,128 pools, stopped by the probe's fd budget check (run every 64 pools; it stops once fewer than 256 fds remain under `RLIMIT_NOFILE`, soft 32,768, hard 524,288): 32,644 fds were open, 124 left. The limit itself was not hit, so the allocator service never had to fail an allocation. The run: 4.00 fds and 3.01 VMAs per pool; 0.32 ms to create a pool and 0.33 ms to free one (averages; creation slows from 0.17 ms at 2,048 pools); 42.5 KB of MemAvailable per pool. The GPU read every pool. The first pool held three dma-buf fds: the 16 KB buffer and two of 28 KB | The same stop: 8,128 pools, 32,648 fds open, 120 left. 4.00 fds and 3.01 VMAs per pool; 0.32 ms to create and 0.37 ms to free; 34.7 KB of MemAvailable per pool; the GPU read every pool. The same three dma-buf fds for the first pool |
+| Pool life cycle, 100 × 16 MB (`ahb.churn`: init with copy, GPU check, finalize, free) | PASS. Init 13.8 ms and finalize 20.5 ms per cycle (0.86 / 1.28 ms per MB). MemAvailable 6.14 GB at the start, 6.12 GB at the lowest, 6.20 GB at the end: the memory comes back. dma-buf mappings 7 → 7, fds 133 → 134 | PASS. Init 9.6 ms and finalize 16.8 ms per cycle (0.60 / 1.05 ms per MB). MemAvailable 5.63 → lowest 5.62 → 5.64 GB: the memory comes back. Unlike 842.6's placed memory (surprise 4), imported AHBs are freed. dma-buf mappings 11 → 11, fds 136 → 137 |
+
+`maxMemoryAllocationCount` is 4,294,967,295 on both drivers, so the per-pool limits are the process's fds (4 per pool) and VMAs (3 per pool, against `vm.max_map_count`: unreadable from shell and app, 65,530 by kernel default).
+
+### Second device: nubia NX789J
+
+Stock driver `E031.47.18.49`, the review-round-1 build, 2026-10-27. Raw results are in `~/dm-work/android/probe-results/gpu/stock/<exe|app>/nubia-*/`:
+- `nubia-ahb/`: `--tests ahb`, exe and app;
+- `nubia-ahbchurn/`: app;
+- `nubia-cohbw/`: `--tests coh,bw`, exe. This is a regression check of the shared probe code changed for the AHB tests, on ordinary mapped memory.
+- `nubia-ahb-r2/` (exe) and `nubia-ahbchurn-r2/` (app): the same tests with the review-round-2 build, which only adds failure handling. Every verdict and every count (pieces, VMAs, faults, fds, dma-buf mappings) matches the runs above.
+
+Every run kept the allocator service, surfaceflinger and system_server pids (1662, 1763, 3008). Not run on the Nubia: `ahbbw`, `ahbsize`, `ahbmany` and 842.6.
+
+Numbers are given as exe / app.
+
+| Check | Nubia (tightened build) | Same as the Fold 7 (earlier build)? |
+|---|---|---|
+| Import extension, buffer import properties | present; importable, exportable, not dedicated-only | yes |
+| `isSupported` up to the cap | 1 for all eight sizes (16 KB to 64 MB) | yes |
+| Memory types the import offers | `memoryTypeBits` 0x12 (types 1 and 4), type 1 bound | yes |
+| The mapping | `/dmabuf:qcom,system`, `pf io` | yes |
+| Chain over a `PROT_NONE` reservation, and over a live heap range | PASS, 0 wrong; the heap range goes 1 → 3 → 1 VMAs | yes |
+| Pool init cost, 40 MB | allocate 0.54 / 0.25 ms, fd 0.06 / 0.06 ms, `mmap` 6.9 / 1.9 ms, import 0.18 / 0.07 ms, the two copies 24.3 / 9.1 ms; finalize 43.6 / 35.5 ms. The exe rerun (`nubia-ahb-r2`): `mmap` 0.24 ms, copies 9.4 ms, finalize 14.1 ms | same order. These timings vary more between runs than between the phones (Fold 7: `mmap` 2.8-3.1 ms, copies 14.6-17.8 ms, finalize 26-28 ms) |
+| Page tables | 0 page faults on the first read of 4,096 pages (KGSL control: 4,096) | yes |
+| Host paths | `process_vm_readv` EFAULT, shared futex EFAULT, `O_DIRECT` EFAULT; pipe `write()`, private futex (woken at the first wake call), file `read()` / `write()`, LDAXR/STLXR and LSE PASS. The anonymous and KGSL controls pass every item | yes. Atomics take 11.9-30.3 ns per op, against 14.1-22.0 on anonymous memory in the same runs (Fold 7: 7.7-10.7): the CPU, not the mapping |
+| KGSL split-VMA bug (`ahb.split.*`, tightened) | not present: 19 pieces and 0 `mprotect` failures, 0 wrong; the store lands at its own offset; fd offset 0x101000: 17 pieces, 0 failures, 0 wrong; remap back to 1 VMA | yes |
+| `madvise` | all six EINVAL, on a 19-VMA range | yes |
+| Write faults | dirty test (6): 6.3 / 12.5 µs a fault; 4,096 faults: 8.7 / 10.5 µs a fault, all stores landed, the GPU sees them | verdicts yes; about 2-3× the Fold 7's 2.8-4.5 µs. The P0.7 runs measured 3-10 µs on this phone |
+| VMA merging (`ahb.vmas`, tightened) | 1 → 8,193 VMAs, never merge; 0 `mprotect` failures, data intact (a valid run); 6.4 / 5.2 µs per `mprotect` | yes; `mprotect` about 2× slower |
+| Defrag by remapping the fd | PASS: 12.7 / 17.8 ms per 64 MB (203 / 284 ms per GB); after the 4,096 faults 11.6 / 11.4 ms | yes; slower |
+| Coherence without flush, descriptors and BDA | PASS, 204 rounds each | yes |
+| BDA, GPU fill of an untouched pool | PASS | yes |
+| 256 pools of 64 KB | PASS: 0.18 / 0.17 ms to create, 0.05 / 0.04 ms to free; 4.00 fds and 3.01 VMAs per pool | yes; creation slower |
+| Pool life cycle, 100 × 16 MB (app, tightened) | PASS: init 6.25 ms, finalize 13.85 ms per cycle (0.39 / 0.87 ms per MB). The range was anonymous after every finalize. dma-buf mappings 8 → 8 (after cycle 20) → 8, fds 150 → 152 → 152; MemAvailable 9.08 → lowest 9.04 → 9.04 GB | yes; faster |
+| Regression: `coh.mapped.*`, `bw.*` on ordinary mapped memory (exe) | the same six items as the P0.7 run of 2026-10-25; coherence 4 × PASS at "4 × 32 MB"; `bw.vkMapMemory` 100 / 99 / 100% of anonymous memory (P0.7: 97 / 100 / 98%) | n/a |
+
+The Nubia's data agrees with the Fold 7's on every verdict, so the decision and its conditions below are unchanged. The allocator crash above 64 MB is known only from the Fold 7. Nothing above 64 MB was requested on the Nubia, and the cap applies to both phones.
+
+### Decision
+
+**Use it with conditions, on the stock driver, for buffer pools of up to 64 MB. It is an optimization of strategy B, not a replacement, and it is not needed for Stardew Valley.**
+
+**What it would buy.** It replaces only strategy B's buffer shadows and their copies at commit.
+- On the phone those cost about 0.27 ms a frame at the title and 0.29-0.38 ms on the farm, and 60 fps already holds (PLAN.md §2.2).
+- Textures are unchanged: they still need CPU deswizzling and write tracking.
+- On 842.6 the method works too, but strategy A is there already.
+
+**Conditions:**
+1. **A fixed size cap of at most 64 MB per AHB**, as a constant: never derived from `isSupported`, which crashes the allocator service above it on the Fold 7's build (the Nubia was not tested above 64 MB). Pools above the cap stay on B.
+   - Untested reasoning: splitting a large pool across several AHBs would give it several `VkBuffer`s, since an imported AHB's memory binds only its own dedicated buffer. Every binding would then have to stay inside one piece.
+2. **No `process_vm_readv` on pool memory.** `vm_read_overwrite` needs a fallback that works on PFN mappings. Copying through a pipe with `write()` works there and fails cleanly on unmapped memory (measured). Until then, its callers (above) treat pool memory as unreadable.
+3. **Private futexes only** on pool memory. No `O_DIRECT` and no `madvise` either: `madvise` fails with EINVAL, so guest unmaps of pool memory must finalize the pool, not rely on `MADV_FREE`.
+4. **VMA budget for write tracking**, as with KGSL: unprotected pages never merge back. Unlike KGSL, mapping the fd again restores one VMA (about 120-150 ms per GB). The remap leaves the whole range read-write, so the tracker must re-protect what it tracks afterwards (reasoning, not tested).
+5. **fd and VMA budget per pool:** 4 fds and 3 VMAs.
+   - 8,128 pools fit under the default soft fd limit (measured). The hard limit is 524,288, so the host could raise the soft limit (reasoning, not tested).
+   - BotW keeps about 1,760 pools alive (`docs/agents/04-graphics.md`), about 7,000 fds.
+6. **Pool init and finalize need a quiescent range** (reasoning). Between the copy out and the copy back, a write from another thread to that range would be lost. The measured costs: init 0.60-0.86 ms per MB and finalize 1.05-1.28 ms per MB (16 MB pools); 3 ms of `mmap` per 40 MB.
+7. **Never `vkMapMemory`, flush or invalidate the imported memory**: the CPU uses the guest mapping. Coherence without flushes was measured that way.
+8. **Watch the system services:** a test or a host path that requests an AHB should check that the allocator service survives. A dead service shows up as -32 / -129 from `AHardwareBuffer_allocate`, not as a crash in our process.
+
+**Not run:**
+- The tightened checks of review round 1 on the Fold 7 (it was on its lock screen). They ran on the Nubia, along with the `coh,bw` regression check.
+- On the Nubia: `ahbbw`, `ahbsize`, `ahbmany` and 842.6.
+- AHB sizes above 64 MB: each miss restarts surfaceflinger and the framework.
+- The allocation failure at fd exhaustion: the shared allocator service would have had to fail an allocation.
+- Turnip: its package is gone.
+- What happens to the mapping when the system reclaims memory from a backgrounded app: not tested (the probe ran in the foreground).
+- A `vm_read_overwrite` fallback through a pipe was measured only as single `write()` calls (4 KB on the mapping, 4 KB on a `PROT_NONE` address), not as a host function: the probe makes no host or backend changes.
+
 ## Method notes
 
 - **Placed tests (a-e):**
@@ -288,6 +459,7 @@ Memory property flags: DL DEVICE_LOCAL, HV HOST_VISIBLE, HC HOST_COHERENT, C HOS
 
 Source: `dm/android/probe/gpu/` (not committed).
 - `gpu_probe.c`: tests.
+- `ahb_probe.c`: the AHardwareBuffer pool tests (`ahb`, `ahbbw`, `ahbsize`, `ahbmany`, `ahbchurn`), included by `gpu_probe.c`.
 - `vk_common.[ch]`: Vulkan bring-up, reusable for P0.8.
 - `coherence.comp`, `diag.comp`: kernels.
 - `gen_vkdump.py`: feature and property dumpers generated from `vulkan_core.h`.
@@ -311,7 +483,13 @@ dm/android/probe/gpu/run_gpu.sh app 842 --tests bw,types        # bandwidth
 dm/android/probe/gpu/run_gpu.sh app turnip --tests kdiag        # push-constant bug
 dm/android/probe/gpu/run_gpu.sh app 842 --tests free            # placed memory not freed
 dm/android/probe/gpu/run_gpu.sh app 842 --tests vmas            # split KGSL VMAs never merge (also stock, turnip)
+# AHardwareBuffer pools (ahb_probe.c; no AHB above 64 MB is ever requested). On another phone, STOCK_INFO / STOCK_LIB name its system driver.
+STOCK_INFO=E031.47.18.56 RUN_TAG=fold7-ahb2 dm/android/probe/gpu/run_gpu.sh app stock --tests kdiag,ahb,fresh,vmas,dirty   # also exe, and 842
+RUN_TAG=fold7-ahbbw dm/android/probe/gpu/run_gpu.sh exe stock --tests ahbbw                                             # bandwidth; also app, and 842
+RUN_TAG=fold7-ahbchurn dm/android/probe/gpu/run_gpu.sh app 842 --tests ahbchurn   # heavy, APK only, each in its own process: ahbsize, ahbmany, ahbchurn
 ```
+
+On a phone shared with other work, wrap each run in a check that the allocator service, surfaceflinger and system_server keep their pids (as `~/dm-work/android/ahb/run_checked.sh`, outside the repo, does). The probe's executable and `libprobe.so` are linked with 16 KB LOAD alignment (`-Wl,-z,max-page-size=16384`); the bundled libadrenotools libraries were already 16 KB aligned. The page-size compatibility dialog was reported on the Fold 7 with the earlier 4 KB build, and the Fold 7 has not been checked since. On the Nubia, `logcat -d` shows no `PageSizeMismatchDialog` or `PAGE_SIZE_APP_COMPAT` lines after two starts of the 16 KB build. Its buffer, which goes back to 2026-10-24, holds no such line for any app either, so this does not show that the fix was needed there. A dead allocator service shows up only as `AHardwareBuffer_allocate` errors (-32, -129).
 
 A run with `--tests` writes to `<driver>/<mode>/<test list>/` (or `$RUN_TAG`), so it never replaces a full run.
 

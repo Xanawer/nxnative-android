@@ -16,7 +16,7 @@ TIMEOUT=${PROBE_TIMEOUT:-900}
 MODE=$1 DRV=$2; shift 2
 ZIP=""
 case $DRV in
-    stock)  DARGS=(--label stock --load system --expect-lib vulkan.adreno.so --expect-id 8 --expect-info "${STOCK_INFO:-E031.47}") ;;
+    stock)  DARGS=(--label stock --load system --expect-lib "${STOCK_LIB:-vulkan.adreno.so}" --expect-id 8 --expect-info "${STOCK_INFO:-E031.47}") ;;   # another phone's system driver: set STOCK_INFO / STOCK_LIB
     842)    DARGS=(--label 842 --load adrenotools --drvname vulkan.ad07xx.so --expect-lib vulkan.ad07xx.so --expect-id 8 --expect-info "${Q842_INFO:-E031.50}")
             ZIP=${ZIP_842:-/tmp/qcom_drv/v842/8Elite2-842.6.zip} ;;
     turnip) DARGS=(--label turnip --load adrenotools --drvname vulkan.ad08xx.so --expect-lib vulkan.ad08xx.so --expect-id 18)
