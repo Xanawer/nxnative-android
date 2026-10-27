@@ -10,6 +10,7 @@
 // values and counter records are written before its fence counts as done, and waits look only at that.
 // No Vulkan device (no library, no 1.3 driver): everything runs as the null backend does, said in red
 #include "vkn.h"
+#include "vk_desc.h"   // descriptor delivery: push descriptors or per-slot pools (Mali)
 #include "../nvn/nvn_obj.h"
 #include "../nvn/nvn_mtl.h"
 #include "../nvn/nvn_tex.h"
@@ -1462,7 +1463,7 @@ static int buf_host(VkDeviceSize n, VkBufferUsageFlags u, VkBuffer *b, VkDeviceM
     return 1;
 }
 static void draw_init(void) {   // vkn_hello, before any submission: the dummies' clear and layout go through a one-off command buffer, waited for
-    if (!vd.push) { NLOG("[RED] the device has no VK_KHR_push_descriptor: nothing is drawn"); return; }
+    if (!vkd_init()) return;   // push descriptors, or descriptor pools where the device has none (vk_desc.c); said there
     void *zm; if (!buf_host(ZBUF_B, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g_zbuf, &g_zmem, &zm)) { NLOG("[RED] the draws' zero buffer cannot be made: nothing is drawn"); return; }
     memset(zm, 0, ZBUF_B);
     static const VkFormat df[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT};
@@ -1569,10 +1570,10 @@ static const lay_ent *lay_get(const vkn_shader *vs, const vkn_shader *ps) {
                 snprintf(why, sizeof why, "location %u: written as %s, read as %s", l, wv, rv); }
         }
         if (*why) NLOG("[RED] shaders %s and %s do not match (%s): their draws are skipped", vs->key, ps->key, why);
-        else if (n > vd.max_push) NLOG("[RED] shaders %s and %s have %u bindings, past the device's %u push descriptors: their draws are skipped (more sets are a later slice)", vs->key, ps ? ps->key : "-", n, vd.max_push);
+        else if (n > vkd_max_bindings()) NLOG("[RED] shaders %s and %s have %u bindings, past the device's %u push descriptors: their draws are skipped (more sets are a later slice)", vs->key, ps ? ps->key : "-", n, vkd_max_bindings());
         else {
             lay_ent *m = calloc(1, sizeof *m); if (!m) die("vkn backend: layout entry allocation failed");
-            VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, n, b};
+            VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, vkd_layout_flags(), n, b};
             VkResult r = vk.vkCreateDescriptorSetLayout(vd.dev, &di, NULL, &m->dsl);
             VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &m->dsl, 0, NULL};
             if (!r && (r = vk.vkCreatePipelineLayout(vd.dev, &pi, NULL, &m->pl))) vk.vkDestroyDescriptorSetLayout(vd.dev, m->dsl, NULL);
@@ -1983,7 +1984,7 @@ static int op_draw(const op_hdr *h, const uint8_t *a) {
     }
     VkCommandBuffer cb = cb_now();
     if (!D.valid || D.pso != p) { vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); D.pso = p; }
-    if (nw) { vk.vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, L->pl, 0, nw, wr); DS(g_push, 1); DS(g_dwr, nw); }
+    if (nw && vkd_write(cb, L->pl, L->dsl, nw, wr)) { DS(g_push, 1); DS(g_dwr, nw); }   // pushed, or a pool's set bound (vk_desc.c)
     if (!D.valid || memcmp(&D.vp, &vp, sizeof vp)) { vk.vkCmdSetViewport(cb, 0, 1, &vp); D.vp = vp; }
     if (!D.valid || memcmp(&D.sc, &sc, sizeof sc)) { vk.vkCmdSetScissor(cb, 0, 1, &sc); D.sc = sc; }
     if (!D.valid || memcmp(D.bc, S.blend_color, sizeof D.bc)) { vk.vkCmdSetBlendConstants(cb, S.blend_color); memcpy(D.bc, S.blend_color, sizeof D.bc); }
@@ -2028,6 +2029,7 @@ void mtl_sub_begin(void) {
     pthread_mutex_lock(&vkn_tmu); vkn_sweep(); pthread_mutex_unlock(&vkn_tmu);
     if (g_cur->failed) return;
     vk.vkResetCommandPool(vd.dev, g_cur->pool, 0);
+    vkd_slot_begin((int)(i % NSUB));   // the slot's descriptor pools are free again (vk_desc.c)
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     vk.vkBeginCommandBuffer(g_cur->cb, &bi);
     rt_reresolve();

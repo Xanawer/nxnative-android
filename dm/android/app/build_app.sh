@@ -18,7 +18,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 NDK=${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/27.1.12297006}
 BT=${APP_BUILD_TOOLS:-$ANDROID_HOME/build-tools/36.1.0}
-ANDROID_JAR=$ANDROID_HOME/platforms/android-36/android.jar
+ANDROID_JAR=${APP_ANDROID_JAR:-$ANDROID_HOME/platforms/android-36/android.jar}   # APP_ANDROID_JAR: another platform's (an SDK with android-34 only)
 KEYSTORE=${APP_KEYSTORE:-$HOME/.android/debug.keystore}
 die() { echo "error: $*" >&2; exit 1; }
 GAME=${1:-}; [ -n "$GAME" ] && [ "${GAME#-}" = "$GAME" ] || die "usage: build_app.sh <GAME> [--gpu null|vkn] [--manifest F] [--res DIR] [--assets DIR] [--out APK] [--version-code N] [--version-name S] [build.sh options]"; shift
@@ -30,6 +30,8 @@ while [ $# -gt 0 ]; do case $1 in
     *) BARGS+=("$1"); shift ;; esac; done   # the rest go to build.sh (it refuses what it does not know)
 case $GPU in null) LIB=$HERE/../cmake/build/libdmhost.so APKN=nxhost.apk ;; vkn) LIB=$HERE/../cmake/build-vkn/libdmhost.so APKN=nxhost-vkn.apk ;; *) die "--gpu takes null or vkn, not '$GPU'" ;; esac
 [ -f "$MANIFEST" ] || die "no manifest $MANIFEST"
+MIN_API=$(sed -n 's/.*minSdkVersion="\([0-9]*\)".*/\1/p' "$MANIFEST" | head -1); [ -n "$MIN_API" ] || die "no minSdkVersion in $MANIFEST"
+export DM_ANDROID_API=${DM_ANDROID_API:-$MIN_API}   # the native build's API level follows the manifest (build.sh), as d8's --min-api below
 [ -z "$RES" ] || [ -d "$RES" ] || die "no resource directory $RES"
 [ -z "$ASSETS" ] || [ -d "$ASSETS" ] || die "no assets directory $ASSETS"
 for t in aapt2 zipalign apksigner; do [ -x "$BT/$t" ] || die "no $t in $BT"; done
@@ -39,7 +41,8 @@ JAVAC=${JAVA_HOME:+$JAVA_HOME/bin/}javac
 EXTRA=()
 if [ $GPU = vkn ]; then
     AT=${ADRENOTOOLS_BUILD:-$HOME/dm-work/android/src/libadrenotools-build}
-    for l in "$AT/libadrenotools.so" "$AT/src/hook/libhook_impl.so" "$AT/src/hook/libmain_hook.so" "$AT/src/hook/libfile_redirect_hook.so" "$AT/src/hook/libgsl_alloc_hook.so"; do
+    # ADRENOTOOLS_BUILD=none: no driver-package loading (Mali and other non-Adreno targets: libadrenotools loads Qualcomm drivers only); DM_VK_DRIVER=842 / turnip then say in red that it is missing
+    [ "$AT" = none ] || for l in "$AT/libadrenotools.so" "$AT/src/hook/libhook_impl.so" "$AT/src/hook/libmain_hook.so" "$AT/src/hook/libfile_redirect_hook.so" "$AT/src/hook/libgsl_alloc_hook.so"; do
         [ -f "$l" ] || die "missing $l (build libadrenotools first: docs/android/probes-gpu.md, \"Loading the drivers\")"; EXTRA+=("$l"); done
     if [ -n "${VALIDATION_LAYER:-}" ]; then [ -f "$VALIDATION_LAYER" ] || die "missing $VALIDATION_LAYER"; EXTRA+=("$VALIDATION_LAYER"); fi
 fi
@@ -59,13 +62,14 @@ done
 mkdir -p "$W/classes" "$W/apk/dex"
 # (find -exec … {} +: paths with spaces stay whole, and find fails when the command does)
 find "$HERE/java" -name '*.java' -exec "$JAVAC" -source 8 -target 8 -nowarn -Xlint:-options -encoding UTF-8 -bootclasspath "$ANDROID_JAR" -d "$W/classes" {} +
-find "$W/classes" -name '*.class' -exec "$BT/d8" --release --min-api 35 --lib "$ANDROID_JAR" --output "$W/apk/dex" {} +
+find "$W/classes" -name '*.class' -exec "$BT/d8" --release --min-api "$MIN_API" --lib "$ANDROID_JAR" --output "$W/apk/dex" {} +
 mv "$W/apk/dex/classes.dex" "$W/apk/classes.dex"; rmdir "$W/apk/dex"
 RZ=(); if [ -n "$RES" ]; then "$BT/aapt2" compile --dir "$RES" -o "$W/res.zip"; RZ=("$W/res.zip"); fi
 "$BT/aapt2" link -o "$W/base.apk" --manifest "$MANIFEST" -I "$ANDROID_JAR" ${VARGS[@]+--replace-version "${VARGS[@]}"} ${RZ[@]+"${RZ[@]}"}
 ZE=(classes.dex lib); if [ -n "$ASSETS" ]; then ln -s "$(cd "$ASSETS" && pwd)" "$W/apk/assets"; ZE+=(assets); fi   # zip follows the link: the files go in as assets/..., read where they are
 (cd "$W/apk" && zip -q -r "$W/base.apk" "${ZE[@]}")
-"$BT/zipalign" -f -P 16 4 "$W/base.apk" "$W/aligned.apk"   # 16 KB page alignment for uncompressed libraries, as the probes
+ZA=(-P 16); "$BT/zipalign" 2>&1 | grep -q -- '-P ' || { ZA=(-p); echo "note: $BT/zipalign has no -P (build-tools before 35): libraries aligned to 4 KB pages, enough on 4 KB-page devices only"; }
+"$BT/zipalign" -f "${ZA[@]}" 4 "$W/base.apk" "$W/aligned.apk"   # 16 KB page alignment for uncompressed libraries, as the probes
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$OUT/$APKN" "$W/aligned.apk"
 rm -f "$OUT/$APKN.idsig"
 echo "built $OUT/$APKN ($("$BT/aapt2" dump packagename "$OUT/$APKN" 2>/dev/null), game $GAME, GPU backend $GPU, $(du -h "$OUT/$APKN" | cut -f1)); lib/arm64-v8a: $(cd "$W/apk/lib/arm64-v8a" && ls | tr '\n' ' ')"
