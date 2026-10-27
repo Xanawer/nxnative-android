@@ -6,7 +6,7 @@
      allowNativeHeapPointerTagging false: host pointers handed to the guest keep a zero top byte (docs/android/probes-cpu.md P0.4). debuggable: run-as pushes the modules into the app's files.
      singleTask and every configuration change kept in the activity: the host runs once per process, and onDestroy ends the process (front_android.c) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.nxnative.host" android:versionCode="1" android:versionName="0.1">
-    <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36"/>
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="36"/>
     <application android:label="nxnative" android:hasCode="true" android:debuggable="true" android:extractNativeLibs="true"
                  android:allowNativeHeapPointerTagging="false" android:isGame="true" android:appCategory="game"
                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">

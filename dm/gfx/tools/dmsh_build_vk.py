@@ -38,7 +38,9 @@
 #      share one. A variable it writes at none of its locations is added as declared there, an array as one array, with no interpolation decoration (Metal's vs_pad), then every user
 #      output, every element of an array, is stored (0,0,0,1) before the body runs (Metal's vs_init: an unwritten component reads so on Maxwell; in Vulkan it is undefined). After the
 #      build every pair is checked again on the reflections, by variable, and a vertex shader that does not match a pixel shader input has its reflection rewritten unsupported (a backstop)
-#   8. spv_strip_caps (dm/android/tools): Float64, the unused GroupNonUniform* and the interlock capability with its extension (one that stays is refused, step 10)
+#   8. spv_strip_caps (dm/android/tools): Float64, the unused GroupNonUniform* and the interlock capability with its extension (one that stays is refused, step 10);
+#      spv_add_caps: StorageImage{Read,Write}WithoutFormat where the module reads or writes a storage image of Unknown format (DMSH_VK_NOFMT=0: not added);
+#      spv_barrier_exit: a compute shader's early returns before a workgroup barrier keep the invocation at the barriers, its later writes skipped (DMSH_VK_BARRIER_EXIT=0: as translated)
 #   9. spirv-val --target-env vulkan1.3: a module with any message is not written
 #  10. refusals: a valid module that must not be used is written with status "unsupported" and its reasons, one [RED] line each, so a backend refuses the pipeline instead of drawing
 #      wrongly: every geometry, hull and domain shader (the translator fixes the input topology and the tessellation state that Maxwell takes from the draw; Metal builds variants in
@@ -77,9 +79,9 @@
 import ast, collections, concurrent.futures as cf, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import dmsh_chain, dmsh_geometry
-sys.path.insert(0, os.path.join(HERE, '../../android/tools')); import spv_strip_caps
+sys.path.insert(0, os.path.join(HERE, '../../android/tools')); import spv_strip_caps, spv_add_caps, spv_barrier_exit
 BUILD = os.path.join(HERE, 'dmsh_build.py')
-VK_FILES = ['tools/dmsh_build_vk.py', '../android/tools/spv_strip_caps.py']   # relative to dm/gfx, as dmsh_chain.FILES
+VK_FILES = ['tools/dmsh_build_vk.py', '../android/tools/spv_strip_caps.py', '../android/tools/spv_add_caps.py', '../android/tools/spv_barrier_exit.py']   # relative to dm/gfx, as dmsh_chain.FILES
 STAGE_SET = {'vs': 0, 'ps': 1, 'gs': 2, 'hs': 3, 'ds': 4, 'cs': 0}   # five sets for a full tessellation + geometry pipeline: above the guaranteed maxBoundDescriptorSets of 4
 EXEC_MODEL = {'vs': 'vert', 'ps': 'frag', 'gs': 'geom', 'hs': 'tesc', 'ds': 'tese', 'cs': 'comp'}
 try: from compression import zstd   # Python 3.14; the backport before, as smash_arc.py
@@ -623,6 +625,8 @@ def vk_module(m, stage, pre, single, pss, tmp):
             want, conflict = pair_inputs(m, pss or []); why += conflict
             vpad = pad(m, want) if want else []; vinit = init(m)
         words = list(struct.unpack(f'<{len(m.bytes()) // 4}I', m.bytes())); words, passes['caps_dropped'] = spv_strip_caps.strip(words)
+        words, passes['caps_added'] = spv_add_caps.add(words)
+        words, passes['barrier_exits'], passes['barrier_guards'] = spv_barrier_exit.fix(words)
         m = Spv(struct.pack(f'<{len(words)}I', *words))
     open(tmp, 'wb').write(m.bytes())
     r = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', tmp], capture_output=True, text=True)

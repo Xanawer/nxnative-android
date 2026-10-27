@@ -4,6 +4,8 @@ Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
 
+An **Android** port is in progress: the same rewritten modules run on arm64 Android devices, with Switch graphics rebuilt on Vulkan. It runs on Adreno (Snapdragon) and Mali GPUs; see [Android](#android).
+
 ## Acknowledgements
 
 This project is built on other people's work:
@@ -182,6 +184,29 @@ A connected game controller hides the touch controls and keeps every button.
 - **Short stutters** the first time a new scene appears are normal: the app compiles graphics for it once and remembers them for the next launch.
 - **Reinstalling:** some sideloading tools give a reinstalled app a new data folder. Copy `save/` and `pso_user.tsv` over from the old one to keep your progress.
 - **Settings in a file:** lines like `DM_OPMODE=0` (handheld mode: lower resolution, higher frame rate) in `Documents/env.txt` win over the settings screen, which then shows them greyed out. `DM_FPS_TARGET=30` keeps Breath of the Wild, Tears of the Kingdom and Octopath Traveler 0 at their original 30 fps, which saves battery; `DM_PRESENT_INTERVAL=game` does the same for Monster Train 2. `DM_SHOW_FPS=1` shows the frame rate at the top left (`--show-fps` when packing turns it on from the start). `DM_LAUNCHER=0` skips the settings screen.
+
+## Android
+
+Experimental. The game's own code runs on the device's CPU as on iPhone; the graphics go through a Vulkan backend (`dm/gfx/vkn`) instead of Metal. Needs an arm64 device with Android 13 or later and a Vulkan GPU.
+
+- **Adreno** (Snapdragon): the port's main target, developed on a Snapdragon 8 Elite (Adreno 830) with the stock driver, Qualcomm's 842.6 package or Turnip.
+- **Mali**: tested on an Anbernic RG 476H (Mali-G57, Android 13). Mali has no push descriptors and no BC textures, so the backend uses descriptor pools there and decodes BC textures on the CPU. Compute shaders that let threads leave before a workgroup barrier, which Switch GPUs allow, are rewritten so Mali doesn't hang on them.
+
+Tested on the RG 476H:
+
+| Game | State |
+|---|---|
+| Stardew Valley | 60 fps |
+| Celeste | 60 fps |
+| Paper Mario: The Thousand-Year Door (1.0.1) | Plays through the prologue to Rogueport. GPU-bound: about 25-30 fps in handheld mode with the 3D render size lowered to 960x540 |
+
+**Pack an APK** (on a Mac, with the Android SDK and NDK):
+
+```
+python3 -I scripts/build_apk_from_nsp.py <NSP folder> -k <prod.keys>
+```
+
+Each game gets its own package, so several can be installed side by side. Settings go in the app's `env.txt` (`--env-file` puts them in at packing time), for example `DM_OPMODE=0` for handheld mode. Every switch is listed in [docs/android/switches.md](docs/android/switches.md), and the port's design and status in [docs/android/PLAN.md](docs/android/PLAN.md).
 
 ## Known issues
 

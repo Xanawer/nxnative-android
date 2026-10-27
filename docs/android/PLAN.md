@@ -562,6 +562,7 @@ Open after slice 2c:
 - **Sync:** one timeline semaphore value per submit. A completion thread performs the effects NVN shows after GPU completion (events, counters, sync objects), which Metal completion handlers do now (`nvn_mtl.m:1086-1293`).
 
 ### 2.8 Diagnostics and profile keys
+- **Switches:** every `DM_VK_*`, front-end and Vulkan shader-build switch, with its default: [switches.md](switches.md).
 - **Ported switches:** `DM_NVN_SHOT` and `DM_NVN_TEXDUMP`.
 - **Validation layers:** on KosmicKrisp and on the phone.
 - **Profilers:** Android GPU Inspector, RenderDoc, Snapdragon Profiler.

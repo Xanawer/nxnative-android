@@ -39,6 +39,7 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
     return n;
 }
 // ---------- rendering and output ----------
+static uint8_t *_Atomic g_sys;               // the AudioRenderSystem, as the game's last update named it (h_ars_Update): where it sits in AudioRendererImpl differs by SDK (h_ar_ImplExec)
 static void *g_handle[2];                    // AudioRendererHandle (renderer object, client state)
 static _Atomic int g_open;
 static void *g_render_tt;                    // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
@@ -281,7 +282,8 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     static span_t (*gen20)(void *, void *, size_t); static size_t mu_off;
     static void (*tmax)(void *, uint32_t), (*setup)(void *, const void *, size_t), (*process)(void *), (*lock)(void *), (*unlock)(void *);
     if (!process) {
-        lock = gsym("_ZN2nn2os12SdkMutexType4LockEv"); unlock = gsym("_ZN2nn2os12SdkMutexType6UnlockEv");
+        // SdkMutexType is newer than the oldest SDKs (Stardew Valley's base game, SDK 3.5, has none): looked up without stopping, update_lock picks nn::os::MutexType there
+        lock = guest_sym("_ZN2nn2os12SdkMutexType4LockEv"); unlock = guest_sym("_ZN2nn2os12SdkMutexType6UnlockEv");
         gen20 = guest_sym("_ZN2nn5audio6server17AudioRenderSystem15GenerateCommandENS_4SpanISt4byteEE");
         if (!gen20) {
             mode = gsym("_ZNK2nn5audio6server17AudioRenderSystem16GetExecutionModeEv"); device = gsym("_ZNK2nn5audio6server17AudioRenderSystem18GetRenderingDeviceEv");
@@ -291,6 +293,7 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
         mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : 0x13;
         int os_mutex = 0;
         if (!gen20 && update_lock(&mu_off, &os_mutex) && os_mutex) { lock = gsym("_ZN2nn2os9LockMutexEPNS0_9MutexTypeE"); unlock = gsym("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE"); }
+        if (!lock || !unlock) die("audren: AudioRenderSystem's update lock is neither SdkMutexType nor an nn::os::MutexType that Update locks first");
         LOG("audren: AudioRenderSystem in the SDK %s layout (update lock %s at +%#zx)", gen20 ? "20" : "16", os_mutex ? "nn::os::MutexType" : "SdkMutexType", mu_off);
         tmax = gsym("_ZN2nn5audio3dsp20CommandListProcessor17SetProcessTimeMaxEj"); setup = gsym("_ZN2nn5audio3dsp20CommandListProcessor5SetupEPKvm");
         process = gsym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
@@ -316,7 +319,15 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
-          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + 0x60, g_frame, &g_frame_n); }   // the AudioRenderSystem sits at +0x60 inside AudioRendererImpl
+          Result, h_ar_ImplExec, uint8_t *impl) {
+    // The AudioRenderSystem sits at +0x60 inside AudioRendererImpl in the SDKs this was written on, elsewhere in older ones (SDK 3.5, Stardew Valley's base game): render_once then read the
+    // execution mode and device from the wrong place, refused (not CPU + manual) and rendered nothing, the host appended silence and only the game's catch-up frames were heard (71% of the
+    // 5 ms blocks silent, very choppy). The system the game's updates name (h_ars_Update) is the one to render; +0x60 until the first update. Only a system inside this AudioRendererImpl
+    // (+0x0 to +0x100) is taken: a second renderer the game opens (refused by the host, its updates still pass h_ars_Update) leaves +0x60 in place
+    uint8_t *sys = impl + 0x60, *up = atomic_load(&g_sys);
+    if (up && up != sys && up > impl && up < impl + 0x100) { static int said; if (!said++) LOG("audren: the AudioRenderSystem is at AudioRendererImpl%+td in this SDK, not +0x60 (taken from the game's updates)", (ptrdiff_t)(up - impl)); sys = up; }
+    return render_once(sys, g_frame, &g_frame_n);
+}
 // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
 // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
 // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well
@@ -337,6 +348,7 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
           Result, h_ars_Update, uint8_t *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
     static uint64_t last_r = ~0ull;
+    atomic_store(&g_sys, sys);   // the render thread's takeover renders on it (h_ar_ImplExec)
     uint64_t u = atomic_fetch_add(&g_updates, 1) + 1, r = atomic_load(&g_renders);
     if (last_r != ~0ull && r == last_r) {
         uint64_t c = atomic_fetch_add(&g_catchups, 1) + 1;

@@ -14,3 +14,7 @@ enum { NVK_RT = 1, NVK_UP = 2, NVK_NOA = 4 };
 // f: the VkFormats to try, in order (a device may lack the first: KosmicKrisp has no D24_UNORM_S8_UINT), 0-terminated; lin: the UNORM twin of an sRGB format (the present samples the bytes through it), 0 = f itself
 typedef struct { uint16_t nvn; uint8_t flags; VkFormat f[3], lin; } nvk_fmt;
 const nvk_fmt *nvn_fmt_vk(int nvn_format);   // NULL = a format this backend does not handle yet
+// BC formats (vk_bc.c): their entry (native where the device has BC, else decoded on the CPU), whether a format is decoded (and its bytes per pixel), the decode of one level
+const nvk_fmt *vkn_bc_nvk(int nvn_format);
+int vkn_bc_decoded(int nvn_format, int *bpp);
+int vkn_bc_decode(int nvn_format, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch);

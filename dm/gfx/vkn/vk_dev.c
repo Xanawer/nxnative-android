@@ -245,6 +245,30 @@ int vkn_dev_init(void) {
     if (f2.features.shaderImageGatherExtended) { w2.features.shaderImageGatherExtended = VK_TRUE; vd.gather_ext = 1; }
     if (f2.features.sampleRateShading) { w2.features.sampleRateShading = VK_TRUE; vd.sample_rate = 1; }
     if (f11.shaderDrawParameters) { w11.shaderDrawParameters = VK_TRUE; vd.draw_params = 1; }
+    // Out-of-bounds buffer accesses return zero instead of faulting the GPU (Mali loses the device on them; the translated shaders compute their own offsets into storage buffers):
+    // robustBufferAccess where the device has it, DM_VK_ROBUST=0 leaves it off
+    { const char *e = getenv("DM_VK_ROBUST"); if (f2.features.robustBufferAccess && !(e && *e == '0')) w2.features.robustBufferAccess = VK_TRUE;
+      if (f13.robustImageAccess && !(e && *e == '0')) w13.robustImageAccess = VK_TRUE;   // image accesses outside the image too (compute stores)
+      VLOG("robust buffer access: %s, image access %s", w2.features.robustBufferAccess ? "on" : f2.features.robustBufferAccess ? "off (DM_VK_ROBUST=0)" : "off (the device has none)", w13.robustImageAccess ? "on" : "off"); }
+    // Subgroup operations (core 1.1, no feature to enable): what the device runs where. Paper Mario: The Thousand-Year Door's in-game lighting compute shaders elect a leader
+    // among the active lanes with subgroupBallot and broadcast with subgroupShuffle, which works at any subgroup size (Mali's 16 as Maxwell's 32); refused, the scenes stayed dark
+    { VkPhysicalDeviceSubgroupProperties sp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
+      vk.vkGetPhysicalDeviceProperties2(vd.pd, &p2); const char *e = getenv("DM_VK_SUBGROUP");
+      if (!(e && *e == '0')) { vd.sg_ops = sp.supportedOperations; vd.sg_stages = sp.supportedStages; vd.sg_size = sp.subgroupSize; }
+      VLOG("subgroups: size %u, operations %#x in stages %#x%s", sp.subgroupSize, sp.supportedOperations, sp.supportedStages, e && *e == '0' ? " (DM_VK_SUBGROUP=0: not used)" : ""); }
+    { const char *e = getenv("DM_VK_ASTC"); if (f2.features.textureCompressionASTC_LDR && !(e && *e == '0')) w2.features.textureCompressionASTC_LDR = VK_TRUE;   // ASTC textures (nvn_fmt_vk.c); DM_VK_ASTC=0: none
+      VLOG("ASTC textures: %s", w2.features.textureCompressionASTC_LDR ? "sampled natively" : "not available (no host images)"); }
+    // BC textures sampled natively where the device has them (vk_bc.c decodes them on the CPU otherwise); DM_VK_BC_NATIVE=0 decodes them anyway
+    { const char *e = getenv("DM_VK_BC_NATIVE"); if (f2.features.textureCompressionBC && !(e && *e == '0')) { w2.features.textureCompressionBC = VK_TRUE; vd.bc_native = 1; } }
+    // Storage buffers the vertex and pixel shaders write (nvn_vk.c draw_sbuf), where the device has the features
+    if (f2.features.fragmentStoresAndAtomics) w2.features.fragmentStoresAndAtomics = VK_TRUE;
+    if (f2.features.vertexPipelineStoresAndAtomics) w2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
+    // Storage images of Unknown format (dm/android/tools/spv_add_caps.py declares StorageImage{Read,Write}WithoutFormat for them: Paper Mario: The Thousand-Year Door's compute shaders);
+    // DM_VK_NOFMT=0 leaves the features off, and vk_shader.c then refuses those modules
+    { const char *e = getenv("DM_VK_NOFMT"); int on = !(e && *e == '0');
+      if (on && f2.features.shaderStorageImageWriteWithoutFormat) { w2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE; vd.nofmt_w = 1; }
+      if (on && f2.features.shaderStorageImageReadWithoutFormat) { w2.features.shaderStorageImageReadWithoutFormat = VK_TRUE; vd.nofmt_r = 1; }
+      VLOG("storage images without format: write %s, read %s%s", vd.nofmt_w ? "on" : "off", vd.nofmt_r ? "on" : "off", on ? "" : " (DM_VK_NOFMT=0)"); }
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, de);
     const char *dx[6]; uint32_t ndx = 0;
