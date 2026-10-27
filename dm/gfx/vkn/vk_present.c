@@ -9,6 +9,7 @@
 #include "present_spv.h"
 #include <errno.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 #ifdef __ANDROID__
@@ -546,8 +547,8 @@ static void shot_one(const pq_ent *q) {
     pthread_mutex_lock(&vkn_qmu); pthread_mutex_lock(&vkn_tmu);   // the layout read here is the queue's (see present_one), and the image stays until its use_pres has completed
     vkn_img *e = vkn_img_get(q->serial); VkImageLayout L = e ? e->layout : VK_IMAGE_LAYOUT_UNDEFINED;
     VkFormatProperties fp = {0}; if (e) vk.vkGetPhysicalDeviceFormatProperties(vd.pd, e->fmt, &fp);
-    int bgra = e && (e->fmt == VK_FORMAT_B8G8R8A8_UNORM || e->fmt == VK_FORMAT_B8G8R8A8_SRGB), rgba = e && (e->fmt == VK_FORMAT_R8G8B8A8_UNORM || e->fmt == VK_FORMAT_R8G8B8A8_SRGB);
-    const char *no = !e ? "the window texture has no host image" : L == VK_IMAGE_LAYOUT_UNDEFINED ? "the window texture was never written" : !bgra && !rgba ? "its format is not RGBA8 / BGRA8"
+    int bgra = e && (e->fmt == VK_FORMAT_B8G8R8A8_UNORM || e->fmt == VK_FORMAT_B8G8R8A8_SRGB), rgba = e && (e->fmt == VK_FORMAT_R8G8B8A8_UNORM || e->fmt == VK_FORMAT_R8G8B8A8_SRGB), a2b10 = e && e->fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32, b10 = e && e->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32, dep = e && (e->fmt == VK_FORMAT_D24_UNORM_S8_UINT || e->fmt == VK_FORMAT_X8_D24_UNORM_PACK32 || e->fmt == VK_FORMAT_D32_SFLOAT);   // dep: a depth target (DM_VK_SHOT_SER), its depth as grey   // a2b10: render targets taken with DM_VK_SHOT_SER, top 8 bits of each channel
+    const char *no = !e ? "the window texture has no host image" : L == VK_IMAGE_LAYOUT_UNDEFINED ? "the window texture was never written" : !bgra && !rgba && !a2b10 && !b10 && !dep ? "its format is not RGBA8 / BGRA8 / A2B10G10R10 / B10G11R11 / D24 / D32"
                    : !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) ? "its format cannot be copied from" : (VkDeviceSize)e->w * e->h * 4 > g_shot_cap ? "it is larger than the present said" : NULL;
     uint32_t w = e ? e->w : 0, h = e ? e->h : 0; VkFormat fmt = e ? e->fmt : VK_FORMAT_UNDEFINED; VkResult r = VK_SUCCESS; uint64_t val = 0;
     if (!no) {
@@ -555,10 +556,11 @@ static void shot_one(const pq_ent *q) {
         vk.vkResetCommandPool(vd.dev, g_shot_pool, 0);
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
         vk.vkBeginCommandBuffer(cb, &bi);
-        img_barrier(cb, e->img, VK_IMAGE_ASPECT_COLOR_BIT, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        VkBufferImageCopy rg = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        VkImageAspectFlags ax = dep ? e->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
+        img_barrier(cb, e->img, ax, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy rg = {0, 0, 0, {dep ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
         vk.vkCmdCopyImageToBuffer(cb, e->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot_buf, 1, &rg);
-        img_barrier(cb, e->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        img_barrier(cb, e->img, ax, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);   // back as the next NVN submission expects it
         VkMemoryBarrier2 hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT};
         VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &hb, 0, NULL, 0, NULL};
@@ -578,7 +580,19 @@ static void shot_one(const pq_ent *q) {
         const uint8_t *src = g_shot_map;
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t *s = src + (size_t)(ll ? h - 1 - y : y) * w * 4; uint8_t *d = raw + y * row; *d++ = 0;
-            for (uint32_t x = 0; x < w; x++, s += 4) { d[0] = s[bgra ? 2 : 0]; d[1] = s[1]; d[2] = s[bgra ? 0 : 2]; d += 3; }
+            if (dep) {   // depth as grey: the range of this image's values (said in the log) stretched to 0-255, depth 1.0 (cleared) black
+                static float lo, hi; if (y == 0) { lo = 2.0f; hi = -1.0f; const uint8_t *qq = src; for (size_t i = 0; i < (size_t)w * h; i++, qq += 4) { float f; uint32_t u; memcpy(&u, qq, 4);
+                    if (fmt == VK_FORMAT_D32_SFLOAT) memcpy(&f, &u, 4); else f = (float)(u & 0xffffff) / 16777215.0f; if (f < 1.0f) { if (f < lo) lo = f; if (f > hi) hi = f; } }
+                    VLOG("screenshot %s: depth below 1.0 spans %.6f-%.6f", q->shot, lo, hi); }
+                for (uint32_t x = 0; x < w; x++, s += 4) { float f; uint32_t u; memcpy(&u, s, 4); if (fmt == VK_FORMAT_D32_SFLOAT) memcpy(&f, &u, 4); else f = (float)(u & 0xffffff) / 16777215.0f;
+                    uint8_t g = f >= 1.0f || hi <= lo ? 0 : (uint8_t)(255.0f - 255.0f * (f - lo) / (hi - lo)); d[0] = d[1] = d[2] = g; d += 3; } }
+            else if (b10) for (uint32_t x = 0; x < w; x++, s += 4) {   // B10G11R11 float: each channel's mantissa bits and exponent, clamped to 1.0, as 8 bits
+                uint32_t v; memcpy(&v, s, 4); uint32_t c[3] = {v & 0x7ff, (v >> 11) & 0x7ff, (v >> 22) & 0x3ff}; int mb[3] = {6, 6, 5};
+                for (int k = 0; k < 3; k++) { uint32_t ex = c[k] >> mb[k], m = c[k] & ((1u << mb[k]) - 1); float f = ex ? ldexpf(1.0f + (float)m / (float)(1u << mb[k]), (int)ex - 15) : ldexpf((float)m / (float)(1u << mb[k]), -14);
+                    d[k] = (uint8_t)(f >= 1.0f ? 255 : f * 255.0f); }
+                d += 3; }
+            else if (a2b10) for (uint32_t x = 0; x < w; x++, s += 4) { uint32_t v; memcpy(&v, s, 4); d[0] = (uint8_t)((v >> 2) & 0xff); d[1] = (uint8_t)((v >> 12) & 0xff); d[2] = (uint8_t)((v >> 22) & 0xff); d += 3; }
+            else for (uint32_t x = 0; x < w; x++, s += 4) { d[0] = s[bgra ? 2 : 0]; d[1] = s[1]; d[2] = s[bgra ? 0 : 2]; d += 3; }
         }
         ok = png_write(q->shot, w, h, raw); free(raw);
     }

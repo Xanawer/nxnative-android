@@ -154,6 +154,7 @@ static int img_kind(const jv *im, uint8_t *vt, uint8_t *comp, char *why, size_t 
     if (dep == 1) { snprintf(why, wn, "a depth-compare image"); return 0; }
     if (!strcmp(dim, "2D")) *vt = arr ? VKN_VT_2D_ARRAY : VKN_VT_2D;
     else if (!strcmp(dim, "Cube") && !arr) *vt = VKN_VT_CUBE;
+    else if (!strcmp(dim, "3D") && !arr && !(getenv("DM_VK_3D") && *getenv("DM_VK_3D") == '0')) *vt = VKN_VT_3D;   // read as an empty 3D image until 3D textures have host images (nvn_vk.c tex_lookup); DM_VK_3D=0: refused
     else { snprintf(why, wn, "image dim %s%s", dim, arr ? " arrayed" : ""); return 0; }
     int ct = ct_of(cp);
     if (ct < 0) { snprintf(why, wn, "image component type %s%s", cp, ct_no(ct)); return 0; }
@@ -172,16 +173,50 @@ static int refl_take(vkn_shader *sh, const jv *j, char *why, size_t wn) {
         if (sh->nb == VKN_MAXB) { snprintf(why, wn, "more than %d bindings", VKN_MAXB); return 0; }
         vkn_sbind *o = &sh->b[sh->nb];
         memset(o, 0, sizeof *o);
-        if (bi < 0 || bi >= 32) { snprintf(why, wn, "binding %ld (%s) outside 0-31", bi, j_s(b, "name")); return 0; }
+        if (bi < 0 || bi >= 128) { snprintf(why, wn, "binding %ld (%s) outside 0-127", bi, j_s(b, "name")); return 0; }
         if (set != (sh->stage == 1 ? 1 : 0)) { snprintf(why, wn, "binding %ld in set %ld", bi, set); return 0; }
+        // Ryujinx's fallback for a texture handle the translator cannot trace to one slot (<stage>_<t|s>_cb0_40000000): an array of textures / samplers indexed by the handle's
+        // IDs. With the profile's tex_dyn_slots, c2's tables hold slot indices and element k is what slot k holds (nvn_vk.c draw_drv2, draw_dyn; nvn_mtl.m NVN_RB_TEXD / SAMPD)
+        { const char *nm = j_s(b, "name"); size_t ln = strlen(nm);
+          // A handle the shader reads from a uniform buffer (Ryujinx's bindless texture from a buffer: kind tex_ubo, reg the uniform slot, off its byte), one or an array
+          // indexed by the handle's offset / 8 (nvn_mtl.m NVN_RB_TEXU): nvn_vk.c draw_texu. DM_VK_TEXU=0: refused
+          if (!strcmp(j_s(b, "kind"), "tex_ubo") && !strcmp(tn, "COMBINED_IMAGE_SAMPLER") && cnt >= 1 && cnt <= 64 && !(getenv("DM_VK_TEXU") && *getenv("DM_VK_TEXU") == '0')) {
+            if (sh->nb == VKN_MAXB) { snprintf(why, wn, "more than %d bindings", VKN_MAXB); return 0; }
+            long off = j_i(b, "off", 0);
+            if (reg < 0 || reg >= 16 || off < 0 || off > 65535) { snprintf(why, wn, "binding %ld (%s): uniform slot %ld offset %ld", bi, nm, reg, off); return 0; }
+            vkn_sbind *o = &sh->b[sh->nb]; memset(o, 0, sizeof *o);
+            o->set = (uint8_t)set; o->orig = (uint16_t)bi; o->binding = (uint16_t)(bi + (sh->stage == 1 ? 128 : 0)); o->n = (uint8_t)cnt; o->kind = VKN_B_TEXU; o->reg = (uint16_t)reg; o->off = (uint16_t)off;
+            if (!img_kind(j_get(b, "image"), &o->vt, &o->comp, why, wn)) return 0;
+            for (int k = 0; k < sh->nb; k++) if (sh->b[k].binding == o->binding) { snprintf(why, wn, "binding %ld twice", bi); return 0; }
+            sh->nb++; continue; }
+          if (DM_GAME_TEX_DYN_SLOTS && cnt >= 1 && cnt <= 64 && ln > 13 && !strcmp(nm + ln - 13, "_cb0_40000000") && !(getenv("DM_VK_TEXD") && *getenv("DM_VK_TEXD") == '0')) {
+            if (sh->nb == VKN_MAXB) { snprintf(why, wn, "more than %d bindings", VKN_MAXB); return 0; }
+            vkn_sbind *o = &sh->b[sh->nb]; memset(o, 0, sizeof *o);
+            o->set = (uint8_t)set; o->orig = (uint16_t)bi; o->binding = (uint16_t)(bi + (sh->stage == 1 ? 128 : 0)); o->n = (uint8_t)cnt;
+            if (!strcmp(tn, "SAMPLED_IMAGE")) { o->kind = VKN_B_TEXD; if (!img_kind(j_get(b, "image"), &o->vt, &o->comp, why, wn)) return 0; }
+            else if (!strcmp(tn, "SAMPLER")) o->kind = VKN_B_SAMPD;
+            else { snprintf(why, wn, "binding %ld (%s): a %s array", bi, nm, tn); return 0; }
+            for (int k = 0; k < sh->nb; k++) if (sh->b[k].binding == o->binding) { snprintf(why, wn, "binding %ld twice", bi); return 0; }
+            sh->nb++; sh->dyn = 1; continue; } }
         if (cnt != 1) { if (cnt == J_BAD) snprintf(why, wn, "binding %ld (%s) is an array (count null or not an integer)", bi, j_s(b, "name")); else snprintf(why, wn, "binding %ld (%s) is an array of %ld", bi, j_s(b, "name"), cnt); return 0; }
-        o->set = (uint8_t)set; o->orig = (uint16_t)bi; o->binding = (uint16_t)(bi + (sh->stage == 1 ? 32 : 0));
+        o->set = (uint8_t)set; o->orig = (uint16_t)bi; o->binding = (uint16_t)(bi + (sh->stage == 1 ? 128 : 0));   // pixel bindings 128 up: vertex ones keep 0-127
         // Slots (reg) are range-checked as read, never cut to their field: a uniform slot 0-15, a texture or sampler slot 0-127, a sampler ID 0-65535; c1 and driver banks have none
         if (!strcmp(kind, "cbuf") && !strcmp(tn, "UNIFORM_BUFFER")) { o->kind = VKN_B_UBO; if (reg < 0 || reg >= 16) { snprintf(why, wn, "uniform slot %ld", reg); return 0; } o->reg = (uint16_t)reg; }
         else if (!strcmp(kind, "c1") && !strcmp(tn, "UNIFORM_BUFFER")) o->kind = VKN_B_C1;
+        else if (!strcmp(kind, "ubo_ptr") && !strcmp(tn, "STORAGE_BUFFER") && !(getenv("DM_VK_UBOP") && *getenv("DM_VK_UBOP") == '0')) {   // DM_VK_UBOP=0: refused as before
+            o->kind = VKN_B_UBOP; if (reg < 0 || reg >= 16) { snprintf(why, wn, "uniform slot %ld", reg); return 0; } o->reg = (uint16_t)reg; }
+        else if (!strcmp(kind, "sbuf") && !strcmp(tn, "STORAGE_BUFFER") && !(getenv("DM_VK_SBUF") && *getenv("DM_VK_SBUF") == '0')) {   // DM_VK_SBUF=0: refused as before
+            o->kind = VKN_B_SBUF; o->rw = j_get(b, "rw") && j_get(b, "rw")->t == J_BOOL && j_get(b, "rw")->num != 0;
+            if (reg < 0 || reg >= 16) { snprintf(why, wn, "storage buffer slot %ld", reg); return 0; } o->reg = (uint16_t)reg; }
+        else if (!strcmp(kind, "support") && !strcmp(tn, "UNIFORM_BUFFER") && !(getenv("DM_VK_SUPPORT") && *getenv("DM_VK_SUPPORT") == '0')) o->kind = VKN_B_SUPPORT;   // DM_VK_SUPPORT=0: refused as before
         else if (!strcmp(kind, "drvcb") && !strcmp(tn, "UNIFORM_BUFFER")) {   // a driver bank the shader reads nothing of (drv_reads empty): the zero buffer
-            if (dr && dr->t == J_OBJ && dr->n) { snprintf(why, wn, "driver bank reads (drv_reads) are a later slice"); return 0; }
-            o->kind = VKN_B_ZERO;
+            // Driver bank c0 read (the storage buffer table, a compute shader's dispatch size and uniform buffer table): filled per draw (nvn_vk.c draw_drv0); c2 reads are a later slice
+            int rd = 0; for (int k = 0; dr && dr->t == J_OBJ && k < dr->n; k++) rd |= !strcmp(dr->k[k], "0") ? 1 : 2;
+            long bank = j_i(b, "bank", -1);
+            if (bank == 0 && (rd & 1) && !(getenv("DM_VK_DRV0") && *getenv("DM_VK_DRV0") == '0')) o->kind = VKN_B_DRV0;   // DM_VK_DRV0=0: refused as before
+            else if (bank == 2 && (rd & 2) && !(getenv("DM_VK_DRV2") && *getenv("DM_VK_DRV2") == '0')) o->kind = VKN_B_DRV2;   // the handle tables (draw_drv2); DM_VK_DRV2=0: refused
+            else if ((bank == 0 && (rd & 1)) || (bank != 0 && (rd & 2))) { snprintf(why, wn, "driver bank reads (drv_reads) of c%ld are a later slice", bank); return 0; }
+            else o->kind = VKN_B_ZERO;
         } else if (!strcmp(kind, "tex") && !strcmp(tn, "COMBINED_IMAGE_SAMPLER")) {
             const char *sk = j_s(sm, "kind");
             o->kind = VKN_B_TEX;
@@ -192,6 +227,12 @@ static int refl_take(vkn_shader *sh, const jv *j, char *why, size_t wn) {
             else { snprintf(why, wn, "sampler kind %s", *sk ? sk : "(none)"); return 0; }
             o->reg = (uint16_t)reg; o->sreg = (uint16_t)sreg;
             if (!img_kind(j_get(b, "image"), &o->vt, &o->comp, why, wn)) return 0;
+        } else if (!strcmp(kind, "img") && !strcmp(tn, "STORAGE_IMAGE") && sh->stage == 5) {   // a storage image of a compute shader: NVN image slot reg, a 2D view of its host image
+            o->kind = VKN_B_IMG;
+            if (reg < 0 || reg >= 32) { snprintf(why, wn, "image slot %ld", reg); return 0; }
+            o->reg = (uint16_t)reg;
+            if (!img_kind(j_get(b, "image"), &o->vt, &o->comp, why, wn)) return 0;
+            if (o->vt != VKN_VT_2D) { snprintf(why, wn, "a storage image of view type %d (only 2D: a later slice)", o->vt); return 0; }
         } else { snprintf(why, wn, "binding kind %s (%s)", *kind ? kind : "?", tn); return 0; }
         for (int k = 0; k < sh->nb; k++) if (sh->b[k].binding == o->binding) { snprintf(why, wn, "binding %ld twice", bi); return 0; }
         sh->nb++;
@@ -208,6 +249,7 @@ static int refl_take(vkn_shader *sh, const jv *j, char *why, size_t wn) {
     }
     // The interface between the stages (nvn_vk.c lay_get matches a pair on it): a vertex shader's outputs, a pixel shader's inputs, each listed (an empty list is a list), one entry per location.
     // An array variable's entries carry its first location and its lengths (array: {location, dims}, dmsh_build_vk.py io()): Vulkan matches variables, so a vec4[2] is not two vec4s
+    if (sh->stage == 5) return 1;   // a compute shader has no interface between stages
     if (!io || io->t != J_ARR) { snprintf(why, wn, "its reflection lists no %s", sh->stage == 0 ? "vertex outputs" : "pixel inputs"); return 0; }
     for (int i = 0; i < io->n; i++) {
         const jv *e = &io->c[i], *ar = j_get(e, "array"), *dm = j_get(ar, "dims"); const char *side = sh->stage == 0 ? "vertex output" : "pixel input";
@@ -231,6 +273,12 @@ static int cap_ok(uint32_t c) {
         case 52: return vd.sample_rate;     // InterpolationFunction: sampleRateShading
         case 25: return vd.gather_ext;      // ImageGatherExtended: shaderImageGatherExtended
         case 4427: return vd.draw_params;   // DrawParameters: shaderDrawParameters
+        // GroupNonUniform (61) and its Vote, Arithmetic, Ballot, Shuffle, ShuffleRelative, Clustered, Quad (62-68): the operation bits the device reports, in fragment and compute
+        // shaders (the builder refuses them elsewhere)
+        case 61: case 62: case 63: case 64: case 65: case 66: case 67: case 68:
+            return (vd.sg_stages & (VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT)) == (VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT) && (vd.sg_ops >> (c - 61) & 1);
+        case 55: return vd.nofmt_r;         // StorageImageReadWithoutFormat: shaderStorageImageReadWithoutFormat
+        case 56: return vd.nofmt_w;         // StorageImageWriteWithoutFormat: shaderStorageImageWriteWithoutFormat
         default: return 0;
     }
 }
@@ -280,12 +328,13 @@ static int spv_patch(uint32_t *w, size_t nw, vkn_shader *sh, char *why, size_t w
     }
     if (sh->stage == 1) sh->out_mask &= ~(sec & ~pri);
     if (ne != 1 || !main_) { snprintf(why, wn, "%d entry points%s", ne, ne == 1 ? ", not main" : ""); return 0; }
-    if (em != (sh->stage == 0 ? 0u : 4u)) { snprintf(why, wn, "its entry point's execution model is %u, not the reflection's stage (%s)", em, sh->stage == 0 ? "vertex, 0" : "fragment, 4"); return 0; }
+    if (em != (sh->stage == 0 ? 0u : sh->stage == 5 ? 5u : 4u)) { snprintf(why, wn, "its entry point's execution model is %u, not the reflection's stage (%s)", em, sh->stage == 0 ? "vertex, 0" : "fragment, 4"); return 0; }
     for (int k = 0; k < nd; k++) {
         if (!d[k].set || !d[k].bind) { snprintf(why, wn, "resource %%%u lacks a set or binding", d[k].id); return 0; }
         ids[k] = d[k].id;
         uint32_t set = w[d[k].set], bi = w[d[k].bind]; int f = -1;
         for (int b = 0; b < sh->nb; b++) if (sh->b[b].set == set && sh->b[b].orig == bi) f = b;
+        if (f >= 0 && (sh->b[f].kind == VKN_B_TEXD || sh->b[f].kind == VKN_B_SAMPD || (sh->b[f].kind == VKN_B_TEXU && sh->b[f].n > 1))) ids[k] = 0;   // arrays by design: not refused below
         if (f < 0) { snprintf(why, wn, "resource %%%u (set %u binding %u) is not in the reflection", d[k].id, set, bi); return 0; }
         w[d[k].set] = 0; w[d[k].bind] = sh->b[f].binding;
     }
@@ -331,7 +380,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
     else if (strcmp(j_s(&j, "status"), "ok")) snprintf(why, sizeof why, "status %s (%s)", j_s(&j, "status"), j_get(&j, "unsupported") && j_get(&j, "unsupported")->n ? "unsupported features" : "see the build");
     else if (strcmp(j_s(&j, "chain"), VKN_CHAIN)) snprintf(why, sizeof why, "chain %s, this host takes %s", j_s(&j, "chain"), VKN_CHAIN);
     else if (strcmp(j_s(&j, "key"), want) || strcmp(j_s(&j, "dm_ctl"), hk)) snprintf(why, sizeof why, "its reflection is of %s", j_s(&j, "key"));
-    else if (strcmp(j_s(&j, "stage"), stage == 0 ? "vs" : stage == 1 ? "ps" : "?")) snprintf(why, sizeof why, "stage %s, the map says %d", j_s(&j, "stage"), stage);
+    else if (strcmp(j_s(&j, "stage"), stage == 0 ? "vs" : stage == 1 ? "ps" : stage == 5 ? "cs" : "?")) snprintf(why, sizeof why, "stage %s, the map says %d", j_s(&j, "stage"), stage);
     else if (strcmp(j_s(&j, "entry"), "main")) snprintf(why, sizeof why, "entry point %s", j_s(&j, "entry"));
     else if (!spv) snprintf(why, sizeof why, "no SPIR-V (%s_b.spv%s)", hk, zst ? ": only its .spv.zst is there, and the directory takes the modules decompressed" : "");
     else if ((long)nbytes != j_i(&j, "spv_bytes", -1) || nbytes % 4) snprintf(why, sizeof why, "SPIR-V of %zu bytes, the reflection says %ld", nbytes, j_i(&j, "spv_bytes", -1));
@@ -345,7 +394,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
         }
     }
     j_free(&j);
-    if (*why) { VLOG("[RED] shader %s (%s) refused: %s: its draws are skipped", hk, stage == 0 ? "vertex" : stage == 1 ? "pixel" : "other", why); atomic_fetch_add_explicit(&g_nrefuse, 1, memory_order_relaxed); free(sh); return NULL; }
+    if (*why) { VLOG("[RED] shader %s (%s) refused: %s: its draws are skipped", hk, stage == 0 ? "vertex" : stage == 1 ? "pixel" : stage == 5 ? "compute" : "other", why); atomic_fetch_add_explicit(&g_nrefuse, 1, memory_order_relaxed); free(sh); return NULL; }
     sh->id = ++g_shid; atomic_fetch_add_explicit(&g_nload, 1, memory_order_relaxed);
     return sh;
 }
@@ -354,7 +403,8 @@ vkn_shader *vkn_shader_get(const uint8_t key[8], int stage) {
     void *v = nvn_hm_get(&g_mods, key);
     if (v) return v == REFUSED ? NULL : v;
     vkn_shader *sh = NULL;
-    if (stage != 0 && stage != 1) { char hk[17]; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]); VLOG("[RED] shader %s: NVN stage %d (geometry, tessellation and compute are a later slice): its draws are skipped", hk, stage); }
+    // compute (stage 5) too; DM_VK_COMPUTE=0 refuses it as before (nvn_vk.c op_dispatch)
+    if (stage != 0 && stage != 1 && !(stage == 5 && !(getenv("DM_VK_COMPUTE") && *getenv("DM_VK_COMPUTE") == '0'))) { char hk[17]; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]); VLOG("[RED] shader %s: NVN stage %d (geometry, tessellation and compute are a later slice): its draws are skipped", hk, stage); }
     else if (g_dir_ok) {
         char hk[17], p[1024]; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]);
         snprintf(p, sizeof p, "%s/%s_b.json", g_dir, hk); char *json = slurp(p, NULL); size_t n = 0;

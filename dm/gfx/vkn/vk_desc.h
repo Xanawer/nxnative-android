@@ -8,4 +8,5 @@ uint32_t vkd_layout_flags(void);       // VkDescriptorSetLayoutCreateFlags for t
 uint32_t vkd_max_bindings(void);       // bindings a pair's one set may have
 void vkd_slot_begin(int slot);         // a submission slot begins (its last submission has completed)
 int vkd_write(VkCommandBuffer cb, VkPipelineLayout pl, VkDescriptorSetLayout dsl, uint32_t nw, VkWriteDescriptorSet *wr);
+int vkd_write_bp(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl, VkDescriptorSetLayout dsl, uint32_t nw, VkWriteDescriptorSet *wr);   // the same at a bind point (compute)
 void vkd_report(char *o, size_t n);

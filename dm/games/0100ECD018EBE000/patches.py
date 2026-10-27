@@ -37,3 +37,23 @@ def frame_step(ctx):
     fs_put(0x2e77f8, [B(0x2e77f8, start)], 'frame step: the base clock steps by the host\'s vsyncs (state page target fps; 0 = the game\'s measured step)')
 
 FRAME_STEP = {'0effe4af1dec3a7966b934d4a7c3d2bf': frame_step}
+
+# Render resolution, opt-in at patch time (the default keeps the game's sizes): main+0x30ed60 and main+0x30efd0 store the 3D render size (object +0x3090 / +0x3094) from
+# immediates: docked 1600x900, handheld 1152x648 (and 1024x576 when bit 0x10 of the mode is set); the game renders at that size and scales it into its 1920x1080 / 1280x720
+# composite itself. On a GPU-bound handheld (the RG 476H: Mali-G57) fewer pixels is the largest saving: DM_TTYD_HANDHELD_RES=960x540 (or any WxH up to 1152x648) and
+# DM_TTYD_DOCKED_RES=1280x720 (up to 1600x900) when patching. Each site is mov w<d>,#imm (MOVZ, 32-bit)
+import os as _os
+def _movz(rd, imm): return (0x52800000 | (imm << 5) | rd).to_bytes(4, 'little').hex()
+def _res_cuts():
+    cuts = []
+    for key, sites, (w0, h0), lim in (('DM_TTYD_HANDHELD_RES', [(0x30ed98, 9, 'w'), (0x30eda4, 10, 'h'), (0x30ede4, 8, 'w'), (0x30ede0, 9, 'h'),
+                                                                 (0x30effc, 9, 'w'), (0x30f008, 10, 'h'), (0x30f084, 8, 'w'), (0x30f080, 9, 'h')], (1152, 648), (1152, 648)),
+                                      ('DM_TTYD_DOCKED_RES', [(0x30f048, 8, 'w'), (0x30f044, 9, 'h')], (1600, 900), (1600, 900))):
+        v = _os.environ.get(key)
+        if not v: continue
+        w, h = (int(x) for x in v.lower().split('x'))
+        assert 64 <= w <= lim[0] and 64 <= h <= lim[1], f'{key}={v}: at most {lim[0]}x{lim[1]}'
+        for off, rd, which in sites:
+            cuts.append((off, _movz(rd, w0 if which == 'w' else h0), _movz(rd, w if which == 'w' else h), f'{key}: render {which} {w0 if which == "w" else h0} -> {w if which == "w" else h}'))
+    return cuts
+CUTS['0effe4af1dec3a7966b934d4a7c3d2bf'] += _res_cuts()

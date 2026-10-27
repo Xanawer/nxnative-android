@@ -515,7 +515,7 @@ static int key_event(const AInputEvent *e) {
     int32_t c = AKeyEvent_getKeyCode(e), act = AKeyEvent_getAction(e);
     if (act != AKEY_EVENT_ACTION_DOWN && act != AKEY_EVENT_ACTION_UP) return 0;
     int down = act == AKEY_EVENT_ACTION_DOWN; uint64_t m;
-    if ((m = pad_key_bit(c))) { g_pad_keys = down ? g_pad_keys | m : g_pad_keys & ~m; pad_push(); }
+    if ((m = pad_key_bit(c))) { g_pad_keys = down ? g_pad_keys | m : g_pad_keys & ~m; pad_push(); void dm_hotkeys(uint64_t held); dm_hotkeys(pad_bits()); }   // hotkey.c
     else if ((m = kbd_key_bit(c)) || c == AKEYCODE_W || c == AKEYCODE_A || c == AKEYCODE_S || c == AKEYCODE_D) {
         if (c == AKEYCODE_W) g_w = down; else if (c == AKEYCODE_A) g_a = down; else if (c == AKEYCODE_S) g_s = down; else if (c == AKEYCODE_D) g_d = down;
         g_kbd = down ? g_kbd | m : g_kbd & ~m; kbd_push();

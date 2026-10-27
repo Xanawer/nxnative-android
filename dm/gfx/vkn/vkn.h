@@ -35,9 +35,9 @@ typedef VkResult (VKAPI_PTR *vkn_create_surface_fn)(VkInstance, const void *, co
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCreateSampler) X(vkDestroySampler) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkDestroyPipeline) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
     X(vkInvalidateMappedMemoryRanges) X(vkFlushMappedMemoryRanges) X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkGetBufferDeviceAddress) X(vkCmdCopyBufferToImage) \
-    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdSetBlendConstants) \
+    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdSetBlendConstants) \
     X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdPushDescriptorSetKHR) X(vkCreatePipelineCache) \
     X(vkDestroyPipelineCache)
 typedef struct {
@@ -64,6 +64,9 @@ typedef struct {
     int clip_ctl;                        // VK_EXT_depth_clip_control's depthClipControl is on (near = -w: mtl_set_depth_zero)
     int depth_clamp, indep_blend, dual_src, bias_clamp, fill_ns;   // depthClamp, independentBlend, dualSrcBlend, depthBiasClamp, fillModeNonSolid are on
     int gather_ext, draw_params, sample_rate;   // shaderImageGatherExtended, shaderDrawParameters, sampleRateShading are on (vk_shader.c refuses a module declaring a capability whose feature is off)
+    uint32_t sg_ops, sg_stages, sg_size;   // VkPhysicalDeviceSubgroupProperties (vk_shader.c cap_ok takes the GroupNonUniform* capabilities it reports; DM_VK_SUBGROUP=0: none)
+    int bc_native;                       // textureCompressionBC is on (else BC textures are decoded on the CPU: vk_bc.c)
+    int nofmt_w, nofmt_r;                // shaderStorageImageWriteWithoutFormat / ReadWithoutFormat are on (DM_VK_NOFMT=0: off)
 } vkn_dev_t;
 extern vkn_dev_t vd;
 int vkn_dev_init(void);                  // 1 = a device; logs the driver's identity
@@ -75,6 +78,8 @@ int vkn_mem_type(uint32_t bits, VkMemoryPropertyFlags want);   // a memory type 
 typedef struct vkn_img {
     uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt, sfmt; VkImageAspectFlags aspect;   // sfmt: the format the present samples it as (UNORM for an sRGB target: bytes pass through)
     uint32_t w, h, layers, levels, nvn_fmt;
+    int cube;                            // made cube-compatible (square, layers a multiple of 6): sampled through cube views where a shader or a view asks
+    uint32_t depth;                      // a 3D texture's slices (1 for the others): a VK_IMAGE_TYPE_3D image, sampled through 3D views
     VkImageLayout layout;                // as of the last submission handed to the queue (under g_qmu); the present restores it after sampling
     VkImageLayout rec;                   // as the submission being recorded leaves it (submit thread); published to layout at the commit
     uint64_t rec_sub;                    // the submission rec belongs to
@@ -85,12 +90,14 @@ typedef struct vkn_img {
     int gpu;                             // made for a render target (TextureInitialize in a CPU-no-access pool, or SET_RT), not for sampling
     // Sampled textures (nvn_vk.c, submit thread): the storage in guest memory and its description, the upload's state, and the views
     const uint8_t *gmem; uint64_t size; nvn_texdesc d;
+    int once;                            // a CPU-sourced texture in a CPU-no-access pool: uploaded once at its first use (the game cannot write it again), never checked again
     int up, alw;                         // up: its content was uploaded from guest memory (stamp is that upload's); alw: it lies in a page another pool shares, never protected: uploaded at every use
     uint64_t stamp;                      // nvn_dirty generation of the last upload (every use checks its pages against it: nvn_vk.c tex_ready)
     const void *span;                    // its nvn_dirty range (the pool's)
     uint8_t *edge[2]; uint32_t edge_n[2];   // its bytes in the pages it shares with other data at each end, as last uploaded: a write there that leaves them as they were uploads nothing (nvn_mtl.m pkg_edges_*)
     struct { uint64_t key; VkImageView v; } sviews[8]; int nsviews;   // sampled views by format, levels, layers, swizzle and aspect (nvn_vk.c img_sview)
     int dead;                            // released by the game, destruction pending
+    VkImage fbi; VkDeviceMemory fbm; VkImageView fbv;   // a copy of level 0, layer 0 for draws that sample the pass's own target (nvn_vk.c fb_copy)
     struct vkn_img *next;                // the table's bucket chain, then the pending-destruction list
 } vkn_img;
 vkn_img *vkn_img_get(uint64_t serial);  // under vkn_tmu
@@ -117,12 +124,12 @@ void vkn_present_flush(void);            // every ticket so far done, and the GP
 int vkn_present_drain(uint64_t ns);      // the same within ns: 1 = done
 
 // Shader modules (vk_shader.c, PLAN.md 2.4, slice 2c): slice 0's SPIR-V of this translation chain (dmsh_build_vk.py; a module of another is refused), by the shader's key (hle_nvn.c prog_key)
-#define VKN_CHAIN "755696b45d84"
+#define VKN_CHAIN "2efb3d91898e"   // dmsh_build_vk.py --version: moves with the Metal chain (upstream ecbeae1 changed dmsh_build.py, dmsh_chain.py and the lock); spv_add_caps.py and spv_barrier_exit.py joined it
 #define VKN_MAXB 32
-enum { VKN_B_UBO = 1, VKN_B_C1, VKN_B_ZERO, VKN_B_TEX };   // a binding: an NVN uniform slot (reg), the shader's c1 bank, a driver bank it reads nothing of (zeros), a combined texture slot (reg)
+enum { VKN_B_UBO = 1, VKN_B_C1, VKN_B_ZERO, VKN_B_TEX, VKN_B_SUPPORT, VKN_B_SBUF, VKN_B_IMG, VKN_B_DRV0, VKN_B_TEXD, VKN_B_SAMPD, VKN_B_DRV2, VKN_B_TEXU, VKN_B_UBOP };   // UBOP: uniform slot reg bound as a storage buffer (compute's uniforms as device pointers, nvn_mtl.m NVN_RB_UBOP)   // TEXU: texture handles in a uniform buffer (slot reg, byte off; n > 1: an array, element k at off + 8k)   // TEXD / SAMPD: n textures / samplers picked at run time by slot (tex_dyn_slots); DRV2: driver bank c2 (draw_drv2)   // VKN_B_DRV0: driver bank c0 the shader reads (nvn_vk.c draw_drv0)   // VKN_B_IMG: a storage image, NVN image slot reg (compute)   // also Ryujinx's support_buffer (nvn_vk.c g_supbuf), an NVN storage buffer slot (reg; rw: written). A binding: an NVN uniform slot (reg), the shader's c1 bank, a driver bank it reads nothing of (zeros), a combined texture slot (reg)
 enum { VKN_S_TEX = 1, VKN_S_SAMP, VKN_S_ID };              // its sampler: the sampler half of combined slot sreg, separate sampler slot sreg, the constant sampler ID sreg
-enum { VKN_VT_2D, VKN_VT_2D_ARRAY, VKN_VT_CUBE };
-typedef struct { uint8_t kind, skind, vt, comp, set; uint16_t orig, binding, reg, sreg; } vkn_sbind;   // binding: in the draws' set (pixel ones + 32); comp 0 float 1 uint 2 sint
+enum { VKN_VT_2D, VKN_VT_2D_ARRAY, VKN_VT_CUBE, VKN_VT_3D };
+typedef struct { uint8_t kind, skind, vt, comp, set, rw, n; uint16_t orig, binding, reg, sreg, off; } vkn_sbind;   // n: an array binding's length (TEXD, SAMPD)   // binding: in the draws' set (pixel ones + 32); comp 0 float 1 uint 2 sint
 typedef struct vkn_shader {
     char key[17]; int stage;             // NVN stage: 0 vertex, 1 pixel
     VkShaderModule mod; uint32_t id;     // id: a small number, for the pipeline keys
@@ -131,8 +138,10 @@ typedef struct vkn_shader {
     uint32_t out_mask; uint8_t out_ct[8], out_n[8];   // pixel outputs written, by location, and their component types and components
     uint32_t io_mask; uint8_t io_ct[32], io_n[32];    // the interface between the stages, by location: a vertex shader's outputs, a pixel shader's inputs (component type as comp, components)
     uint8_t io_first[32], io_nd[32], io_dims[32][4];  // and the variable on each: its first location and array lengths (outermost first; io_nd 0: no array, io_first the location)
+    int dyn;                                          // has TEXD / SAMPD bindings: c2 holds slot indices for it (draw_drv2)
     int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
     VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
+    VkDescriptorSetLayout cdsl; VkPipelineLayout cpl; VkPipeline cpso; int cbad;   // a compute shader's own layout and pipeline (nvn_vk.c op_dispatch); cbad: they cannot be made
 } vkn_shader;
 int vkn_shmap_stage(const uint8_t key[8]);           // the shader map's NVN stage of a key, -1 = not in it
 vkn_shader *vkn_shader_get(const uint8_t key[8], int stage);   // NULL = refused or missing (said once)
